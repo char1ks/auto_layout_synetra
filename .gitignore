@@ -44,7 +44,7 @@ venv.bak/
 .ipynb_checkpoints
 *.ipynb
 
-# Machine Learning Models & Data
+# Machine Learning Models & Data (все модели скачиваются автоматически)
 *.pt
 *.pth
 *.ckpt
@@ -54,20 +54,27 @@ venv.bak/
 *.hdf5
 *.pkl
 *.pickle
+
+# Директории с моделями (создаются автоматически)
 models/
 weights/
 checkpoints/
 data/
 datasets/
 
-# LLaVA specific
+# LLaVA (клонируется автоматически)
 LLaVA/
 llava_models/
 clip_models/
 
-# FastSAM specific
+# FastSAM модели (скачиваются автоматически)
 FastSAM/
 FastSAM-*.pt
+
+# HuggingFace cache (модели скачиваются в кэш)
+.cache/
+transformers_cache/
+huggingface/
 
 # Output files
 output/
