@@ -30,73 +30,70 @@
 - **Рекомендуется (GPU)**: 8GB+ VRAM, RTX 3060+ / RTX 4060+
 - **Оптимально**: 16GB+ RAM, RTX 4070+ / RTX 4090
 
-## ⚡ Быстрая установка
+## ⚡ ПРОСТАЯ УСТАНОВКА И ЗАПУСК
 
-### 🖥️ **Linux/macOS (рекомендуется):**
+### 🚀 **Автоматическая установка (Linux/macOS) - РЕКОМЕНДУЕТСЯ:**
 
 ```bash
-# 1. Клонируйте репозиторий
-git clone <your-repo-url>
-cd LLaVA-SAM2-Pipeline
+# 1. Клонируйте проект
+git clone https://github.com/char1ks/auto_layout_synetra.git
+cd auto_layout_synetra
 
-# 2. Запустите автоматическую установку
+# 2. Запустите автоматическую установку (установит всё сразу)
 chmod +x setup_llava_sam2.sh
 ./setup_llava_sam2.sh
 
-# 3. Первый запуск (скачает модели ~8GB)
+# 3. Запустите анализ
 ./run_sam2_pipeline.sh input/test_metal.jpg
 ```
 
-### 🪟 **Windows:**
+### 🖥️ **Пошаговая установка (любая ОС):**
 
-#### Шаг 1: Установка Python и Git
-```cmd
-# 1. Скачайте Python 3.10+ с https://python.org
-# При установке ОБЯЗАТЕЛЬНО отметьте "Add Python to PATH"
-
-# 2. Скачайте Git с https://git-scm.com/download/win
-
-# 3. Проверьте установку
-python --version
-git --version
+#### **Шаг 1: Клонирование проекта**
+```bash
+# Клонируйте проект
+git clone https://github.com/char1ks/auto_layout_synetra.git
+cd auto_layout_synetra
 ```
 
-#### Шаг 2: Клонирование и настройка
-```cmd
-# Клонируйте репозиторий
-git clone <your-repo-url>
-cd LLaVA-SAM2-Pipeline
-
+#### **Шаг 2: Создание Python окружения**
+```bash
 # Создайте виртуальное окружение
-python -m venv venv
+python3 -m venv venv
 
 # Активируйте окружение
-venv\Scripts\activate
+# На Linux/macOS:
+source venv/bin/activate
+# На Windows:
+# venv\Scripts\activate
 
 # Обновите pip
-python -m pip install --upgrade pip
+pip install --upgrade pip
 ```
 
-#### Шаг 3: Установка PyTorch
-```cmd
+#### **Шаг 3: Установка PyTorch**
+```bash
 # Для GPU (NVIDIA CUDA 11.8):
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 
 # Для GPU (NVIDIA CUDA 12.1):
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# Для CPU (если нет подходящей GPU):
+# Для CPU (если нет GPU):
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Для Apple Silicon (M1/M2):
+pip install torch torchvision torchaudio
 ```
 
-#### Шаг 4: Установка зависимостей
-```cmd
-# Основные зависимости
+#### **Шаг 4: Установка зависимостей**
+```bash
+# Установите основные зависимости
 pip install -r requirements_llava_sam2.txt
 ```
 
-#### Шаг 5: Установка LLaVA
-```cmd
+#### **Шаг 5: Установка LLaVA**
+```bash
 # Клонируйте и установите LLaVA
 git clone https://github.com/haotian-liu/LLaVA.git
 cd LLaVA
@@ -104,8 +101,8 @@ pip install -e .
 cd ..
 ```
 
-#### Шаг 6: Установка SAM2
-```cmd
+#### **Шаг 6: Установка SAM2**
+```bash
 # Клонируйте и установите SAM2
 git clone https://github.com/facebookresearch/segment-anything-2.git
 cd segment-anything-2
@@ -113,102 +110,95 @@ pip install -e .
 cd ..
 ```
 
-#### Шаг 7: Создание папок
-```cmd
-mkdir models output input
-```
-
-**⚠️ Важно:** Все модели (LLaVA ~7GB, SAM2 ~1GB) будут **автоматически скачаны** при первом запуске. Подключение к интернету обязательно!
-
-## 🎯 Запуск анализа
-
-### **Простой запуск (Linux/macOS):**
+#### **Шаг 7: Создание папок**
 ```bash
-# 1. Активировать окружение (если не активно)
-source venv/bin/activate
-
-# 2. Запуск анализа через скрипт
-./run_sam2_pipeline.sh input/your_image.jpg
-
-# 3. Запуск с указанием выходной папки
-./run_sam2_pipeline.sh input/your_image.jpg output/custom_folder
-
-# 4. Или напрямую через Python
-python3 llava_sam2_pipeline.py --image input/your_image.jpg --output output
+# Создайте необходимые папки
+mkdir -p models input output
 ```
 
-### **Windows:**
-```cmd
-# 1. Активировать окружение
-venv\Scripts\activate
+## 🎯 ЗАПУСК АНАЛИЗА
 
-# 2. ПЕРВЫЙ запуск (скачает модели ~8GB, займет 5-15 минут)
-python llava_sam2_pipeline.py --image 001.png --output output
+### **Простой запуск:**
+```bash
+# 1. Активируйте окружение (если не активно)
+source venv/bin/activate  # Linux/macOS
+# venv\Scripts\activate   # Windows
 
-# 3. Последующие запуски (быстро)
-python llava_sam2_pipeline.py --image "путь\к\изображению.jpg" --output output
+# 2. Поместите изображение в папку input/
+cp your_image.jpg input/
 
-# 4. Пример с конкретным файлом
-python llava_sam2_pipeline.py --image "input\test_metal.jpg" --output "output\results"
+# 3. Запустите анализ
+python3 llava_sam2_pipeline.py --image input/your_image.jpg --output output/
+
+# 4. Результаты появятся в папке output/
+```
+
+### **Примеры команд:**
+```bash
+# Анализ конкретного файла
+python3 llava_sam2_pipeline.py --image input/test_metal.jpg --output output/
+
+# Анализ с указанием выходной папки
+python3 llava_sam2_pipeline.py --image input/defect_sample.png --output results/
+
+# Использование готового скрипта (Linux/macOS)
+./run_sam2_pipeline.sh input/your_image.jpg
 ```
 
 ### **Параметры запуска:**
 ```bash
-python llava_sam2_pipeline.py --help
+python3 llava_sam2_pipeline.py --help
 
 # Опции:
 # --image IMAGE    Путь к изображению для анализа (обязательно)
 # --output OUTPUT  Директория для сохранения результатов (по умолчанию: ./output)
 ```
 
-## 📥 Что происходит при первом запуске
+## 📥 ЧТО ПРОИСХОДИТ ПРИ ПЕРВОМ ЗАПУСКЕ
+
+**⚠️ ВАЖНО:** Первый запуск занимает 5-15 минут для скачивания моделей!
 
 При первом запуске автоматически скачаются:
-1. **LLaVA модель** (~7GB) - для определения материалов и анализа дефектов
-2. **SAM2 модель** (~1GB) - для точной сегментации дефектов  
-3. **Дополнительные файлы** (~500MB) - tokenizer, конфиги
+1. **LLaVA-1.5-7B модель** (~7GB) - для анализа материалов и дефектов
+2. **SAM2-Hiera-Large модель** (~1GB) - для точной сегментации
+3. **Tokenizer и конфиги** (~500MB) - дополнительные файлы
 
 **Общий размер:** ~8.5GB  
-**Время скачивания:** 5-15 минут (зависит от интернета)  
-**Где хранятся:** В кэше HuggingFace (`~/.cache/huggingface/`) и папке `models/`
+**Где хранятся:** `~/.cache/huggingface/` и `models/`  
+**Интернет:** Нужен только при первом запуске
 
-**⚠️ Важно:** Не прерывайте первый запуск! Все последующие запуски будут быстрыми.
-
-## 🔍 Как работает новый pipeline
+## 🔍 Как работает pipeline
 
 ```
-📸 Изображение
-    ↓
-🔬 LLaVA Запрос 1: "Какой это материал?"
-    ↓ (metal, wood, plastic, etc.)
-🔍 LLaVA Запрос 2: "Где дефекты? Какие типы?"
-    ↓ (scratch at center, dent at top-right, etc.)
-🎯 SAM2: Сегментация по подсказкам от LLaVA
-    ↓ (точечные координаты → маски)
-🎨 OpenCV: Постобработка и фильтрация
-    ↓
-📊 Результат: маски + аннотации
+📸 Ваше изображение
+         ↓
+🔬 LLaVA: "Какой материал?" → metal/wood/plastic
+         ↓
+🔍 LLaVA: "Где дефекты?" → scratch at center, dent at top
+         ↓
+🎯 SAM2: Точная сегментация → маски дефектов
+         ↓
+🎨 OpenCV: Постобработка → финальные результаты
+         ↓
+📊 Сохранение результатов
 ```
 
-## 📊 Результаты
+## 📊 РЕЗУЛЬТАТЫ
 
-После запуска в папке `output/` появятся:
-- **`image_result.jpg`** - Визуализация с цветными масками и типами дефектов
-- **`image_analysis.json`** - JSON с полным анализом:
-  - Тип материала и уверенность
-  - Типы дефектов (scratch, dent, corrosion, etc.)
-  - Локации дефектов (center, top-right, etc.)
-  - Координаты масок
-  - Степень серьезности (minor/moderate/severe)
-- **`image_mask_*.png`** - Отдельные маски для каждого дефекта
+После анализа в папке `output/` появятся:
 
-### Пример JSON результата:
+### **Файлы результатов:**
+- **`image_result.jpg`** - Визуализация с цветными масками дефектов
+- **`image_analysis.json`** - Полный анализ в формате JSON
+- **`image_mask_1.png`**, **`image_mask_2.png`** - Отдельные маски дефектов
+
+### **JSON содержит:**
 ```json
 {
   "material": {
     "material": "metal",
     "confidence": 0.9,
-    "description": "Metallic surface with visible wear"
+    "description": "Metallic surface with wear patterns"
   },
   "defect_analysis": {
     "defects_found": true,
@@ -229,113 +219,72 @@ python llava_sam2_pipeline.py --help
 }
 ```
 
-## ⚙️ Оптимизация производительности
+## ⚡ ПРОИЗВОДИТЕЛЬНОСТЬ
 
-### Для GPU:
-- Используйте изображения до 1024x1024 для оптимальной скорости
-- SAM2 работает значительно быстрее с точечными подсказками от LLaVA
-- Убедитесь что CUDA версия совпадает с PyTorch
-- Закройте другие GPU приложения для освобождения VRAM
+| Устройство | Время анализа |
+|---|---|
+| **RTX 4090** | 3-6 секунд |
+| **RTX 4070** | 5-8 секунд |
+| **RTX 3060** | 8-12 секунд |
+| **M2 Pro** | 20-35 секунд |
+| **M1** | 35-50 секунд |
+| **Intel i7** | 25-45 секунд |
 
-### Для CPU:
-- Используйте изображения до 640x640 для приемлемой скорости
-- SAM2 CPU режим требователен к RAM (12GB+)
-- Рассмотрите использование более легких моделей
-- Закройте ненужные программы для освобождения RAM
+## 🐛 РЕШЕНИЕ ПРОБЛЕМ
 
-## 📈 Производительность
-
-**С GPU (CUDA):**
-- **RTX 4090**: ~3-6 секунд (2 LLaVA запроса + SAM2)
-- **RTX 4080**: ~4-7 секунд
-- **RTX 4070**: ~5-8 секунд
-- **RTX 3080**: ~5-9 секунд
-- **RTX 3070**: ~7-11 секунд
-- **RTX 3060**: ~8-12 секунд
-
-**CPU (Apple Silicon):**
-- **M2 Ultra**: ~15-25 секунд
-- **M2 Pro**: ~20-35 секунд
-- **M1 Pro**: ~25-40 секунд
-- **M1**: ~35-50 секунд
-
-**CPU (Intel/AMD):**
-- **Intel i9-13900K**: ~20-35 секунд
-- **Intel i7-12700K**: ~25-40 секунд
-- **AMD Ryzen 9 7900X**: ~18-32 секунд
-- **AMD Ryzen 7 5800X**: ~25-45 секунд
-
-## 🆚 Сравнение с FastSAM
-
-| Характеристика | FastSAM (старая версия) | SAM2 (новая версия) |
-|---|---|---|
-| **Точность сегментации** | Хорошая | Отличная |
-| **Интеллектуальность** | Автоматическая | Направляемая LLaVA |
-| **Типы дефектов** | Общие | Специфические |
-| **Скорость** | Быстрая (~2-4 сек) | Средняя (~3-6 сек) |
-| **Размер моделей** | ~140MB | ~1GB |
-| **Качество масок** | Среднее | Высокое |
-| **Анализ материалов** | Базовый | Продвинутый |
-| **VRAM требования** | 4GB+ | 6GB+ |
-
-## 🐛 Решение проблем
-
-### ❌ "SAM2 не найден"
+### ❌ "Модули не найдены"
 ```bash
-# Переустановите SAM2:
-git clone https://github.com/facebookresearch/segment-anything-2.git
-cd segment-anything-2
-pip install -e . --force-reinstall
-cd ..
+# Переустановите зависимости
+pip install -r requirements_llava_sam2.txt --force-reinstall
 ```
 
 ### ❌ "CUDA out of memory"
 ```bash
-# 1. Используйте CPU версию PyTorch:
-pip uninstall torch torchvision torchaudio
+# Используйте CPU версию
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-
-# 2. Или уменьшите размер изображения в коде:
-# В llava_sam2_pipeline.py найдите и измените:
-# imgsz = 640  # вместо 1024
 ```
 
-### ❌ "LLaVA генерирует неточные результаты"
+### ❌ "Медленная работа"
 ```bash
-# Попробуйте более мощную модель LLaVA:
-# В коде llava_sam2_pipeline.py измените model_path на:
-# "liuhaotian/llava-v1.5-13b"  # более мощная, но медленнее
+# Уменьшите размер изображения до 640x640
+# Или используйте GPU если доступен
 ```
 
-### ❌ "SAM2 работает медленно"
+### ❌ "Ошибки установки на Windows"
+```cmd
+# Установите Visual Studio Build Tools
+# Скачайте с: https://visualstudio.microsoft.com/visual-cpp-build-tools/
+```
+
+## 📞 БЫСТРАЯ ПОМОЩЬ
+
+**Если ничего не работает:**
+1. Убедитесь что Python 3.10+
+2. Активируйте виртуальное окружение
+3. Проверьте интернет соединение
+4. Освободите место на диске (нужно 18GB)
+5. Закройте другие программы (нужно 12GB RAM)
+
+**Тестовая команда:**
 ```bash
-# Уменьшите количество точек в автоматической сегментации:
-# В коде найдите SAM2AutomaticMaskGenerator и измените:
-# points_per_side=16  # вместо 32
-# pred_iou_thresh=0.8  # вместо 0.7
+python3 -c "
+import torch
+print('PyTorch:', torch.__version__)
+print('CUDA доступна:', torch.cuda.is_available())
+try:
+    from llava.model.builder import load_pretrained_model
+    print('LLaVA: ✅')
+except:
+    print('LLaVA: ❌')
+try:
+    from sam2.build_sam import build_sam2
+    print('SAM2: ✅')
+except:
+    print('SAM2: ❌')
+"
 ```
 
-### ❌ "python не найден" (Windows)
-```cmd
-# Переустановите Python с python.org
-# ОБЯЗАТЕЛЬНО отметьте "Add Python to PATH"
-# Перезагрузите командную строку
-```
-
-### ❌ "git не найден" (Windows)
-```cmd
-# Установите Git с https://git-scm.com/download/win
-# Или используйте GitHub Desktop
-```
-
-## 🔄 Что делает новая система
-
-1. **🔍 LLaVA Этап 1** - Определяет тип материала (metal, wood, plastic, etc.)
-2. **🔍 LLaVA Этап 2** - Анализирует дефекты (типы, локации, серьезность)
-3. **🎯 SAM2** - Точная сегментация на основе подсказок от LLaVA
-4. **🎨 OpenCV** - Фильтрация и постобработка результатов
-
-**Интеллектуальная сегментация готова! 🚀**
+**Готово! Теперь можно анализировать дефекты! 🚀**
 
 ---
 
