@@ -1,0 +1,22 @@
+mkdir -p sam-hq/pretrained_checkpoint
+wget https://huggingface.co/lkeab/hq-sam/resolve/main/sam_hq_vit_l.pth -O sam-hq/pretrained_checkpoint/sam_hq_vit_l.pth
+
+python main.py \
+  --example data/photo_2025-07-03_13-05-26.jpg \
+  --positive-dir data/pos/ \
+  --negative-dir data/neg/ \
+  --conf-threshold 0.5 \
+  --iou-threshold 0.5 \
+  --output data/out.jpg
+
+
+# --ground_truth_dir data/masks \   # omit if you have no GT masks
+OPENAI_API_KEY=$OPENAI_API_KEY python agent.py \
+    --reference  data/reference.png \
+    --images_dir data/scenes \
+    --instructions "Segment and detect cpus of silver colour, mounted in the motherboard." \
+    --output_dir results \
+    --max_iters 5 \
+    --iou_thresh 0.5 \
+    --ap_target 0.5 \
+    --model gpt-4o
