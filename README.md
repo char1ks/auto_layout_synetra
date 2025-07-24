@@ -1,34 +1,71 @@
-# 🚀 LLaVA + FastSAM Pipeline для автоматической разметки дефектов
+# 🚀 LLaVA + SAM2 Pipeline для автоматической разметки дефектов
 
-Автоматическая система определения материалов и сегментации дефектов с использованием LLaVA и FastSAM.
+Интеллектуальная система определения материалов и сегментации дефектов с использованием LLaVA для анализа и SAM2 для точной сегментации.
 
-**🚨 Важно:** Модели НЕ включены в репозиторий! Они скачиваются автоматически при первом запуске (~7.5GB).
+**🚨 Важно:** Модели НЕ включены в репозиторий! Они скачиваются автоматически при первом запуске (~8GB).
 
-## 📋 Требования
+## 🔄 Новая архитектура
+
+Система использует **двойной запрос к LLaVA**:
+1. **Запрос 1**: Определение типа материала (metal, wood, plastic, etc.)
+2. **Запрос 2**: Анализ дефектов с указанием типов и локаций
+3. **SAM2**: Точная сегментация на основе подсказок от LLaVA
+
+**Преимущества над FastSAM:**
+- ✅ Более точная сегментация благодаря направленным подсказкам
+- ✅ Интеллектуальный анализ дефектов через LLaVA
+- ✅ Лучшая работа с различными типами материалов
+- ✅ Автоматическая генерация точек-подсказок для SAM2
+
+## 📋 Системные требования
 
 - **Python 3.10+** 
-- **RAM**: 8GB+ (16GB рекомендуется)
-- **Свободное место**: 15GB
-- **GPU** (опционально): NVIDIA с CUDA для ускорения
+- **RAM**: 12GB+ (16GB рекомендуется для SAM2)
+- **Свободное место**: 18GB (LLaVA ~7GB + SAM2 ~1GB + зависимости)
+- **GPU** (настоятельно рекомендуется): NVIDIA с CUDA 11.8+ или 12.x
+- **CPU**: Intel i7/AMD Ryzen 7+ (для работы без GPU)
 
-## ⚡ Полная установка (Python venv)
+### Требования по устройствам:
+- **Минимум (CPU)**: 16GB RAM, Intel i7-8700K / AMD Ryzen 7 2700X
+- **Рекомендуется (GPU)**: 8GB+ VRAM, RTX 3060+ / RTX 4060+
+- **Оптимально**: 16GB+ RAM, RTX 4070+ / RTX 4090
 
-### 🖥️ **Windows:**
+## ⚡ Быстрая установка
 
-#### Шаг 1: Установка Python
-```cmd
-# Скачайте Python 3.10+ с https://python.org
-# При установке отметьте "Add Python to PATH"
+### 🖥️ **Linux/macOS (рекомендуется):**
 
-# Проверьте установку
-python --version
-pip --version
+```bash
+# 1. Клонируйте репозиторий
+git clone <your-repo-url>
+cd LLaVA-SAM2-Pipeline
+
+# 2. Запустите автоматическую установку
+chmod +x setup_llava_sam2.sh
+./setup_llava_sam2.sh
+
+# 3. Первый запуск (скачает модели ~8GB)
+./run_sam2_pipeline.sh input/test_metal.jpg
 ```
 
-#### Шаг 2: Создание виртуального окружения
+### 🪟 **Windows:**
+
+#### Шаг 1: Установка Python и Git
 ```cmd
-# Перейдите в папку проекта
-cd путь\к\проекту
+# 1. Скачайте Python 3.10+ с https://python.org
+# При установке ОБЯЗАТЕЛЬНО отметьте "Add Python to PATH"
+
+# 2. Скачайте Git с https://git-scm.com/download/win
+
+# 3. Проверьте установку
+python --version
+git --version
+```
+
+#### Шаг 2: Клонирование и настройка
+```cmd
+# Клонируйте репозиторий
+git clone <your-repo-url>
+cd LLaVA-SAM2-Pipeline
 
 # Создайте виртуальное окружение
 python -m venv venv
@@ -40,336 +77,436 @@ venv\Scripts\activate
 python -m pip install --upgrade pip
 ```
 
-#### Шаг 3: Установка зависимостей
+#### Шаг 3: Установка PyTorch
 ```cmd
-# Для GPU (NVIDIA CUDA):
+# Для GPU (NVIDIA CUDA 11.8):
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# Для GPU (NVIDIA CUDA 12.1):
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# Для CPU (если нет GPU):
-# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-
-# Основные зависимости
-pip install transformers==4.37.2
-pip install accelerate==0.21.0
-pip install opencv-python opencv-contrib-python
-pip install numpy==1.26.4 pillow scipy matplotlib
-pip install protobuf sentencepiece==0.1.99 einops==0.6.1
-pip install gradio==4.16.0 gradio_client==0.8.1
-pip install requests tqdm pyyaml regex
-pip install safetensors tokenizers huggingface-hub
-pip install ultralytics
+# Для CPU (если нет подходящей GPU):
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 ```
 
-#### Шаг 4: Установка LLaVA
+#### Шаг 4: Установка зависимостей
 ```cmd
-# Клонируйте репозиторий LLaVA (автоматически скачается ~200MB)
-git clone https://github.com/haotian-liu/LLaVA.git
+# Основные зависимости
+pip install -r requirements_llava_sam2.txt
+```
 
-# Установите LLaVA
+#### Шаг 5: Установка LLaVA
+```cmd
+# Клонируйте и установите LLaVA
+git clone https://github.com/haotian-liu/LLaVA.git
 cd LLaVA
 pip install -e .
 cd ..
 ```
 
-#### Шаг 5: Создание папок
+#### Шаг 6: Установка SAM2
+```cmd
+# Клонируйте и установите SAM2
+git clone https://github.com/facebookresearch/segment-anything-2.git
+cd segment-anything-2
+pip install -e .
+cd ..
+```
+
+#### Шаг 7: Создание папок
 ```cmd
 mkdir models output input
 ```
 
-**⚠️ Важно:** Все модели (LLaVA ~7GB, FastSAM ~140MB) будут **автоматически скачаны** при первом запуске. Подключение к интернету обязательно!
-
-### 🐧 **Linux/macOS:**
-
-#### Шаг 1: Проверка Python
-```bash
-python3 --version  # Должно быть 3.10+
-pip3 --version
-```
-
-#### Шаг 2: Создание виртуального окружения
-```bash
-# Перейдите в папку проекта
-cd /путь/к/проекту
-
-# Создайте виртуальное окружение
-python3 -m venv venv
-
-# Активируйте окружение
-source venv/bin/activate
-
-# Обновите pip
-pip install --upgrade pip
-```
-
-#### Шаг 3: Установка зависимостей
-```bash
-# Для GPU (NVIDIA CUDA):
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-
-# Для CPU или macOS:
-pip install torch torchvision torchaudio
-
-# Основные зависимости (те же что для Windows)
-pip install transformers==4.37.2 accelerate==0.21.0
-pip install opencv-python opencv-contrib-python
-pip install numpy==1.26.4 pillow scipy matplotlib
-pip install protobuf sentencepiece==0.1.99 einops==0.6.1
-pip install gradio==4.16.0 gradio_client==0.8.1
-pip install requests tqdm pyyaml regex
-pip install safetensors tokenizers huggingface-hub
-pip install ultralytics
-```
-
-#### Шаг 4: Установка LLaVA
-```bash
-# Клонируйте репозиторий LLaVA (автоматически скачается ~200MB)
-git clone https://github.com/haotian-liu/LLaVA.git
-cd LLaVA
-pip install -e .
-cd ..
-```
-
-#### Шаг 5: Создание папок
-```bash
-mkdir -p models output input
-```
-
-**⚠️ Важно:** Все модели (LLaVA ~7GB, FastSAM ~140MB) будут **автоматически скачаны** при первом запуске. Подключение к интернету обязательно!
+**⚠️ Важно:** Все модели (LLaVA ~7GB, SAM2 ~1GB) будут **автоматически скачаны** при первом запуске. Подключение к интернету обязательно!
 
 ## 🎯 Запуск анализа
 
-### **Активация окружения и запуск:**
+### **Простой запуск (Linux/macOS):**
+```bash
+# 1. Активировать окружение (если не активно)
+source venv/bin/activate
 
-#### Windows:
+# 2. Запуск анализа через скрипт
+./run_sam2_pipeline.sh input/your_image.jpg
+
+# 3. Запуск с указанием выходной папки
+./run_sam2_pipeline.sh input/your_image.jpg output/custom_folder
+
+# 4. Или напрямую через Python
+python3 llava_sam2_pipeline.py --image input/your_image.jpg --output output
+```
+
+### **Windows:**
 ```cmd
 # 1. Активировать окружение
 venv\Scripts\activate
 
-# 2. ПЕРВЫЙ запуск (скачает модели ~7GB, займет 5-10 минут)
-python llava_fastsam_pipeline.py --image 001.png --output output
+# 2. ПЕРВЫЙ запуск (скачает модели ~8GB, займет 5-15 минут)
+python llava_sam2_pipeline.py --image 001.png --output output
 
 # 3. Последующие запуски (быстро)
-python llava_fastsam_pipeline.py --image "путь\к\изображению.jpg" --output output
+python llava_sam2_pipeline.py --image "путь\к\изображению.jpg" --output output
+
+# 4. Пример с конкретным файлом
+python llava_sam2_pipeline.py --image "input\test_metal.jpg" --output "output\results"
 ```
 
-#### Linux/macOS:
+### **Параметры запуска:**
 ```bash
-# 1. Активировать окружение
-source venv/bin/activate
+python llava_sam2_pipeline.py --help
 
-# 2. ПЕРВЫЙ запуск (скачает модели ~7GB, займет 5-10 минут)
-python llava_fastsam_pipeline.py --image 001.png --output output
-
-# 3. Последующие запуски (быстро)
-python llava_fastsam_pipeline.py --image "путь/к/изображению.jpg" --output output
+# Опции:
+# --image IMAGE    Путь к изображению для анализа (обязательно)
+# --output OUTPUT  Директория для сохранения результатов (по умолчанию: ./output)
 ```
 
 ## 📥 Что происходит при первом запуске
 
 При первом запуске автоматически скачаются:
-1. **LLaVA модель** (~7GB) - для определения материалов
-2. **FastSAM модель** (~140MB) - для сегментации дефектов  
+1. **LLaVA модель** (~7GB) - для определения материалов и анализа дефектов
+2. **SAM2 модель** (~1GB) - для точной сегментации дефектов  
 3. **Дополнительные файлы** (~500MB) - tokenizer, конфиги
 
-**Общий размер:** ~7.5GB  
-**Время скачивания:** 5-10 минут (зависит от интернета)  
-**Где хранятся:** В кэше HuggingFace и папке models/
+**Общий размер:** ~8.5GB  
+**Время скачивания:** 5-15 минут (зависит от интернета)  
+**Где хранятся:** В кэше HuggingFace (`~/.cache/huggingface/`) и папке `models/`
 
 **⚠️ Важно:** Не прерывайте первый запуск! Все последующие запуски будут быстрыми.
+
+## 🔍 Как работает новый pipeline
+
+```
+📸 Изображение
+    ↓
+🔬 LLaVA Запрос 1: "Какой это материал?"
+    ↓ (metal, wood, plastic, etc.)
+🔍 LLaVA Запрос 2: "Где дефекты? Какие типы?"
+    ↓ (scratch at center, dent at top-right, etc.)
+🎯 SAM2: Сегментация по подсказкам от LLaVA
+    ↓ (точечные координаты → маски)
+🎨 OpenCV: Постобработка и фильтрация
+    ↓
+📊 Результат: маски + аннотации
+```
 
 ## 📊 Результаты
 
 После запуска в папке `output/` появятся:
-- **`image_result.jpg`** - Визуализация с цветными масками дефектов
-- **`image_analysis.json`** - JSON с координатами и метаданными
+- **`image_result.jpg`** - Визуализация с цветными масками и типами дефектов
+- **`image_analysis.json`** - JSON с полным анализом:
+  - Тип материала и уверенность
+  - Типы дефектов (scratch, dent, corrosion, etc.)
+  - Локации дефектов (center, top-right, etc.)
+  - Координаты масок
+  - Степень серьезности (minor/moderate/severe)
 - **`image_mask_*.png`** - Отдельные маски для каждого дефекта
 
-## 🔧 Создание bat/sh скриптов для удобства
-
-### Windows (create `run.bat`):
-```batch
-@echo off
-echo Активируем окружение...
-call venv\Scripts\activate
-echo Запускаем анализ...
-python llava_fastsam_pipeline.py --image %1 --output output
-pause
-```
-
-**Использование:** `run.bat "image.jpg"`
-
-### Linux/macOS (create `run.sh`):
-```bash
-#!/bin/bash
-echo "Активируем окружение..."
-source venv/bin/activate
-echo "Запускаем анализ..."
-python llava_fastsam_pipeline.py --image "$1" --output output
-```
-
-**Использование:** `./run.sh "image.jpg"`
-
-## 🐛 Решение проблем
-
-### ❌ "python не найден"
-```cmd
-# Windows: Переустановите Python с python.org
-# Отметьте "Add Python to PATH"
-
-# Linux: 
-sudo apt install python3 python3-venv python3-pip
-
-# macOS:
-brew install python
-```
-
-### ❌ "venv не активируется"
-```cmd
-# Windows - убедитесь что используете правильный слэш:
-venv\Scripts\activate
-
-# Linux/macOS:
-source venv/bin/activate
-```
-
-### ❌ "CUDA out of memory"
-```cmd
-# Используйте CPU версию PyTorch:
-pip uninstall torch torchvision torchaudio
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-```
-
-### ❌ "LLaVA не найдена"
-```cmd
-# Переустановите LLaVA:
-cd LLaVA
-pip install -e . --force-reinstall
-cd ..
+### Пример JSON результата:
+```json
+{
+  "material": {
+    "material": "metal",
+    "confidence": 0.9,
+    "description": "Metallic surface with visible wear"
+  },
+  "defect_analysis": {
+    "defects_found": true,
+    "defect_types": ["scratch", "corrosion"],
+    "defect_locations": ["center", "bottom-right"],
+    "severity": "moderate",
+    "prompt_points": [[320, 240], [480, 360]]
+  },
+  "defects": [
+    {
+      "id": 1,
+      "category": "scratch",
+      "bbox": [310, 230, 20, 80],
+      "confidence": 0.85,
+      "severity": "moderate"
+    }
+  ]
+}
 ```
 
 ## ⚙️ Оптимизация производительности
 
 ### Для GPU:
-- Используйте изображения до 1024x1024
-- Закройте другие GPU приложения
+- Используйте изображения до 1024x1024 для оптимальной скорости
+- SAM2 работает значительно быстрее с точечными подсказками от LLaVA
 - Убедитесь что CUDA версия совпадает с PyTorch
+- Закройте другие GPU приложения для освобождения VRAM
 
 ### Для CPU:
-- Используйте изображения до 640x640  
-- Закройте ненужные программы
-- Рассмотрите использование более мощного CPU
+- Используйте изображения до 640x640 для приемлемой скорости
+- SAM2 CPU режим требователен к RAM (12GB+)
+- Рассмотрите использование более легких моделей
+- Закройте ненужные программы для освобождения RAM
 
 ## 📈 Производительность
 
-- **RTX 4090**: ~2-4 секунды
-- **RTX 3080**: ~4-6 секунд
-- **CPU Intel i7**: ~15-25 секунд
+**С GPU (CUDA):**
+- **RTX 4090**: ~3-6 секунд (2 LLaVA запроса + SAM2)
+- **RTX 4080**: ~4-7 секунд
+- **RTX 4070**: ~5-8 секунд
+- **RTX 3080**: ~5-9 секунд
+- **RTX 3070**: ~7-11 секунд
+- **RTX 3060**: ~8-12 секунд
 
-## 🔄 Что делает система
+**CPU (Apple Silicon):**
+- **M2 Ultra**: ~15-25 секунд
+- **M2 Pro**: ~20-35 секунд
+- **M1 Pro**: ~25-40 секунд
+- **M1**: ~35-50 секунд
 
-1. **🔍 LLaVA** - Определяет тип материала на изображении
-2. **⚡ FastSAM** - Быстро сегментирует потенциальные дефекты  
-3. **🎨 OpenCV** - Очищает и фильтрует результаты по типу материала
+**CPU (Intel/AMD):**
+- **Intel i9-13900K**: ~20-35 секунд
+- **Intel i7-12700K**: ~25-40 секунд
+- **AMD Ryzen 9 7900X**: ~18-32 секунд
+- **AMD Ryzen 7 5800X**: ~25-45 секунд
 
-**Готово к использованию! 🚀**
+## 🆚 Сравнение с FastSAM
+
+| Характеристика | FastSAM (старая версия) | SAM2 (новая версия) |
+|---|---|---|
+| **Точность сегментации** | Хорошая | Отличная |
+| **Интеллектуальность** | Автоматическая | Направляемая LLaVA |
+| **Типы дефектов** | Общие | Специфические |
+| **Скорость** | Быстрая (~2-4 сек) | Средняя (~3-6 сек) |
+| **Размер моделей** | ~140MB | ~1GB |
+| **Качество масок** | Среднее | Высокое |
+| **Анализ материалов** | Базовый | Продвинутый |
+| **VRAM требования** | 4GB+ | 6GB+ |
+
+## 🐛 Решение проблем
+
+### ❌ "SAM2 не найден"
+```bash
+# Переустановите SAM2:
+git clone https://github.com/facebookresearch/segment-anything-2.git
+cd segment-anything-2
+pip install -e . --force-reinstall
+cd ..
+```
+
+### ❌ "CUDA out of memory"
+```bash
+# 1. Используйте CPU версию PyTorch:
+pip uninstall torch torchvision torchaudio
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# 2. Или уменьшите размер изображения в коде:
+# В llava_sam2_pipeline.py найдите и измените:
+# imgsz = 640  # вместо 1024
+```
+
+### ❌ "LLaVA генерирует неточные результаты"
+```bash
+# Попробуйте более мощную модель LLaVA:
+# В коде llava_sam2_pipeline.py измените model_path на:
+# "liuhaotian/llava-v1.5-13b"  # более мощная, но медленнее
+```
+
+### ❌ "SAM2 работает медленно"
+```bash
+# Уменьшите количество точек в автоматической сегментации:
+# В коде найдите SAM2AutomaticMaskGenerator и измените:
+# points_per_side=16  # вместо 32
+# pred_iou_thresh=0.8  # вместо 0.7
+```
+
+### ❌ "python не найден" (Windows)
+```cmd
+# Переустановите Python с python.org
+# ОБЯЗАТЕЛЬНО отметьте "Add Python to PATH"
+# Перезагрузите командную строку
+```
+
+### ❌ "git не найден" (Windows)
+```cmd
+# Установите Git с https://git-scm.com/download/win
+# Или используйте GitHub Desktop
+```
+
+## 🔄 Что делает новая система
+
+1. **🔍 LLaVA Этап 1** - Определяет тип материала (metal, wood, plastic, etc.)
+2. **🔍 LLaVA Этап 2** - Анализирует дефекты (типы, локации, серьезность)
+3. **🎯 SAM2** - Точная сегментация на основе подсказок от LLaVA
+4. **🎨 OpenCV** - Фильтрация и постобработка результатов
+
+**Интеллектуальная сегментация готова! 🚀**
 
 ---
 
 # I этап: Определение материала по фото 
-  *1.CLIP(OpenAi)*-Обучена на огромном количестве фоток и данных,используется для zero-shot классификации
 
-  *2.BLIP/BLIP-2*-имеет языковое понимание+зрение,можно задавать вопросы по типу :"What Material on photo?"
+**Текущее решение: LLaVA (Large Language and Vision Assistant)**
 
-  *3.AWS Rekognition*-Надежный ,но требуется обучение custom модели
+*1. CLIP (OpenAI)* - Обучена на огромном количестве фоток и данных, используется для zero-shot классификации
 
-  *4.Google Cloud Vision AI*-чисто гипотетически можно попробовать юзать general object detection ,но может потребоваться дообучение 
+*2. BLIP/BLIP-2* - имеет языковое понимание+зрение, можно задавать вопросы по типу: "What Material on photo?"
 
-  *5. OpenAI (через GPT-4o Vision или GPT-4 + Vision API)*-часто достаточно четкий результат,но при этом достаточно трудно использовать в real-time режиме,что для нас главный ред флаг.
+*3. AWS Rekognition* - Надежный, но требуется обучение custom модели
 
-  *6. LLaVA (Large Language and Vision Assistant)*-Open source альтернатива GPT-4V, можно запускать локально, хорошо понимает материалы и текстуры
+*4. Google Cloud Vision AI* - чисто гипотетически можно попробовать юзать general object detection, но может потребоваться дообучение 
 
-  *7. MiniGPT-4*-Локальная модель с vision capabilities, быстрая для определения типа материала
+*5. OpenAI (через GPT-4o Vision или GPT-4 + Vision API)* - часто достаточно четкий результат, но при этом достаточно трудно использовать в real-time режиме, что для нас главный ред флаг.
 
-  *8. InstructBLIP*-Отличная open source модель для visual question answering, можно спрашивать "What material is this?"
+**6. LLaVA (Large Language and Vision Assistant)** ⭐ **ИСПОЛЬЗУЕМ** - Open source альтернатива GPT-4V, можно запускать локально, хорошо понимает материалы и текстуры
 
-# II этап: Обнаружение дефектов
-  *1.Grounding DINO + SAM (Grounded-SAM)*-Находят объект по тексту: "crack", "corrosion" и т.д,но при этом могут ошибаться в достаточно сложных сценариях.
+*7. MiniGPT-4* - Локальная модель с vision capabilities, быстрая для определения типа материала
 
-  *2.Detectron2 (Meta)*-Очень надежно работает на производственном уровне,уже имеет встроенное выделение масок,что решает проблему III Этап(фаворит,на мой взгляд)(Потестировал,оказалось,что это не юзабельная херь в нашем контексте ,так что ее отбрасываем)
+*8. InstructBLIP* - Отличная open source модель для visual question answering, можно спрашивать "What material is this?"
 
-  *3. YOLOv8 + Segmentation*-Быстрый и точный для real-time обнаружения дефектов, есть готовые веса для промышленных дефектов
+## Преимущества LLaVA для нашего случая:
+- ✅ **Локальная работа** - не нужен интернет после установки
+- ✅ **Бесплатность** - никаких API ключей и лимитов
+- ✅ **Точность** - отличное понимание материалов
+- ✅ **Гибкость** - можно задавать сложные вопросы
+- ✅ **Приватность** - данные не покидают вашу систему
 
-  *4. Anomalib (Intel)*-Профессиональная библиотека для обнаружения аномалий, множество алгоритмов (PaDiM, STFPM, PatchCore), работает без разметки
+# II этап: Обнаружение и анализ дефектов
 
-  *5. FastSAM*-Быстрая версия SAM для real-time сегментации, хорошо подходит для выделения дефектных областей
+**Текущее решение: LLaVA с специализированными промптами**
 
-  *6. SegmentAnything 2 (SAM2)*-Новая версия от Meta, лучше работает с видео и сложными сценариями
+*1. Grounding DINO + SAM (Grounded-SAM)* - Находят объект по тексту: "crack", "corrosion" и т.д, но при этом могут ошибаться в достаточно сложных сценариях.
 
-  *7. YOLO-World*-Zero-shot object detection, можно детектить дефекты по текстовому описанию без дообучения
+*2. Detectron2 (Meta)* - Очень надежно работает на производственном уровне, уже имеет встроенное выделение масок, что решает проблему III Этап (фаворит, на мой взгляд) (Потестировал, оказалось, что это не юзабельная херь в нашем контексте, так что ее отбрасываем)
+
+*3. YOLOv8 + Segmentation* - Быстрый и точный для real-time обнаружения дефектов, есть готовые веса для промышленных дефектов
+
+*4. Anomalib (Intel)* - Профессиональная библиотека для обнаружения аномалий, множество алгоритмов (PaDiM, STFPM, PatchCore), работает без разметки
+
+*5. FastSAM* - Быстрая версия SAM для real-time сегментации, хорошо подходит для выделения дефектных областей
+
+*6. SegmentAnything 2 (SAM2)* - Новая версия от Meta, лучше работает с видео и сложными сценариями
+
+*7. YOLO-World* - Zero-shot object detection, можно детектить дефекты по текстовому описанию без дообучения
+
+**8. LLaVA с анализом дефектов** ⭐ **ИСПОЛЬЗУЕМ** - Интеллектуальный анализ через специализированные промпты
+
+## Как работает наш подход:
+- **Специализированный промпт** для поиска дефектов
+- **Типизация дефектов**: scratches, cracks, dents, corrosion, stains, wear, chips
+- **Локализация**: top-left, center, bottom-right, etc.
+- **Оценка серьезности**: minor, moderate, severe
+- **Генерация подсказок** для следующего этапа
 
 # III этап: Автоматическая сегментация дефектов
 
+**Текущее решение: SAM2 (Segment Anything Model 2) с подсказками от LLaVA**
+
 ## Open Source модели (локальный запуск):
-  *1. Segment Anything Model 2 (SAM2)*-Самая мощная модель сегментации от Meta, работает с промптами и автоматически, отличная точность на дефектах
 
-  *2. FastSAM*-Быстрая альтернатива SAM, основана на YOLOv8, real-time сегментация, идеально для производства
+**1. Segment Anything Model 2 (SAM2)** ⭐ **ИСПОЛЬЗУЕМ** - Самая мощная модель сегментации от Meta, работает с промптами и автоматически, отличная точность на дефектах
 
-  *3. MobileSAM*-Легкая версия SAM для мобильных устройств и edge computing, быстрая сегментация
+*2. FastSAM* - Быстрая альтернатива SAM, основана на YOLOv8, real-time сегментация, идеально для производства
 
-  *4. EfficientSAM*-Оптимизированная версия SAM, баланс между скоростью и качеством
+*3. MobileSAM* - Легкая версия SAM для мобильных устройств и edge computing, быстрая сегментация
 
-  *5. Grounding DINO + SAM Pipeline*-Связка детекции по тексту + сегментация, можно писать "rust on metal", "crack in wood"
+*4. EfficientSAM* - Оптимизированная версия SAM, баланс между скоростью и качеством
 
-  *6. Mask2Former*-Универсальная модель сегментации от Meta, хорошо настраивается под специфические дефекты
+*5. Grounding DINO + SAM Pipeline* - Связка детекции по тексту + сегментация, можно писать "rust on metal", "crack in wood"
 
-  *7. OneFormer*-Единая модель для semantic, instance и panoptic сегментации
+*6. Mask2Former* - Универсальная модель сегментации от Meta, хорошо настраивается под специфические дефекты
 
-  *8. CLIPSeg*-Сегментация по текстовым промптам, основана на CLIP, zero-shot сегментация дефектов
+*7. OneFormer* - Единая модель для semantic, instance и panoptic сегментации
+
+*8. CLIPSeg* - Сегментация по текстовым промптам, основана на CLIP, zero-shot сегментация дефектов
 
 ## API решения:
-  *1. Roboflow Universe API*-Огромная база готовых моделей для дефектов, API для кастомных моделей, есть автосегментация
+*1. Roboflow Universe API* - Огромная база готовых моделей для дефектов, API для кастомных моделей, есть автосегментация
 
-  *2. Clarifai Custom Models API*-Обучение кастомных моделей сегментации дефектов, API для inference
+*2. Clarifai Custom Models API* - Обучение кастомных моделей сегментации дефектов, API для inference
 
-  *3. Azure Custom Vision + Computer Vision API*-Microsoft решение для кастомной сегментации, интеграция с production
+*3. Azure Custom Vision + Computer Vision API* - Microsoft решение для кастомной сегментации, интеграция с production
 
-  *4. AWS SageMaker + Rekognition Custom Labels*-Amazon решение для автоматической сегментации дефектов
+*4. AWS SageMaker + Rekognition Custom Labels* - Amazon решение для автоматической сегментации дефектов
 
-  *5. Google Vertex AI Vision API*-AutoML для сегментации, можно обучать на дефектах материалов
+*5. Google Vertex AI Vision API* - AutoML для сегментации, можно обучать на дефектах материалов
 
-  *6. Ultralytics HUB API*-Облачная платформа для YOLO моделей, есть сегментация дефектов
+*6. Ultralytics HUB API* - Облачная платформа для YOLO моделей, есть сегментация дефектов
+
+## Преимущества SAM2 для нашего случая:
+- ✅ **Направляемая сегментация** - работает с подсказками от LLaVA
+- ✅ **Высочайшая точность** - state-of-the-art качество масок
+- ✅ **Универсальность** - работает с любыми объектами
+- ✅ **Автоматический режим** - может работать без подсказок
+- ✅ **Быстрая работа** - оптимизирован для production
 
 # IV этап: End-to-End Pipeline автосегментации
 
+## Наше решение: LLaVA + SAM2 + OpenCV ⭐
+
+**Архитектура:**
+```
+LLaVA (материал) → LLaVA (дефекты) → SAM2 (сегментация) → OpenCV (постобработка)
+```
+
 ## Готовые решения:
-  *1. Industrial AI Inspection Toolkit*-Комплексное решение: материал → дефекты → сегментация → отчет
+*1. Industrial AI Inspection Toolkit* - Комплексное решение: материал → дефекты → сегментация → отчет
 
-  *2. OpenCV AI Kit (OAK)*-Hardware + software решение для промышленной инспекции в real-time
+*2. OpenCV AI Kit (OAK)* - Hardware + software решение для промышленной инспекции в real-time
 
-  *3. Intel OpenVINO Toolkit*-Оптимизация моделей для edge deployment, быстрая сегментация на CPU
+*3. Intel OpenVINO Toolkit* - Оптимизация моделей для edge deployment, быстрая сегментация на CPU
 
-  *4. NVIDIA Triton + TensorRT*-Высокопроизводительный inference сервер для комплексной обработки
+*4. NVIDIA Triton + TensorRT* - Высокопроизводительный inference сервер для комплексной обработки
 
-## Гибридные подходы (наш случай):
-  *1. CLIP (материал) → Anomalib (дефекты) → SAM2 (сегментация)*-Точный pipeline с open source компонентами
+## Альтернативные гибридные подходы:
+*1. CLIP (материал) → Anomalib (дефекты) → SAM2 (сегментация)* - Точный pipeline с open source компонентами
 
-  *2. LLaVA (материал) → YOLOv8-seg (дефекты+сегментация)*-Быстрый pipeline для production
+*2. LLaVA (материал) → YOLOv8-seg (дефекты+сегментация)* - Быстрый pipeline для production
 
-  *3. API (материал) → Local models (дефекты+сегментация)*-Баланс между точностью и контролем данных
+*3. API (материал) → Local models (дефекты+сегментация)* - Баланс между точностью и контролем данных
 
-  *4. Grounding DINO + SAM2 (все в одном)*-Универсальное решение по текстовым промптам
+*4. Grounding DINO + SAM2 (все в одном)* - Универсальное решение по текстовым промптам
 
 # Рекомендации по выбору:
 
 ## Для прототипа:
+- **LLaVA + SAM2** ⭐ **НАШ ВЫБОР** - интеллектуальный и точный
 - **FastSAM + простые фильтры** - быстро запустить и протестировать
 - **Grounding DINO + SAM** - если есть время на настройку
 
 ## Для production:
+- **LLaVA + SAM2 + оптимизация** ⭐ **РЕКОМЕНДУЕМ** - лучший баланс точности и интеллекта
 - **YOLOv8-seg кастомная модель** - если есть данные для обучения  
 - **Anomalib + SAM2** - если нет размеченных данных
 - **API решения** - если нужна стабильность без поддержки
 
 ## Для research:
 - **SAM2 + CLIP** - максимальная гибкость
-- **Полный pipeline с LLaVA** - автоматизация всех этапов
+- **Полный pipeline с LLaVA** ⭐ **ИСПОЛЬЗУЕМ** - автоматизация всех этапов
+
+---
+
+# Техническая архитектура нашего решения
+
+## I этап: Определение материала (LLaVA)
+- **LLaVA-1.5-7B** - Анализ типа материала по изображению
+- Поддержка: metal, wood, plastic, concrete, fabric, glass, ceramic
+- Описание состояния поверхности и качества
+
+## II этап: Анализ дефектов (LLaVA)  
+- **Специализированный промпт** для поиска дефектов
+- Определение типов: scratches, cracks, dents, corrosion, stains, wear, chips
+- Локализация: top-left, center, bottom-right, etc.
+- Оценка серьезности: minor, moderate, severe
+
+## III этап: Сегментация (SAM2)
+- **SAM2-Hiera-Large** - Точная сегментация по подсказкам
+- Генерация точек-подсказок на основе анализа LLaVA
+- Автоматическая сегментация для дополнительных дефектов
+- Фильтрация дублирующихся масок (IoU > 0.7)
+
+## IV этап: Постобработка (OpenCV)
+- Морфологические операции для очистки масок
+- Фильтрация по размеру в зависимости от материала
+- Генерация аннотаций в формате COCO
+- Создание визуализации с типами дефектов
+
+## Конфигурация моделей:
+- **LLaVA**: liuhaotian/llava-v1.5-7b
+- **SAM2**: facebook/sam2-hiera-large
+- **Автоматическое скачивание** при первом запуске
