@@ -380,15 +380,37 @@ class HybridDefectDetector:
         
         return annotations
     
+    def _convert_numpy_to_json(self, obj):
+        """Рекурсивная конвертация numpy массивов в JSON-совместимые типы"""
+        import numpy as np
+        
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, dict):
+            return {key: self._convert_numpy_to_json(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self._convert_numpy_to_json(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(self._convert_numpy_to_json(item) for item in obj)
+        else:
+            return obj
+    
     def _save_hybrid_results(self, image_path, image, masks, results, output_path):
         """Сохранение результатов гибридного анализа"""
         
         image_name = Path(image_path).stem
         
+        # Конвертация numpy массивов перед сериализацией
+        json_compatible_results = self._convert_numpy_to_json(results)
+        
         # JSON с результатами
         json_path = output_path / f"{image_name}_hybrid_analysis.json"
         with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
+            json.dump(json_compatible_results, f, ensure_ascii=False, indent=2)
         
         # Визуализация
         visualization = self._create_hybrid_visualization(image, masks, results)
