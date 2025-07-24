@@ -69,8 +69,16 @@ except ImportError as e:
 class MaterialAndDefectAnalyzer:
     """LLaVA для определения типа материала и анализа дефектов"""
     
-    def __init__(self, model_path="liuhaotian/llava-v1.5-7b"):
+    def __init__(self, model_path="liuhaotian/llava-v1.5-13b"):
         self.model_path = model_path
+        
+        # Доступные модели по уровню детализации
+        self.available_models = {
+            "detailed": "liuhaotian/llava-v1.5-13b",  # 13B - очень детальный анализ
+            "standard": "liuhaotian/llava-v1.5-7b",   # 7B - стандартный
+            "latest": "liuhaotian/llava-v1.6-vicuna-13b",  # Новейшая 13B версия
+            "onevision": "lmms-lab/llava-onevision-qwen2-7b-ov"  # Специально для детального анализа
+        }
         self.model = None
         self.tokenizer = None
         self.image_processor = None
@@ -78,6 +86,24 @@ class MaterialAndDefectAnalyzer:
         
         if LLAVA_AVAILABLE:
             self._load_model()
+    
+    def switch_model(self, model_type="detailed"):
+        """Переключение на другую модель LLaVA для разного уровня детализации"""
+        if model_type in self.available_models:
+            print(f"🔄 Переключаемся на модель: {model_type}")
+            self.model_path = self.available_models[model_type]
+            self._load_model()
+        else:
+            print(f"❌ Неизвестный тип модели: {model_type}")
+            print(f"✅ Доступные типы: {list(self.available_models.keys())}")
+    
+    def get_model_info(self):
+        """Информация о текущей модели"""
+        return {
+            "current_model": self.model_path,
+            "available_models": self.available_models,
+            "model_loaded": self.model is not None
+        }
     
     def _load_model(self):
         """Загрузка модели LLaVA"""
@@ -91,17 +117,33 @@ class MaterialAndDefectAnalyzer:
         try:
             self.model_name = get_model_name_from_path(self.model_path)
             
-            # Настройки в зависимости от устройства
+            # Определяем размер модели для оптимизации
+            is_large_model = "13b" in self.model_path.lower() or "34b" in self.model_path.lower()
+            
+            print(f"📊 Модель: {self.model_path}")
+            print(f"📏 Большая модель: {is_large_model}")
+            
+            # Настройки в зависимости от устройства и размера модели
             if DEVICE == 'cuda':
-                # CUDA (Windows/Linux with NVIDIA GPU) - ПРИНУДИТЕЛЬНО float16
-                self.tokenizer, self.model, self.image_processor, self.context_len = load_pretrained_model(
-                    self.model_path, None, self.model_name, 
-                    device_map="auto",
-                    load_8bit=False, load_4bit=False,
-                    torch_dtype=torch.float16  # Принудительно float16
-                )
-                # ПРИНУДИТЕЛЬНО приводим всю модель к float16
-                self.model = self.model.half()
+                # CUDA - оптимизации для больших моделей
+                if is_large_model:
+                    print("🔧 Применяем оптимизации для большой модели...")
+                    self.tokenizer, self.model, self.image_processor, self.context_len = load_pretrained_model(
+                        self.model_path, None, self.model_name, 
+                        device_map="auto",
+                        load_8bit=True,  # 8bit для экономии памяти на больших моделях
+                        load_4bit=False,
+                        torch_dtype=torch.float16
+                    )
+                else:
+                    # Стандартная загрузка для 7B модели
+                    self.tokenizer, self.model, self.image_processor, self.context_len = load_pretrained_model(
+                        self.model_path, None, self.model_name, 
+                        device_map="auto",
+                        load_8bit=False, load_4bit=False,
+                        torch_dtype=torch.float16
+                    )
+                    self.model = self.model.half()
                 
             elif DEVICE == 'mps':
                 # Apple Silicon
@@ -188,45 +230,41 @@ class MaterialAndDefectAnalyzer:
             }
     
     def analyze_defects(self, image_path, material_type="unknown"):
-        """Анализ дефектов на изображении с помощью LLaVA"""
+        """Двухэтапный анализ дефектов: сначала найти объекты с координатами, потом анализировать дефекты"""
         if not LLAVA_AVAILABLE or self.model is None:
             # Заглушка
             print("⚠️ LLaVA недоступна, используем заглушку для анализа дефектов")
             return {
                 "defects_found": True,
-                "defect_types": ["scratch", "dent"],
-                "defect_locations": ["center", "top-right"],
+                "defect_types": ["scratch", "dent", "missing_part"],
+                "defect_locations": ["center", "top-right", "edge"],
                 "severity": "moderate",
-                "description": "Detected potential surface defects",
-                "prompt_points": [[320, 240], [400, 150]]  # Примерные координаты
+                "completeness": "incomplete",
+                "description": "Detected potential surface defects and structural issues",
+                "bounding_boxes": [(0.2, 0.2, 0.8, 0.8)],  # x1, y1, x2, y2 (normalized)
+                "prompt_points": [[320, 240], [400, 150], [200, 300]]
             }
         
         try:
             # Загрузка изображения
             image = Image.open(image_path).convert('RGB')
             
-            # Специализированный промпт для анализа дефектов
-            defect_prompt = f"""Analyze this {material_type} surface for defects and damage. Look carefully for:
-            - Scratches, cracks, dents, chips
-            - Discoloration, stains, corrosion
-            - Surface irregularities, wear patterns
-            - Any other visible damage or imperfections
+            # ЭТАП 1: Найти все объекты с точными координатами
+            print("🔍 Этап 1: Поиск объектов и их локализация...")
+            object_detection_result = self._detect_objects_with_coordinates(image, material_type)
             
-            Describe:
-            1. Are there any visible defects? (Yes/No)
-            2. What types of defects do you see?
-            3. Where are they located on the surface? (use terms like top-left, center, bottom-right, etc.)
-            4. How severe are the defects? (minor/moderate/severe)
-            5. Estimate approximate locations as coordinates if possible (describe relative positions)
+            # ЭТАП 2: Детальный анализ каждого найденного объекта
+            print("🔬 Этап 2: Детальный анализ найденных объектов...")
+            defect_analysis_result = self._analyze_objects_for_defects(image, object_detection_result, material_type)
             
-            Be very specific about defect locations and types."""
+            # Комбинируем результаты
+            combined_result = {
+                **defect_analysis_result,
+                "bounding_boxes": object_detection_result.get("bounding_boxes", []),
+                "objects_found": object_detection_result.get("objects_found", [])
+            }
             
-            response = self._get_llava_response(image, defect_prompt)
-            
-            # Парсинг результата анализа дефектов
-            defect_analysis = self._parse_defect_analysis(response, image.size)
-            
-            return defect_analysis
+            return combined_result
             
         except Exception as e:
             print(f"❌ Ошибка анализа дефектов: {e}")
@@ -236,8 +274,155 @@ class MaterialAndDefectAnalyzer:
                 "defect_locations": [],
                 "severity": "unknown",
                 "description": "failed to analyze defects",
+                "bounding_boxes": [],
                 "prompt_points": []
             }
+    
+    def _detect_objects_with_coordinates(self, image, material_type):
+        """ЭТАП 1: Поиск объектов с точными координатами bounding box"""
+        
+        # Промпт для поиска объектов с координатами
+        detection_prompt = f"""OBJECT DETECTION TASK: Analyze this {material_type} image and identify ALL visible objects/components with their EXACT locations.
+
+        For each object you see, provide:
+        1. Object type (wire, cable, connector, screw, pin, contact, etc.)
+        2. Bounding box coordinates in format: (x1, y1, x2, y2)
+        3. Brief description of the object
+        
+        COORDINATE FORMAT:
+        - Use normalized coordinates (0.0 to 1.0)
+        - (x1, y1) = top-left corner
+        - (x2, y2) = bottom-right corner
+        - Example: wire at top-left would be (0.1, 0.1, 0.4, 0.3)
+        
+        FOCUS ON FINDING:
+        - Individual wires and wire strands
+        - Cables and cable bundles
+        - Connectors, pins, terminals
+        - Screws, bolts, fasteners
+        - Electronic components
+        - Any damaged or missing areas
+        
+        OUTPUT FORMAT:
+        Object: wire_strand_1, Box: (0.2, 0.3, 0.25, 0.4), Description: thin copper wire
+        Object: connector_pin, Box: (0.5, 0.1, 0.55, 0.15), Description: metal contact pin
+        Object: missing_area, Box: (0.7, 0.6, 0.8, 0.7), Description: gap where component should be
+        
+        Be very precise with coordinates. Look for EVERYTHING, including tiny details."""
+        
+        response = self._get_llava_response(image, detection_prompt)
+        
+        # Парсинг координат объектов
+        return self._parse_object_coordinates(response)
+    
+    def _analyze_objects_for_defects(self, image, detection_result, material_type):
+        """ЭТАП 2: Детальный анализ каждого найденного объекта на предмет дефектов"""
+        
+        objects_info = "\n".join([f"- {obj['type']}: {obj['description']} at {obj['box']}" 
+                                 for obj in detection_result.get("objects_found", [])])
+        
+        analysis_prompt = f"""DEFECT ANALYSIS: Based on the detected objects below, analyze each one for defects and issues.
+
+        DETECTED OBJECTS:
+        {objects_info}
+        
+        CRITICAL ANALYSIS FOR {material_type.upper()}:
+        
+        **WIRE & CABLE INSPECTION:**
+        - Count individual wire strands in each cable
+        - Check if any copper wires are missing from bundles
+        - Look for exposed/protruding wire strands
+        - Verify insulation integrity
+        - Check wire routing and positioning
+        
+        **CONNECTOR ANALYSIS:**
+        - Verify all pins/contacts are present
+        - Check for bent or damaged pins
+        - Look for corrosion or oxidation
+        - Verify proper alignment and seating
+        
+        **STRUCTURAL INSPECTION:**
+        - Identify missing components or fasteners
+        - Check for cracks, breaks, or deformation
+        - Look for incomplete assemblies
+        - Verify proper component orientation
+        
+        **SURFACE EXAMINATION:**
+        - Detect scratches, dents, wear patterns
+        - Look for discoloration or staining
+        - Check for coating or paint damage
+        
+        PROVIDE DETAILED ANALYSIS:
+        1. Are there visible defects? (Yes/No)
+        2. What specific defects do you see for each object?
+        3. For wires: Are any strands missing or protruding?
+        4. For connectors: Are all pins present and undamaged?
+        5. Rate severity: minor/moderate/severe/critical
+        6. Is the assembly complete or incomplete?
+        7. Describe the overall condition and any missing parts
+        
+        Focus on identifying subtle issues like individual missing wire strands or slightly bent pins."""
+        
+        response = self._get_llava_response(image, analysis_prompt)
+        
+        # Парсинг результата анализа дефектов
+        return self._parse_defect_analysis(response, image.size)
+    
+    def _parse_object_coordinates(self, response):
+        """Парсинг координат объектов из ответа LLaVA"""
+        import re
+        
+        objects_found = []
+        bounding_boxes = []
+        
+        # Поиск объектов в формате: Object: name, Box: (x1, y1, x2, y2), Description: desc
+        pattern = r'Object:\s*([^,]+),\s*Box:\s*\(([^)]+)\),\s*Description:\s*(.+)'
+        matches = re.findall(pattern, response, re.IGNORECASE)
+        
+        for match in matches:
+            object_type = match[0].strip()
+            coords_str = match[1].strip()
+            description = match[2].strip()
+            
+            try:
+                # Парсинг координат
+                coords = [float(x.strip()) for x in coords_str.split(',')]
+                if len(coords) == 4:
+                    x1, y1, x2, y2 = coords
+                    # Валидация координат (должны быть в диапазоне 0-1)
+                    if all(0 <= coord <= 1 for coord in coords) and x2 > x1 and y2 > y1:
+                        objects_found.append({
+                            "type": object_type,
+                            "box": (x1, y1, x2, y2),
+                            "description": description
+                        })
+                        bounding_boxes.append((x1, y1, x2, y2))
+            except (ValueError, IndexError):
+                continue
+        
+        # Если не найдены объекты в правильном формате, пытаемся найти любые координаты
+        if not bounding_boxes:
+            coord_pattern = r'\(([0-9.]+),\s*([0-9.]+),\s*([0-9.]+),\s*([0-9.]+)\)'
+            coord_matches = re.findall(coord_pattern, response)
+            
+            for match in coord_matches:
+                try:
+                    coords = [float(x) for x in match]
+                    if all(0 <= coord <= 1 for coord in coords) and coords[2] > coords[0] and coords[3] > coords[1]:
+                        bounding_boxes.append(tuple(coords))
+                        objects_found.append({
+                            "type": "detected_object",
+                            "box": tuple(coords),
+                            "description": "Object detected from coordinates"
+                        })
+                except ValueError:
+                    continue
+        
+        return {
+            "objects_found": objects_found,
+            "bounding_boxes": bounding_boxes,
+            "detection_response": response
+        }
     
     def _get_llava_response(self, image, prompt):
         """Получение ответа от LLaVA"""
@@ -266,8 +451,13 @@ class MaterialAndDefectAnalyzer:
         if hasattr(image_tensor, 'to'):
             image_tensor = image_tensor.to(DEVICE, dtype=target_dtype)
         
-        # Настройки генерации в зависимости от устройства
-        max_tokens = 512 if DEVICE == 'cuda' else 256
+        # Настройки генерации в зависимости от устройства и модели
+        is_large_model = "13b" in self.model_path.lower() or "34b" in self.model_path.lower()
+        
+        if DEVICE == 'cuda':
+            max_tokens = 1024 if is_large_model else 512  # Больше токенов для детального анализа
+        else:
+            max_tokens = 512 if is_large_model else 256
         
         with torch.inference_mode():
             output_ids = self.model.generate(
@@ -311,51 +501,98 @@ class MaterialAndDefectAnalyzer:
         """Парсинг результата анализа дефектов"""
         response_lower = response.lower()
         
-        # Определение наличия дефектов
-        defects_found = any(word in response_lower for word in ["yes", "defect", "damage", "scratch", "crack", "dent", "stain"])
+        # Определение наличия дефектов/проблем
+        defects_found = any(word in response_lower for word in [
+            "yes", "defect", "damage", "scratch", "crack", "dent", "stain", 
+            "missing", "broken", "incomplete", "separated", "detached", "bent"
+        ])
         
-        # Типы дефектов
+        # Расширенные типы дефектов и проблем (включая мелкие детали)
         defect_types = []
         defect_keywords = {
-            "scratch": ["scratch", "scratches", "scrape"],
-            "crack": ["crack", "cracks", "fracture"],
-            "dent": ["dent", "dents", "deformation"],
-            "corrosion": ["rust", "corrosion", "oxidation"],
-            "stain": ["stain", "discoloration", "spot"],
-            "wear": ["wear", "worn", "erosion"],
-            "chip": ["chip", "chips", "chipping"]
+            # Поверхностные дефекты
+            "scratch": ["scratch", "scratches", "scrape", "scraping"],
+            "crack": ["crack", "cracks", "fracture", "split", "tear"],
+            "dent": ["dent", "dents", "deformation", "depression"],
+            "corrosion": ["rust", "corrosion", "oxidation", "rusted"],
+            "stain": ["stain", "discoloration", "spot", "mark"],
+            "wear": ["wear", "worn", "erosion", "abraded"],
+            "chip": ["chip", "chips", "chipping", "flaking"],
+            
+            # Структурные проблемы
+            "missing_part": ["missing", "absent", "lost", "hole where", "should be"],
+            "broken_off": ["broken off", "detached", "separated", "fell off", "torn off"],
+            "bent": ["bent", "twisted", "warped", "deformed", "curved"],
+            "incomplete": ["incomplete", "unfinished", "partial", "half"],
+            "loose": ["loose", "wobbling", "unstable", "not secure"],
+            "gap": ["gap", "space", "opening", "separation"],
+            "asymmetry": ["asymmetric", "uneven", "lopsided", "misaligned"],
+            
+            # Проблемы с проводами и кабелями (НОВОЕ!)
+            "wire_missing": ["missing wire", "wire missing", "missing strand", "strand missing", "wire absent"],
+            "wire_exposed": ["exposed wire", "wire sticking", "protruding wire", "wire out", "copper showing"],
+            "wire_frayed": ["frayed wire", "frayed", "wire broken", "damaged wire", "torn wire"],
+            "wire_misrouted": ["misrouted", "wrong position", "incorrect routing", "wire placement"],
+            "insulation_damage": ["damaged insulation", "insulation broken", "bare copper", "exposed copper"],
+            
+            # Проблемы с соединениями и контактами
+            "connector_issue": ["missing pin", "pin missing", "connector damage", "contact issue"],
+            "solder_defect": ["cold joint", "solder crack", "poor solder", "excess solder"],
+            "contact_corrosion": ["corroded contact", "contact corrosion", "oxidized contact"],
+            "misalignment": ["misaligned", "not aligned", "crooked", "tilted"],
+            
+            # Мелкие компоненты
+            "tiny_missing": ["tiny", "small missing", "micro component", "fastener missing"],
+            "assembly_error": ["not seated", "not inserted", "wrong orientation", "upside down"],
+            
+            # Проблемы целостности
+            "fracture": ["fractured", "broken", "split", "cracked through"],
+            "edge_damage": ["edge damage", "torn edge", "damaged edge"],
+            "dimensional": ["wrong size", "distorted", "out of shape"]
         }
         
         for defect_type, keywords in defect_keywords.items():
             if any(keyword in response_lower for keyword in keywords):
                 defect_types.append(defect_type)
         
-        # Локации дефектов
+        # Расширенные локации дефектов
         defect_locations = []
         location_keywords = {
-            "top-left": ["top-left", "top left", "upper left"],
+            "top-left": ["top-left", "top left", "upper left", "corner top-left"],
             "top-center": ["top-center", "top center", "upper center", "top"],
-            "top-right": ["top-right", "top right", "upper right"],
+            "top-right": ["top-right", "top right", "upper right", "corner top-right"],
             "center-left": ["center-left", "center left", "middle left", "left"],
-            "center": ["center", "middle", "central"],
+            "center": ["center", "middle", "central", "middle area"],
             "center-right": ["center-right", "center right", "middle right", "right"],
-            "bottom-left": ["bottom-left", "bottom left", "lower left"],
+            "bottom-left": ["bottom-left", "bottom left", "lower left", "corner bottom-left"],
             "bottom-center": ["bottom-center", "bottom center", "lower center", "bottom"],
-            "bottom-right": ["bottom-right", "bottom right", "lower right"]
+            "bottom-right": ["bottom-right", "bottom right", "lower right", "corner bottom-right"],
+            "edge": ["edge", "rim", "border", "perimeter"],
+            "corner": ["corner", "angle", "joint"],
+            "multiple": ["multiple", "several", "various", "throughout"]
         }
         
         for location, keywords in location_keywords.items():
             if any(keyword in response_lower for keyword in keywords):
                 defect_locations.append(location)
         
-        # Определение серьезности
+        # Определение серьезности (включая критический уровень)
         severity = "unknown"
-        if any(word in response_lower for word in ["severe", "serious", "major", "significant"]):
+        if any(word in response_lower for word in ["critical", "catastrophic", "complete failure", "totally broken"]):
+            severity = "critical"
+        elif any(word in response_lower for word in ["severe", "serious", "major", "significant", "extensive"]):
             severity = "severe"
-        elif any(word in response_lower for word in ["moderate", "medium", "noticeable"]):
+        elif any(word in response_lower for word in ["moderate", "medium", "noticeable", "considerable"]):
             severity = "moderate"
-        elif any(word in response_lower for word in ["minor", "small", "slight", "light"]):
+        elif any(word in response_lower for word in ["minor", "small", "slight", "light", "superficial"]):
             severity = "minor"
+        
+        # Определение полноты объекта
+        completeness = "unknown"
+        if any(word in response_lower for word in ["complete", "intact", "whole", "all parts present"]):
+            completeness = "complete"
+        elif any(word in response_lower for word in ["incomplete", "missing parts", "partial", "broken off"]):
+            completeness = "incomplete"
         
         # Генерация точек-подсказок для SAM2 на основе локаций
         prompt_points = self._generate_prompt_points(defect_locations, image_size)
@@ -365,6 +602,7 @@ class MaterialAndDefectAnalyzer:
             "defect_types": defect_types,
             "defect_locations": defect_locations,
             "severity": severity,
+            "completeness": completeness,
             "description": response,
             "prompt_points": prompt_points
         }
@@ -374,7 +612,7 @@ class MaterialAndDefectAnalyzer:
         width, height = image_size
         prompt_points = []
         
-        # Карта локаций в координаты (относительные)
+        # Расширенная карта локаций в координаты (относительные)
         location_map = {
             "top-left": (0.25, 0.25),
             "top-center": (0.5, 0.25),
@@ -384,8 +622,21 @@ class MaterialAndDefectAnalyzer:
             "center-right": (0.75, 0.5),
             "bottom-left": (0.25, 0.75),
             "bottom-center": (0.5, 0.75),
-            "bottom-right": (0.75, 0.75)
+            "bottom-right": (0.75, 0.75),
+            "edge": (0.5, 0.1),  # Верхний край
+            "corner": (0.9, 0.1),  # Правый верхний угол
         }
+        
+        # Специальная обработка для множественных локаций
+        if "multiple" in locations:
+            # Добавляем несколько точек для множественных дефектов
+            multiple_points = [
+                (0.3, 0.3), (0.7, 0.3), (0.3, 0.7), (0.7, 0.7), (0.5, 0.5)
+            ]
+            for rel_x, rel_y in multiple_points:
+                x = int(rel_x * width)
+                y = int(rel_y * height)
+                prompt_points.append([x, y])
         
         for location in locations:
             if location in location_map:
@@ -399,14 +650,46 @@ class MaterialAndDefectAnalyzer:
             prompt_points.append([width // 2, height // 2])
         
         return prompt_points
+    
+    def _generate_points_from_boxes(self, bounding_boxes, image_size):
+        """Генерация точек из bounding boxes для дополнительных промптов"""
+        width, height = image_size
+        points = []
+        
+        for bbox in bounding_boxes:
+            x1_norm, y1_norm, x2_norm, y2_norm = bbox
+            
+            # Центральная точка bounding box
+            center_x = int((x1_norm + x2_norm) / 2 * width)
+            center_y = int((y1_norm + y2_norm) / 2 * height)
+            points.append([center_x, center_y])
+            
+            # Также добавляем несколько точек внутри box для лучшего покрытия
+            box_width = (x2_norm - x1_norm) * width
+            box_height = (y2_norm - y1_norm) * height
+            
+            # Добавляем дополнительные точки только для больших объектов
+            if box_width > 50 and box_height > 50:
+                # Четыре точки в квадрантах
+                quad_points = [
+                    [int((x1_norm + (x2_norm - x1_norm) * 0.3) * width), 
+                     int((y1_norm + (y2_norm - y1_norm) * 0.3) * height)],
+                    [int((x1_norm + (x2_norm - x1_norm) * 0.7) * width), 
+                     int((y1_norm + (y2_norm - y1_norm) * 0.3) * height)],
+                    [int((x1_norm + (x2_norm - x1_norm) * 0.3) * width), 
+                     int((y1_norm + (y2_norm - y1_norm) * 0.7) * height)],
+                    [int((x1_norm + (x2_norm - x1_norm) * 0.7) * width), 
+                     int((y1_norm + (y2_norm - y1_norm) * 0.7) * height)]
+                ]
+                points.extend(quad_points)
+        
+        return points
 
 
 class SAM2DefectSegmenter:
     """SAM2 для точной сегментации дефектов на основе подсказок от LLaVA"""
     
-    def __init__(self, model_path="./models/sam2_hiera_large.pt", config="sam2_hiera_l.yaml"):
-        self.model_path = model_path
-        self.config = config
+    def __init__(self):
         self.predictor = None
         self.mask_generator = None
         
@@ -417,14 +700,38 @@ class SAM2DefectSegmenter:
         """Загрузка модели SAM2"""
         print("🔄 Загружаем SAM2 модель...")
         try:
-            # Автоматическое скачивание модели если не существует
-            if not Path(self.model_path).exists():
-                print("📥 Скачиваем SAM2 модель...")
-                # Здесь можно добавить автоматическое скачивание
-                self.model_path = "facebook/sam2-hiera-large"  # Используем HuggingFace
+            import os
+            import urllib.request
+            
+            # Путь для сохранения модели
+            models_dir = Path("./models")
+            models_dir.mkdir(exist_ok=True)
+            
+            config_name = "sam2_hiera_l.yaml"
+            checkpoint_path = models_dir / "sam2_hiera_large.pt"
+            
+            # Скачиваем модель если её нет
+            if not checkpoint_path.exists():
+                print("📥 Скачиваем SAM2 модель (это займет несколько минут)...")
+                model_url = "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt"
+                
+                try:
+                    urllib.request.urlretrieve(model_url, checkpoint_path)
+                    print(f"✅ SAM2 модель скачана: {checkpoint_path}")
+                except Exception as e:
+                    print(f"❌ Ошибка скачивания SAM2: {e}")
+                    print("🔄 Пробуем использовать torch.hub...")
+                    # Fallback: пробуем через torch.hub
+                    import torch
+                    checkpoint_path = torch.hub.load_state_dict_from_url(
+                        "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt",
+                        model_dir=str(models_dir)
+                    )
+            
+            print(f"📥 Загружаем SAM2: {config_name} + {checkpoint_path}")
             
             # Создание модели SAM2
-            sam2_model = build_sam2(self.config, self.model_path, device=DEVICE)
+            sam2_model = build_sam2(config_name, str(checkpoint_path), device=DEVICE)
             
             # Создание предиктора для точечных подсказок
             self.predictor = SAM2ImagePredictor(sam2_model)
@@ -443,8 +750,33 @@ class SAM2DefectSegmenter:
             print("✅ SAM2 модель загружена успешно")
         except Exception as e:
             print(f"❌ Ошибка загрузки SAM2: {e}")
-            self.predictor = None
-            self.mask_generator = None
+            print("🔄 Пробуем альтернативный способ загрузки...")
+            
+            try:
+                # Альтернативный способ: используем меньшую модель или упрощенную загрузку
+                print("📥 Загружаем упрощенную версию SAM2...")
+                sam2_model = build_sam2("sam2_hiera_s.yaml", "sam2_hiera_small.pt", device=DEVICE)
+                
+                # Создание предиктора для точечных подсказок
+                self.predictor = SAM2ImagePredictor(sam2_model)
+                
+                # Создание генератора масок для автоматической сегментации
+                self.mask_generator = SAM2AutomaticMaskGenerator(
+                    model=sam2_model,
+                    points_per_side=16,  # Меньше точек для упрощения
+                    pred_iou_thresh=0.7,
+                    stability_score_thresh=0.85,
+                    crop_n_layers=1,
+                    crop_n_points_downscale_factor=2,
+                    min_mask_region_area=100
+                )
+                
+                print("✅ SAM2 упрощенная модель загружена успешно")
+            except Exception as e2:
+                print(f"❌ Окончательная ошибка загрузки SAM2: {e2}")
+                print("⚠️ SAM2 будет недоступен, используется простая сегментация")
+                self.predictor = None
+                self.mask_generator = None
     
     def segment_defects_with_prompts(self, image_path, defect_analysis):
         """Сегментация дефектов с использованием подсказок от LLaVA"""
@@ -462,8 +794,47 @@ class SAM2DefectSegmenter:
             
             all_masks = []
             
-            # Если есть подсказки от LLaVA, используем их
-            if defect_analysis.get("prompt_points"):
+            # ПРИОРИТЕТ 1: Используем bounding boxes от LLaVA (самые точные)
+            if defect_analysis.get("bounding_boxes"):
+                print(f"📦 Используем {len(defect_analysis['bounding_boxes'])} bounding boxes от LLaVA")
+                
+                height, width = image_rgb.shape[:2]
+                
+                for i, bbox in enumerate(defect_analysis["bounding_boxes"]):
+                    try:
+                        # Конвертация нормализованных координат в пиксели
+                        x1_norm, y1_norm, x2_norm, y2_norm = bbox
+                        x1 = int(x1_norm * width)
+                        y1 = int(y1_norm * height)
+                        x2 = int(x2_norm * width)
+                        y2 = int(y2_norm * height)
+                        
+                        # Валидация координат
+                        x1, x2 = max(0, min(x1, x2)), min(width-1, max(x1, x2))
+                        y1, y2 = max(0, min(y1, y2)), min(height-1, max(y1, y2))
+                        
+                        if x2 > x1 and y2 > y1:
+                            # Предсказание маски с использованием bounding box
+                            input_box = np.array([x1, y1, x2, y2])
+                            
+                            masks, scores, logits = self.predictor.predict(
+                                box=input_box[None, :],  # Box prompt
+                                multimask_output=False
+                            )
+                            
+                            # Получаем маску
+                            mask = masks[0]
+                            mask_uint8 = (mask * 255).astype(np.uint8)
+                            all_masks.append(mask_uint8)
+                            
+                            print(f"   ✅ Box {i+1}: точность {scores[0]:.3f}, область ({x1},{y1})-({x2},{y2})")
+                        
+                    except Exception as e:
+                        print(f"   ❌ Ошибка обработки box {i+1}: {e}")
+                        continue
+            
+            # ПРИОРИТЕТ 2: Если нет bounding boxes, используем точки
+            elif defect_analysis.get("prompt_points"):
                 print(f"🎯 Используем {len(defect_analysis['prompt_points'])} точек-подсказок от LLaVA")
                 
                 for i, point in enumerate(defect_analysis["prompt_points"]):
@@ -483,7 +854,7 @@ class SAM2DefectSegmenter:
                         mask_uint8 = (best_mask * 255).astype(np.uint8)
                         all_masks.append(mask_uint8)
                         
-                        print(f"   ✅ Маска {i+1}: точность {scores[best_mask_idx]:.3f}")
+                        print(f"   ✅ Точка {i+1}: точность {scores[best_mask_idx]:.3f}")
                         
                     except Exception as e:
                         print(f"   ❌ Ошибка обработки точки {i+1}: {e}")
@@ -647,10 +1018,20 @@ class OpenCVPostProcessor:
 class DefectAnalysisPipeline:
     """Основной pipeline для анализа дефектов: LLaVA → SAM2 → OpenCV"""
     
-    def __init__(self):
+    def __init__(self, model_type="detailed"):
         self.analyzer = MaterialAndDefectAnalyzer()
+        if model_type != "detailed":
+            self.analyzer.switch_model(model_type)
         self.segmenter = SAM2DefectSegmenter()
         self.postprocessor = OpenCVPostProcessor()
+    
+    def switch_model(self, model_type):
+        """Переключение модели LLaVA для разного уровня детализации"""
+        self.analyzer.switch_model(model_type)
+    
+    def get_model_info(self):
+        """Информация о текущей модели"""
+        return self.analyzer.get_model_info()
     
     def analyze_image(self, image_path, output_dir="./output"):
         """Полный анализ изображения"""
@@ -777,7 +1158,13 @@ class DefectAnalysisPipeline:
             
             # Определение типа дефекта на основе анализа LLaVA
             defect_type = "defect"
-            if i < len(defect_analysis.get("defect_types", [])):
+            object_info = None
+            
+            # Привязка к найденным объектам если они есть
+            if defect_analysis.get("objects_found") and i < len(defect_analysis["objects_found"]):
+                object_info = defect_analysis["objects_found"][i]
+                defect_type = object_info.get("type", "detected_object")
+            elif i < len(defect_analysis.get("defect_types", [])):
                 defect_type = defect_analysis["defect_types"][i]
             
             defect_annotation = {
@@ -786,9 +1173,20 @@ class DefectAnalysisPipeline:
                 "bbox": [x, y, w, h],
                 "area": int(area),
                 "segmentation": [polygon],
-                "confidence": 0.85,  # Выше благодаря LLaVA + SAM2
-                "severity": defect_analysis.get("severity", "unknown")
+                "confidence": 0.90,  # Выше благодаря LLaVA координатам + SAM2
+                "severity": defect_analysis.get("severity", "unknown"),
+                "completeness": defect_analysis.get("completeness", "unknown")
             }
+            
+            # Добавляем информацию об объекте если есть
+            if object_info:
+                defect_annotation.update({
+                    "object_description": object_info.get("description", ""),
+                    "llava_bbox": object_info.get("box", None),
+                    "detection_method": "llava_coordinates"
+                })
+            else:
+                defect_annotation["detection_method"] = "automatic_segmentation"
             
             annotations["defects"].append(defect_annotation)
         
@@ -860,13 +1258,23 @@ class DefectAnalysisPipeline:
         material_info = results["stages"]["material_classification"]["result"]
         defect_info = results["stages"]["defect_analysis"]["result"]
         
-        info_text = f"Material: {material_info['material']} | Defects: {len(masks)}"
+        info_text = f"Material: {material_info['material']} | Issues: {len(masks)}"
         severity_text = f"Severity: {defect_info.get('severity', 'unknown')}"
+        completeness_text = f"Completeness: {defect_info.get('completeness', 'unknown')}"
+        
+        # Цвет текста в зависимости от серьезности
+        text_color = (255, 255, 255)  # Белый по умолчанию
+        if defect_info.get('severity') == 'critical':
+            text_color = (0, 0, 255)  # Красный
+        elif defect_info.get('severity') == 'severe':
+            text_color = (0, 100, 255)  # Оранжевый
         
         cv2.putText(vis_image, info_text, (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, text_color, 2)
         cv2.putText(vis_image, severity_text, (10, 60), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+        cv2.putText(vis_image, completeness_text, (10, 90), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
         
         return vis_image
 
@@ -875,6 +1283,9 @@ def main():
     parser = argparse.ArgumentParser(description="Автоматическая разметка дефектов: LLaVA + SAM2 + OpenCV")
     parser.add_argument("--image", required=True, help="Путь к изображению для анализа")
     parser.add_argument("--output", default="./output", help="Директория для сохранения результатов")
+    parser.add_argument("--model", default="detailed", 
+                       choices=["detailed", "standard", "latest", "onevision"],
+                       help="Тип модели LLaVA: detailed(13B), standard(7B), latest(13B-v1.6), onevision(7B-специальная)")
     
     args = parser.parse_args()
     
@@ -883,8 +1294,13 @@ def main():
         print(f"❌ Файл не найден: {args.image}")
         return
     
-    # Создание pipeline
-    pipeline = DefectAnalysisPipeline()
+    # Создание pipeline с выбранной моделью
+    print(f"🤖 Используем модель: {args.model}")
+    pipeline = DefectAnalysisPipeline(model_type=args.model)
+    
+    # Показываем информацию о модели
+    model_info = pipeline.get_model_info()
+    print(f"📊 Модель загружена: {model_info['current_model']}")
     
     # Запуск анализа
     results = pipeline.analyze_image(args.image, args.output)
