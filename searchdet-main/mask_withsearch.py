@@ -18,6 +18,58 @@ import requests
 from langchain_community.llms import VLLM
 from langchain.chains import LLMChain
 from langchain_core.prompts import PromptTemplate
+import urllib.request
+from pathlib import Path
+
+
+def download_sam_hq_model():
+    """Автоматическое скачивание SAM-HQ модели если её нет"""
+    sam_dir = Path("sam-hq/pretrained_checkpoint")
+    sam_checkpoint = sam_dir / "sam_hq_vit_l.pth"
+    
+    if sam_checkpoint.exists():
+        print(f"✅ SAM-HQ модель уже существует: {sam_checkpoint}")
+        return str(sam_checkpoint)
+    
+    print("📥 SAM-HQ модель не найдена, скачиваем...")
+    
+    # Создаем директорию
+    sam_dir.mkdir(parents=True, exist_ok=True)
+    
+    # URL для скачивания SAM-HQ модели
+    model_url = "https://huggingface.co/lkeab/hq-sam/resolve/main/sam_hq_vit_l.pth"
+    
+    try:
+        print(f"🔄 Скачиваем SAM-HQ модель из {model_url}")
+        print("⚠️ Это займет несколько минут (~1.2GB)...")
+        
+        # Скачиваем с прогресс-баром
+        def reporthook(blocknum, blocksize, totalsize):
+            if totalsize > 0:
+                percent = min(blocknum * blocksize * 100 / totalsize, 100)
+                print(f"\r📥 Прогресс: {percent:.1f}%", end="", flush=True)
+        
+        urllib.request.urlretrieve(model_url, sam_checkpoint, reporthook=reporthook)
+        print(f"\n✅ SAM-HQ модель скачана: {sam_checkpoint}")
+        
+        return str(sam_checkpoint)
+        
+    except Exception as e:
+        print(f"\n❌ Ошибка скачивания SAM-HQ: {e}")
+        print("🔄 Пробуем альтернативный URL...")
+        
+        # Альтернативный URL
+        alt_url = "https://github.com/SysCV/sam-hq/releases/download/v0.3/sam_hq_vit_l.pth"
+        
+        try:
+            urllib.request.urlretrieve(alt_url, sam_checkpoint, reporthook=reporthook)
+            print(f"\n✅ SAM-HQ модель скачана (альтернативный источник): {sam_checkpoint}")
+            return str(sam_checkpoint)
+            
+        except Exception as e2:
+            print(f"\n❌ Окончательная ошибка скачивания: {e2}")
+            print("⚠️ Используем fallback на обычную SAM модель...")
+            return None
 
 
 def get_conversation_chain():
@@ -105,7 +157,10 @@ def scrape_images(keyword, save_dir, num_images=5):
 
 # Initialize models
 def initialize_models():
+    print("🚀 Инициализация SearchDet моделей...")
+    
     # Load ResNet model
+    print("📦 Загружаем ResNet101...")
     resnet_model = models.resnet101(pretrained=True)
     layer = resnet_model._modules.get('avgpool')
     resnet_model.eval()
@@ -118,12 +173,58 @@ def initialize_models():
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    # Initialize SAM model
-    sam_checkpoint = "sam-hq/pretrained_checkpoint/sam_hq_vit_l.pth"
-    model_type = "vit_l"
-    device = "cuda"
-    sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
-    sam.to(device=device)
+    # Initialize SAM model with automatic download
+    print("🎯 Инициализация SAM-HQ модели...")
+    
+    try:
+        # Попытка скачать SAM-HQ модель
+        sam_checkpoint = download_sam_hq_model()
+        
+        if sam_checkpoint and os.path.exists(sam_checkpoint):
+            # Используем SAM-HQ
+            model_type = "vit_l"
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            
+            print(f"🔄 Загружаем SAM-HQ модель на {device}...")
+            sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+            sam.to(device=device)
+            print("✅ SAM-HQ модель загружена успешно")
+            
+        else:
+            # Fallback: используем обычную SAM модель
+            print("⚠️ SAM-HQ недоступна, используем fallback...")
+            raise Exception("SAM-HQ не найдена, переходим к fallback")
+            
+    except Exception as e:
+        print(f"❌ Ошибка загрузки SAM-HQ: {e}")
+        print("🔄 Fallback: пробуем использовать обычную SAM модель...")
+        
+        try:
+            # Попытка использовать стандартную SAM модель
+            from segment_anything import sam_model_registry as sam_registry_fallback
+            from segment_anything import SamAutomaticMaskGenerator as SamFallback
+            
+            # Скачиваем стандартную SAM модель
+            sam_fallback_dir = Path("models")
+            sam_fallback_dir.mkdir(exist_ok=True)
+            sam_fallback_checkpoint = sam_fallback_dir / "sam_vit_l_0b3195.pth"
+            
+            if not sam_fallback_checkpoint.exists():
+                print("📥 Скачиваем стандартную SAM модель...")
+                sam_fallback_url = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth"
+                urllib.request.urlretrieve(sam_fallback_url, sam_fallback_checkpoint)
+                print("✅ Стандартная SAM модель скачана")
+            
+            model_type = "vit_l"
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            sam = sam_registry_fallback[model_type](checkpoint=str(sam_fallback_checkpoint))
+            sam.to(device=device)
+            print("✅ Fallback SAM модель загружена успешно")
+            
+        except Exception as e2:
+            print(f"❌ Критическая ошибка: не удалось загрузить ни одну SAM модель: {e2}")
+            print("💡 Решение: установите segment-anything или segment-anything-hq вручную")
+            raise e2
 
     return resnet_model, layer, transform, sam
 

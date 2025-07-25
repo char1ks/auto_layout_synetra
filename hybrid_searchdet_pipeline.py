@@ -400,7 +400,7 @@ class HybridDefectDetector:
             return obj
     
     def _save_hybrid_results(self, image_path, image, masks, results, output_path):
-        """Сохранение результатов гибридного анализа"""
+        """Сохранение результатов гибридного анализа с множественными визуализациями"""
         
         image_name = Path(image_path).stem
         
@@ -412,59 +412,362 @@ class HybridDefectDetector:
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(json_compatible_results, f, ensure_ascii=False, indent=2)
         
-        # Визуализация
-        visualization = self._create_hybrid_visualization(image, masks, results)
-        cv2.imwrite(str(output_path / f"{image_name}_hybrid_result.jpg"), visualization)
+        print(f"📁 Сохраняем результаты: {output_path}")
         
-        # Отдельные маски
+        # 1. Основная визуализация с полной информацией
+        main_visualization = self._create_hybrid_visualization(image, masks, results)
+        cv2.imwrite(str(output_path / f"{image_name}_hybrid_result.jpg"), main_visualization)
+        print("   ✅ Основная визуализация сохранена")
+        
+        # 2. Оригинальное изображение с масками (без панелей)
+        clean_overlay = self._create_clean_overlay(image, masks, results)
+        cv2.imwrite(str(output_path / f"{image_name}_clean_overlay.jpg"), clean_overlay)
+        print("   ✅ Чистое наложение сохранено")
+        
+        # 3. Только контуры (без заливки)
+        contours_only = self._create_contours_visualization(image, masks, results)
+        cv2.imwrite(str(output_path / f"{image_name}_contours_only.jpg"), contours_only)
+        print("   ✅ Визуализация контуров сохранена")
+        
+        # 4. Отдельные маски
         for i, mask in enumerate(masks):
-            mask_path = output_path / f"{image_name}_hybrid_mask_{i+1}.png"
+            mask_path = output_path / f"{image_name}_mask_{i+1:02d}.png"
             cv2.imwrite(str(mask_path), mask)
+        print(f"   ✅ {len(masks)} отдельных масок сохранено")
+        
+        # 5. Composite mask (все маски в одном изображении)
+        if masks:
+            composite_mask = self._create_composite_mask(masks, image.shape[:2])
+            cv2.imwrite(str(output_path / f"{image_name}_composite_mask.png"), composite_mask)
+            print("   ✅ Композитная маска сохранена")
+        
+        # 6. Side-by-side сравнение
+        comparison = self._create_before_after_comparison(image, main_visualization)
+        cv2.imwrite(str(output_path / f"{image_name}_comparison.jpg"), comparison)
+        print("   ✅ Сравнение до/после сохранено")
     
-    def _create_hybrid_visualization(self, image, masks, results):
-        """Создание визуализации с информацией от всех систем"""
+    def _create_clean_overlay(self, image, masks, results):
+        """Создание чистого наложения без информационных панелей"""
         
-        vis_image = image.copy()
+        overlay = image.copy()
         
-        # Цвета для разных типов детекции
         colors = {
-            "sam2_segmentation": (0, 255, 0),      # Зеленый
-            "searchdet_missing": (0, 0, 255),     # Красный  
-            "llava_coordinates": (255, 0, 0),     # Синий
+            "missing_element": (0, 0, 255),
+            "wire_missing": (0, 100, 255), 
+            "scratch": (0, 255, 255),
+            "crack": (128, 0, 255),
+            "corrosion": (0, 165, 255),
+            "defect": (0, 255, 0),
+            "sam2_segmentation": (0, 255, 128),
+            "searchdet_missing": (0, 64, 255),
+            "llava_coordinates": (255, 128, 0),
         }
         
-        # Наложение масок
         for i, mask in enumerate(masks):
-            defect_info = results["annotations"]["defects"][i] if i < len(results["annotations"]["defects"]) else {}
-            detection_method = defect_info.get("detection_method", "sam2_segmentation")
-            color = colors.get(detection_method, (255, 255, 255))
+            if i < len(results["annotations"]["defects"]):
+                defect_info = results["annotations"]["defects"][i]
+                category = defect_info.get("category", "defect")
+                severity = defect_info.get("severity", "unknown")
+                color = colors.get(category, (255, 255, 255))
+            else:
+                color = (255, 255, 255)
+                severity = "unknown"
             
-            # Создание цветной маски
-            colored_mask = np.zeros_like(vis_image)
+            # Полупрозрачная маска
+            colored_mask = np.zeros_like(overlay)
             colored_mask[mask > 0] = color
             
-            # Наложение с прозрачностью
-            vis_image = cv2.addWeighted(vis_image, 0.7, colored_mask, 0.3, 0)
+            alpha = 0.3
+            cv2.addWeighted(overlay, 1-alpha, colored_mask, alpha, 0, overlay)
             
             # Контур
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(vis_image, contours, -1, color, 2)
+            if contours:
+                thickness = 2
+                cv2.drawContours(overlay, contours, -1, color, thickness)
         
-        # Информация о результатах
+        return overlay
+    
+    def _create_contours_visualization(self, image, masks, results):
+        """Создание визуализации только с контурами"""
+        
+        contour_image = image.copy()
+        
+        colors = {
+            "missing_element": (0, 0, 255),
+            "wire_missing": (0, 100, 255),
+            "scratch": (0, 255, 255), 
+            "crack": (128, 0, 255),
+            "corrosion": (0, 165, 255),
+            "defect": (0, 255, 0),
+            "sam2_segmentation": (0, 255, 128),
+            "searchdet_missing": (0, 64, 255),
+            "llava_coordinates": (255, 128, 0),
+        }
+        
+        for i, mask in enumerate(masks):
+            if i < len(results["annotations"]["defects"]):
+                defect_info = results["annotations"]["defects"][i]
+                category = defect_info.get("category", "defect")
+                severity = defect_info.get("severity", "unknown")
+                color = colors.get(category, (255, 255, 255))
+            else:
+                color = (255, 255, 255)
+                severity = "unknown"
+            
+            # Только контуры
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                thickness = 3 if severity in ["critical", "severe"] else 2
+                cv2.drawContours(contour_image, contours, -1, color, thickness)
+                
+                # Номер дефекта
+                main_contour = max(contours, key=cv2.contourArea)
+                M = cv2.moments(main_contour)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    
+                    cv2.circle(contour_image, (cx, cy), 15, color, -1)
+                    cv2.putText(contour_image, str(i+1), (cx-5, cy+5), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        return contour_image
+    
+    def _create_composite_mask(self, masks, image_shape):
+        """Создание композитной маски со всеми дефектами"""
+        
+        h, w = image_shape
+        composite = np.zeros((h, w), dtype=np.uint8)
+        
+        for i, mask in enumerate(masks):
+            # Каждая маска получает уникальное значение (1, 2, 3, ...)
+            composite[mask > 0] = i + 1
+        
+        # Конвертируем в цветную маску
+        colored_composite = np.zeros((h, w, 3), dtype=np.uint8)
+        
+        # Генерируем разные цвета для каждой маски
+        for i in range(len(masks)):
+            mask_value = i + 1
+            color = [(i * 50) % 255, (i * 80 + 100) % 255, (i * 120 + 150) % 255]
+            colored_composite[composite == mask_value] = color
+        
+        return colored_composite
+    
+    def _create_before_after_comparison(self, original, processed):
+        """Создание сравнения до и после"""
+        
+        # Изменяем размер изображений для равномерного сравнения
+        h, w = original.shape[:2]
+        
+        # Создаем композицию side-by-side
+        comparison = np.zeros((h, w * 2 + 20, 3), dtype=np.uint8)
+        
+        # Оригинал слева
+        comparison[:h, :w] = original
+        
+        # Разделительная линия
+        comparison[:, w:w+20] = (100, 100, 100)
+        
+        # Обработанное изображение справа
+        processed_resized = cv2.resize(processed, (w, h))
+        comparison[:h, w+20:w*2+20] = processed_resized
+        
+        # Подписи
+        cv2.putText(comparison, "ORIGINAL", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(comparison, "DETECTED DEFECTS", (w + 40, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        
+        return comparison
+    
+    def _create_hybrid_visualization(self, image, masks, results):
+        """Создание улучшенной визуализации с масками поверх фото"""
+        
+        vis_image = image.copy()
+        overlay = image.copy()
+        
+        # Улучшенные цвета для разных типов детекции (в BGR формате)
+        colors = {
+            "sam2_segmentation": (0, 255, 128),        # Ярко-зеленый  
+            "searchdet_missing": (0, 64, 255),        # Красно-оранжевый
+            "llava_coordinates": (255, 128, 0),       # Голубой
+            "missing_element": (0, 0, 255),           # Красный
+            "defect": (0, 255, 0),                    # Зеленый
+            "wire_missing": (0, 100, 255),            # Оранжевый
+            "scratch": (0, 255, 255),                 # Желтый
+            "crack": (128, 0, 255),                   # Фиолетовый
+            "corrosion": (0, 165, 255),               # Оранжевый
+        }
+        
+        print(f"🎨 Создаем визуализацию для {len(masks)} масок...")
+        
+        # Наложение масок с улучшенными эффектами
+        for i, mask in enumerate(masks):
+            if i < len(results["annotations"]["defects"]):
+                defect_info = results["annotations"]["defects"][i]
+                detection_method = defect_info.get("detection_method", "sam2_segmentation")
+                category = defect_info.get("category", "defect")
+                severity = defect_info.get("severity", "unknown")
+                
+                # Выбор цвета по категории или методу детекции
+                if category in colors:
+                    color = colors[category]
+                else:
+                    color = colors.get(detection_method, (255, 255, 255))
+                
+                # Увеличиваем интенсивность для критических дефектов
+                if severity == "critical":
+                    color = tuple(min(255, int(c * 1.3)) for c in color)
+                elif severity == "severe":
+                    color = tuple(min(255, int(c * 1.1)) for c in color)
+                
+            else:
+                color = (255, 255, 255)  # Белый по умолчанию
+                category = "unknown"
+                severity = "unknown"
+            
+            # Создание цветной маски с градиентом к краям
+            colored_mask = np.zeros_like(vis_image)
+            
+            # Основная цветная область
+            colored_mask[mask > 0] = color
+            
+            # Полупрозрачное наложение маски
+            alpha = 0.4 if severity in ["critical", "severe"] else 0.3
+            cv2.addWeighted(overlay, 1-alpha, colored_mask, alpha, 0, overlay)
+            
+            # Контур с переменной толщиной в зависимости от серьезности
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                thickness = 3 if severity in ["critical", "severe"] else 2
+                cv2.drawContours(overlay, contours, -1, color, thickness)
+                
+                # Добавляем номер и тип дефекта на маску
+                main_contour = max(contours, key=cv2.contourArea)
+                M = cv2.moments(main_contour)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    
+                    # Иконка в зависимости от типа
+                    icon_map = {
+                        "missing_element": "❌",
+                        "wire_missing": "🔌", 
+                        "scratch": "⚡",
+                        "crack": "💥",
+                        "corrosion": "🔴",
+                        "defect": "⚠️"
+                    }
+                    icon = icon_map.get(category, f"{i+1}")
+                    
+                    # Текст с тенью для лучшей читаемости
+                    text = f"{icon} {category.upper()[:3]}"
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    font_scale = 0.6
+                    thickness = 2
+                    
+                    # Тень
+                    cv2.putText(overlay, text, (cx-17, cy+7), font, font_scale, (0, 0, 0), thickness+1)
+                    # Основной текст
+                    cv2.putText(overlay, text, (cx-15, cy+5), font, font_scale, (255, 255, 255), thickness)
+        
+        # Создание информационной панели
+        self._add_info_panel(overlay, results, len(masks))
+        
+        # Создание легенды
+        self._add_legend(overlay, results, colors)
+        
+        return overlay
+    
+    def _add_info_panel(self, image, results, num_masks):
+        """Добавление информационной панели"""
+        
         llava_result = results["stages"]["llava_analysis"]["material"]
         searchdet_result = results["stages"]["searchdet_analysis"]["result"]
+        defects = results["stages"]["llava_analysis"]["defects"]
         
-        info_text = f"Material: {llava_result['material']} | Total issues: {len(masks)}"
-        missing_text = f"SearchDet missing: {len(searchdet_result.get('missing_elements', []))}"
+        # Фон для информационной панели
+        h, w = image.shape[:2]
+        panel_height = 120
+        panel = np.zeros((panel_height, w, 3), dtype=np.uint8)
+        panel[:] = (40, 40, 40)  # Темно-серый фон
         
-        cv2.putText(vis_image, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(vis_image, missing_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        # Основная информация
+        font = cv2.FONT_HERSHEY_SIMPLEX
         
-        # Легенда
-        cv2.putText(vis_image, "Green: SAM2 | Red: Missing | Blue: LLaVA", (10, vis_image.shape[0] - 20), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # Заголовок
+        title = "🔍 HYBRID SEARCHDET ANALYSIS RESULTS"
+        cv2.putText(panel, title, (10, 25), font, 0.7, (255, 255, 255), 2)
         
-        return vis_image
+        # Материал
+        material_text = f"📦 Material: {llava_result['material'].upper()} (conf: {llava_result['confidence']:.2f})"
+        cv2.putText(panel, material_text, (10, 50), font, 0.5, (100, 255, 100), 1)
+        
+        # Дефекты LLaVA
+        llava_text = f"🧠 LLaVA defects: {len(defects.get('defect_types', []))} types | Severity: {defects.get('severity', 'unknown').upper()}"
+        cv2.putText(panel, llava_text, (10, 70), font, 0.5, (100, 200, 255), 1)
+        
+        # SearchDet
+        missing_count = len(searchdet_result.get('missing_elements', []))
+        searchdet_text = f"🎯 SearchDet missing: {missing_count} elements | Total masks: {num_masks}"
+        cv2.putText(panel, searchdet_text, (10, 90), font, 0.5, (255, 100, 100), 1)
+        
+        # Статус завершенности
+        completeness = defects.get('completeness', 'unknown')
+        status_color = (0, 255, 0) if completeness == 'complete' else (0, 100, 255)
+        status_text = f"📊 Status: {completeness.upper()}"
+        cv2.putText(panel, status_text, (w-200, 50), font, 0.5, status_color, 1)
+        
+        # Объединяем панель с изображением
+        combined = np.vstack([panel, image])
+        image[:] = combined[:h]  # Размещаем панель сверху, обрезая если нужно
+    
+    def _add_legend(self, image, results, colors):
+        """Добавление легенды"""
+        
+        h, w = image.shape[:2]
+        
+        # Определяем какие типы дефектов найдены
+        found_types = set()
+        for defect in results["annotations"]["defects"]:
+            found_types.add(defect.get("category", "defect"))
+            found_types.add(defect.get("detection_method", "sam2_segmentation"))
+        
+        # Легенда с найденными типами
+        legend_items = []
+        for item in found_types:
+            if item in colors:
+                legend_items.append((item, colors[item]))
+        
+        if legend_items:
+            # Фон для легенды
+            legend_height = min(150, len(legend_items) * 25 + 40)
+            legend_width = 300
+            legend_x = w - legend_width - 10
+            legend_y = h - legend_height - 10
+            
+            # Полупрозрачный фон
+            overlay = image.copy()
+            cv2.rectangle(overlay, (legend_x, legend_y), (legend_x + legend_width, legend_y + legend_height), 
+                         (0, 0, 0), -1)
+            cv2.addWeighted(image, 0.7, overlay, 0.3, 0, image)
+            
+            # Заголовок легенды
+            cv2.putText(image, "🎨 LEGEND:", (legend_x + 10, legend_y + 25), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            # Элементы легенды
+            for i, (item_name, color) in enumerate(legend_items[:5]):  # Максимум 5 элементов
+                y_pos = legend_y + 50 + i * 20
+                
+                # Цветной квадратик
+                cv2.rectangle(image, (legend_x + 10, y_pos - 8), (legend_x + 25, y_pos + 2), color, -1)
+                cv2.rectangle(image, (legend_x + 10, y_pos - 8), (legend_x + 25, y_pos + 2), (255, 255, 255), 1)
+                
+                # Название
+                display_name = item_name.replace("_", " ").title()
+                cv2.putText(image, display_name, (legend_x + 35, y_pos), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
 
 def main():
