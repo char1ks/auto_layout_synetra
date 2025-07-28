@@ -182,9 +182,9 @@ class HybridDefectDetector:
                 for q in pos_embeddings
             ], axis=0).astype(np.float32)
             
-            # Поиск отсутствующих элементов
+            # Поиск отсутствующих элементов - более строгий threshold
             missing_elements = self._find_missing_elements(
-                example_img, adjusted_queries, similarity_threshold=0.4
+                example_img, adjusted_queries, similarity_threshold=0.3  # Более строгий: только <70% сходства
             )
             
             return {
@@ -229,7 +229,7 @@ class HybridDefectDetector:
             points_per_batch=64,
             pred_iou_thresh=0.8,
             stability_score_thresh=0.9,
-            min_mask_region_area=100,
+            min_mask_region_area=1000,  # Увеличили чтобы исключить мелкие шумовые маски
         )
         
         masks = mask_generator.generate(np.array(image))
@@ -270,19 +270,28 @@ class HybridDefectDetector:
                 y_min, x_min = coords.min(axis=0)
                 y_max, x_max = coords.max(axis=0)
                 
-                # Нормализованные координаты
+                # Вычисляем параметры маски
                 h, w = image_np.shape[:2]
+                mask_area = int(seg.sum())
+                
+
+                
+                # Нормализованные координаты
                 bbox_norm = (x_min/w, y_min/h, x_max/w, y_max/h)
                 
                 missing_elements.append({
                     "type": "missing_element",
                     "bbox": bbox_norm,
-                    "area": int(seg.sum()),
+                    "area": mask_area,
                     "confidence": float(1.0 - normalized_similarities[idx][0]),
                     "description": "Potentially missing component detected by SearchDet"
                 })
         
+        print(f"   ✅ После фильтрации: {len(missing_elements)} подходящих отсутствующих элементов")
+        
         return missing_elements
+    
+
     
     def _combine_llava_searchdet_results(self, llava_results, searchdet_results):
         """Объединение результатов LLaVA и SearchDet"""
@@ -447,91 +456,100 @@ class HybridDefectDetector:
         print("   ✅ Сравнение до/после сохранено")
     
     def _create_clean_overlay(self, image, masks, results):
-        """Создание чистого наложения без информационных панелей"""
+        """Создание чистого наложения ТОЛЬКО красных масок SearchDet"""
         
         overlay = image.copy()
-        
-        colors = {
-            "missing_element": (0, 0, 255),
-            "wire_missing": (0, 100, 255), 
-            "scratch": (0, 255, 255),
-            "crack": (128, 0, 255),
-            "corrosion": (0, 165, 255),
-            "defect": (0, 255, 0),
-            "sam2_segmentation": (0, 255, 128),
-            "searchdet_missing": (0, 64, 255),
-            "llava_coordinates": (255, 128, 0),
-        }
+        red_color = (0, 0, 255)  # Красный для SearchDet
         
         for i, mask in enumerate(masks):
             if i < len(results["annotations"]["defects"]):
                 defect_info = results["annotations"]["defects"][i]
+                detection_method = defect_info.get("detection_method", "sam2_segmentation")
                 category = defect_info.get("category", "defect")
-                severity = defect_info.get("severity", "unknown")
-                color = colors.get(category, (255, 255, 255))
+                
+                # ПОКАЗЫВАЕМ ТОЛЬКО SearchDet маски (красные)
+                if detection_method == "searchdet_missing" or category == "missing_element":
+                    color = red_color
+                else:
+                    # Пропускаем все остальные маски
+                    continue
             else:
-                color = (255, 255, 255)
-                severity = "unknown"
+                # Пропускаем неизвестные маски
+                continue
             
-            # Полупрозрачная маска
+            # Полупрозрачная красная маска
             colored_mask = np.zeros_like(overlay)
             colored_mask[mask > 0] = color
             
             alpha = 0.3
             cv2.addWeighted(overlay, 1-alpha, colored_mask, alpha, 0, overlay)
             
-            # Контур
+            # Красный контур
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if contours:
                 thickness = 2
                 cv2.drawContours(overlay, contours, -1, color, thickness)
         
+        # Накладываем 10px рамку от оригинального изображения поверх визуализации
+        border_width = 10
+        overlay[:border_width, :] = image[:border_width, :]  # верхняя полоса
+        overlay[-border_width:, :] = image[-border_width:, :]  # нижняя полоса
+        overlay[:, :border_width] = image[:, :border_width]  # левая полоса
+        overlay[:, -border_width:] = image[:, -border_width:]  # правая полоса
+
         return overlay
     
     def _create_contours_visualization(self, image, masks, results):
-        """Создание визуализации только с контурами"""
+        """Создание визуализации ТОЛЬКО красных контуров SearchDet"""
         
         contour_image = image.copy()
+        red_color = (0, 0, 255)  # Красный для SearchDet
         
-        colors = {
-            "missing_element": (0, 0, 255),
-            "wire_missing": (0, 100, 255),
-            "scratch": (0, 255, 255), 
-            "crack": (128, 0, 255),
-            "corrosion": (0, 165, 255),
-            "defect": (0, 255, 0),
-            "sam2_segmentation": (0, 255, 128),
-            "searchdet_missing": (0, 64, 255),
-            "llava_coordinates": (255, 128, 0),
-        }
+        searchdet_mask_count = 0  # Счетчик для нумерации только SearchDet масок
         
         for i, mask in enumerate(masks):
             if i < len(results["annotations"]["defects"]):
                 defect_info = results["annotations"]["defects"][i]
+                detection_method = defect_info.get("detection_method", "sam2_segmentation")
                 category = defect_info.get("category", "defect")
-                severity = defect_info.get("severity", "unknown")
-                color = colors.get(category, (255, 255, 255))
+                
+                # ПОКАЗЫВАЕМ ТОЛЬКО SearchDet маски (красные)
+                if detection_method == "searchdet_missing" or category == "missing_element":
+                    color = red_color
+                    searchdet_mask_count += 1
+                else:
+                    # Пропускаем все остальные маски
+                    continue
             else:
-                color = (255, 255, 255)
-                severity = "unknown"
+                # Пропускаем неизвестные маски
+                continue
             
-            # Только контуры
+            # Только красные контуры
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if contours:
-                thickness = 3 if severity in ["critical", "severe"] else 2
+                thickness = 3  # Толстые контуры для SearchDet
                 cv2.drawContours(contour_image, contours, -1, color, thickness)
                 
-                # Номер дефекта
+                # Номер SearchDet маски в красном кружке
                 main_contour = max(contours, key=cv2.contourArea)
                 M = cv2.moments(main_contour)
                 if M["m00"] != 0:
                     cx = int(M["m10"] / M["m00"])
                     cy = int(M["m01"] / M["m00"])
                     
-                    cv2.circle(contour_image, (cx, cy), 15, color, -1)
-                    cv2.putText(contour_image, str(i+1), (cx-5, cy+5), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
+                    cv2.circle(contour_image, (cx, cy), 20, color, -1)
+                    cv2.putText(contour_image, str(searchdet_mask_count), (cx-8, cy+8), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+         
+        # Накладываем 10px рамку от оригинального изображения поверх визуализации
+        border_width = 10
+        border_mask = np.zeros_like(image, dtype=np.uint8)
+        border_mask[:border_width, :] = 255  # верх
+        border_mask[-border_width:, :] = 255  # низ
+        border_mask[:, :border_width] = 255  # лево
+        border_mask[:, -border_width:] = 255  # право
+        cv2.copyTo(image, border_mask, contour_image)  # Накладываем оригинал по маске
+
         return contour_image
     
     def _create_composite_mask(self, masks, image_shape):
@@ -601,7 +619,7 @@ class HybridDefectDetector:
         
         print(f"🎨 Создаем визуализацию для {len(masks)} масок...")
         
-        # Наложение масок с улучшенными эффектами
+        # Наложение ТОЛЬКО КРАСНЫХ масок от SearchDet
         for i, mask in enumerate(masks):
             if i < len(results["annotations"]["defects"]):
                 defect_info = results["annotations"]["defects"][i]
@@ -609,22 +627,17 @@ class HybridDefectDetector:
                 category = defect_info.get("category", "defect")
                 severity = defect_info.get("severity", "unknown")
                 
-                # Выбор цвета по категории или методу детекции
-                if category in colors:
-                    color = colors[category]
+                # ПОКАЗЫВАЕМ ТОЛЬКО SearchDet маски (красные)
+                if detection_method == "searchdet_missing" or category == "missing_element":
+                    color = (0, 0, 255)  # КРАСНЫЙ для SearchDet
+                    category = "missing_element"
                 else:
-                    color = colors.get(detection_method, (255, 255, 255))
-                
-                # Увеличиваем интенсивность для критических дефектов
-                if severity == "critical":
-                    color = tuple(min(255, int(c * 1.3)) for c in color)
-                elif severity == "severe":
-                    color = tuple(min(255, int(c * 1.1)) for c in color)
+                    # Пропускаем все остальные маски (не от SearchDet)
+                    continue
                 
             else:
-                color = (255, 255, 255)  # Белый по умолчанию
-                category = "unknown"
-                severity = "unknown"
+                # Пропускаем неизвестные маски
+                continue
             
             # Создание цветной маски с градиентом к краям
             colored_mask = np.zeros_like(vis_image)
@@ -649,19 +662,11 @@ class HybridDefectDetector:
                     cx = int(M["m10"] / M["m00"])
                     cy = int(M["m01"] / M["m00"])
                     
-                    # Иконка в зависимости от типа
-                    icon_map = {
-                        "missing_element": "❌",
-                        "wire_missing": "🔌", 
-                        "scratch": "⚡",
-                        "crack": "💥",
-                        "corrosion": "🔴",
-                        "defect": "⚠️"
-                    }
-                    icon = icon_map.get(category, f"{i+1}")
+                    # Иконка для SearchDet отсутствующих элементов
+                    icon = "❌"
                     
-                    # Текст с тенью для лучшей читаемости
-                    text = f"{icon} {category.upper()[:3]}"
+                    # Текст с тенью для лучшей читаемости  
+                    text = f"{icon} MISSING {i+1}"
                     font = cv2.FONT_HERSHEY_SIMPLEX
                     font_scale = 0.6
                     thickness = 2
@@ -676,7 +681,16 @@ class HybridDefectDetector:
         
         # Создание легенды
         self._add_legend(overlay, results, colors)
-        
+         
+         # Накладываем 10px рамку от оригинального изображения поверх визуализации
+        border_width = 10
+        border_mask = np.zeros_like(image, dtype=np.uint8)
+        border_mask[:border_width, :] = 255  # верх
+        border_mask[-border_width:, :] = 255  # низ
+        border_mask[:, :border_width] = 255  # лево
+        border_mask[:, -border_width:] = 255  # право
+        cv2.copyTo(image, border_mask, overlay)  # Накладываем оригинал по маске
+
         return overlay
     
     def _add_info_panel(self, image, results, num_masks):
@@ -696,53 +710,40 @@ class HybridDefectDetector:
         font = cv2.FONT_HERSHEY_SIMPLEX
         
         # Заголовок
-        title = "🔍 HYBRID SEARCHDET ANALYSIS RESULTS"
+        title = "🔍 SEARCHDET MISSING ELEMENTS (RED MASKS ONLY)"
         cv2.putText(panel, title, (10, 25), font, 0.7, (255, 255, 255), 2)
         
         # Материал
         material_text = f"📦 Material: {llava_result['material'].upper()} (conf: {llava_result['confidence']:.2f})"
         cv2.putText(panel, material_text, (10, 50), font, 0.5, (100, 255, 100), 1)
         
-        # Дефекты LLaVA
-        llava_text = f"🧠 LLaVA defects: {len(defects.get('defect_types', []))} types | Severity: {defects.get('severity', 'unknown').upper()}"
-        cv2.putText(panel, llava_text, (10, 70), font, 0.5, (100, 200, 255), 1)
-        
-        # SearchDet
+        # Показываем только SearchDet результаты
         missing_count = len(searchdet_result.get('missing_elements', []))
-        searchdet_text = f"🎯 SearchDet missing: {missing_count} elements | Total masks: {num_masks}"
-        cv2.putText(panel, searchdet_text, (10, 90), font, 0.5, (255, 100, 100), 1)
+        red_masks_text = f"🔴 RED MASKS (SearchDet): {missing_count} missing elements found"
+        cv2.putText(panel, red_masks_text, (10, 70), font, 0.5, (0, 100, 255), 1)
         
         # Статус завершенности
-        completeness = defects.get('completeness', 'unknown')
-        status_color = (0, 255, 0) if completeness == 'complete' else (0, 100, 255)
-        status_text = f"📊 Status: {completeness.upper()}"
-        cv2.putText(panel, status_text, (w-200, 50), font, 0.5, status_color, 1)
+        status_text = "❌ INCOMPLETE ASSEMBLY" if missing_count > 0 else "✅ COMPLETE ASSEMBLY"
+        status_color = (0, 100, 255) if missing_count > 0 else (0, 255, 0)
+        cv2.putText(panel, status_text, (w-300, 50), font, 0.5, status_color, 1)
         
         # Объединяем панель с изображением
         combined = np.vstack([panel, image])
         image[:] = combined[:h]  # Размещаем панель сверху, обрезая если нужно
     
     def _add_legend(self, image, results, colors):
-        """Добавление легенды"""
+        """Добавление легенды только для SearchDet (красные маски)"""
         
         h, w = image.shape[:2]
         
-        # Определяем какие типы дефектов найдены
-        found_types = set()
-        for defect in results["annotations"]["defects"]:
-            found_types.add(defect.get("category", "defect"))
-            found_types.add(defect.get("detection_method", "sam2_segmentation"))
+        # Проверяем есть ли отсутствующие элементы SearchDet
+        searchdet_result = results["stages"]["searchdet_analysis"]["result"]
+        missing_count = len(searchdet_result.get('missing_elements', []))
         
-        # Легенда с найденными типами
-        legend_items = []
-        for item in found_types:
-            if item in colors:
-                legend_items.append((item, colors[item]))
-        
-        if legend_items:
-            # Фон для легенды
-            legend_height = min(150, len(legend_items) * 25 + 40)
-            legend_width = 300
+        if missing_count > 0:
+            # Простая легенда только для SearchDet
+            legend_width = 250
+            legend_height = 60
             legend_x = w - legend_width - 10
             legend_y = h - legend_height - 10
             
@@ -752,22 +753,17 @@ class HybridDefectDetector:
                          (0, 0, 0), -1)
             cv2.addWeighted(image, 0.7, overlay, 0.3, 0, image)
             
-            # Заголовок легенды
-            cv2.putText(image, "🎨 LEGEND:", (legend_x + 10, legend_y + 25), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            # Заголовок
+            cv2.putText(image, "🎨 LEGEND:", (legend_x + 10, legend_y + 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
             
-            # Элементы легенды
-            for i, (item_name, color) in enumerate(legend_items[:5]):  # Максимум 5 элементов
-                y_pos = legend_y + 50 + i * 20
-                
-                # Цветной квадратик
-                cv2.rectangle(image, (legend_x + 10, y_pos - 8), (legend_x + 25, y_pos + 2), color, -1)
-                cv2.rectangle(image, (legend_x + 10, y_pos - 8), (legend_x + 25, y_pos + 2), (255, 255, 255), 1)
-                
-                # Название
-                display_name = item_name.replace("_", " ").title()
-                cv2.putText(image, display_name, (legend_x + 35, y_pos), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            # Красный квадрат для SearchDet
+            cv2.rectangle(image, (legend_x + 10, legend_y + 35), (legend_x + 25, legend_y + 50), (0, 0, 255), -1)
+            cv2.rectangle(image, (legend_x + 10, legend_y + 35), (legend_x + 25, legend_y + 50), (255, 255, 255), 1)
+            
+            # Текст
+            cv2.putText(image, "Missing Elements (SearchDet)", (legend_x + 35, legend_y + 47), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
 
 
 def main():
@@ -808,9 +804,19 @@ def main():
         print(f"   🧪 Материал: {results['stages']['llava_analysis']['material']['material']}")
         print(f"   🔍 LLaVA дефекты: {results['stages']['llava_analysis']['defects'].get('defects_found', False)}")
         print(f"   🎯 SearchDet отсутствующие: {len(results['stages']['searchdet_analysis']['result'].get('missing_elements', []))}")
-        print(f"   📝 Финальных аннотаций: {len(results['annotations']['defects'])}")
+        
+        # Подсчитаем только SearchDet маски в визуализации
+        searchdet_masks_shown = 0
+        for defect in results['annotations']['defects']:
+            if (defect.get('detection_method') == 'searchdet_missing' or 
+                defect.get('category') == 'missing_element'):
+                searchdet_masks_shown += 1
+        
+        print(f"   🔴 КРАСНЫХ масок показано: {searchdet_masks_shown} (только SearchDet)")
+        print(f"   📝 Всего аннотаций: {len(results['annotations']['defects'])}")
         total_time = sum(stage['duration'] for stage in results['stages'].values())
         print(f"   ⏱️ Общее время: {total_time:.2f} сек")
+        print(f"\n🔴 В визуализации показываются ТОЛЬКО КРАСНЫЕ маски от SearchDet!")
 
 
 if __name__ == "__main__":
