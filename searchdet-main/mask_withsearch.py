@@ -182,14 +182,13 @@ def initialize_models():
         
         if sam_checkpoint and os.path.exists(sam_checkpoint):
             # Используем SAM-HQ
-    model_type = "vit_l"
+            model_type = "vit_l"
             device = "cuda" if torch.cuda.is_available() else "cpu"
             
             print(f"🔄 Загружаем SAM-HQ модель на {device}...")
-    sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
-    sam.to(device=device)
+            sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+            sam.to(device=device)
             print("✅ SAM-HQ модель загружена успешно")
-            
         else:
             # Fallback: используем обычную SAM модель
             print("⚠️ SAM-HQ недоступна, используем fallback...")
