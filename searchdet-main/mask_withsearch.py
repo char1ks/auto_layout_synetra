@@ -189,6 +189,7 @@ def initialize_models():
             sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
             sam.to(device=device)
             print("✅ SAM-HQ модель загружена успешно")
+            
         else:
             # Fallback: используем обычную SAM модель
             print("⚠️ SAM-HQ недоступна, используем fallback...")
