@@ -56,7 +56,7 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 
 ## 🎯 ЗАПУСК АНАЛИЗА
-=
+
 ```bash
 python3 hybrid_searchdet_pipeline.py \
   --image image.png \
