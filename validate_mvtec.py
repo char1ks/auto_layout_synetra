@@ -33,7 +33,7 @@ class MVTecValidator:
     """Валидатор для датасета MVTec AD"""
     
     def __init__(self, dataset_path=None):
-        self.dataset_path = dataset_path
+        self.dataset_path = Path(dataset_path) if dataset_path else None
         self.detector = None
         self.results = {
             "metrics": [],
@@ -50,7 +50,18 @@ class MVTecValidator:
         try:
             path = kagglehub.dataset_download("ipythonx/mvtec-ad")
             self.dataset_path = Path(path)
-            print(f"✅ Датасет скачан: {self.dataset_path}")
+            
+            print(f"✅ Датасет скачан в: {self.dataset_path}")
+            
+            # Проверяем структуру
+            wood_path = self.dataset_path / "wood"
+            if wood_path.exists():
+                print(f"✅ Папка wood найдена: {wood_path}")
+                print(f"📂 Содержимое wood: {list(wood_path.iterdir())}")
+            else:
+                print(f"❌ Папка wood не найдена в {self.dataset_path}")
+                print(f"📂 Доступные папки: {list(self.dataset_path.iterdir())}")
+            
             return self.dataset_path
         except Exception as e:
             print(f"❌ Ошибка скачивания: {e}")
@@ -67,25 +78,105 @@ class MVTecValidator:
         wood_test_path = self.dataset_path / "wood" / "test"
         wood_gt_path = self.dataset_path / "wood" / "ground_truth"
         
+        print(f"🔍 Поиск образцов в: {wood_test_path}")
+        print(f"🔍 Ground truth в: {wood_gt_path}")
+        
+        # Проверяем существование папок
+        if not wood_test_path.exists():
+            print(f"❌ Папка test не найдена: {wood_test_path}")
+            return []
+        
+        if not wood_gt_path.exists():
+            print(f"❌ Папка ground_truth не найдена: {wood_gt_path}")
+            return []
+        
         samples = []
         
         # Проходим по всем подпапкам с дефектами
+        print(f"📂 Содержимое test: {list(wood_test_path.iterdir())}")
+        
         for defect_folder in wood_test_path.iterdir():
             if defect_folder.is_dir():
                 defect_name = defect_folder.name
+                
+                # Пропускаем папку "good" - там нет дефектов
+                if defect_name == "good":
+                    print(f"   ⚪ Пропускаем '{defect_name}' - это хорошие образцы без дефектов")
+                    continue
+                
+                print(f"   🔍 Найден тип дефекта: {defect_name}")
+                
                 gt_defect_path = wood_gt_path / defect_name
                 
                 if gt_defect_path.exists():
                     # Собираем пары изображение-маска
-                    for img_file in defect_folder.glob("*.png"):
+                    img_files = list(defect_folder.glob("*.png"))
+                    gt_files = list(gt_defect_path.glob("*.png"))
+                    
+                    print(f"      📷 Изображений в test: {len(img_files)}")
+                    print(f"      📷 Масок в ground_truth: {len(gt_files)}")
+                    
+                    if len(gt_files) > 0:
+                        print(f"      📂 Примеры GT файлов: {[f.name for f in gt_files[:3]]}")
+                        print(f"      📂 Примеры test файлов: {[f.name for f in img_files[:3]]}")
+                    
+                    # Ищем совпадающие пары файлов с учетом суффикса _mask
+                    matched_pairs = 0
+                    for img_file in img_files:
+                        img_stem = img_file.stem  # 001
+                        found_match = False
+                        
+                        # Вариант 1: Точное совпадение (001.png -> 001.png)
                         gt_file = gt_defect_path / img_file.name
                         if gt_file.exists():
                             samples.append({
                                 "image_path": img_file,
                                 "gt_path": gt_file,
                                 "defect_type": defect_name,
-                                "sample_id": img_file.stem
+                                "sample_id": img_stem
                             })
+                            matched_pairs += 1
+                            found_match = True
+                        
+                        # Вариант 2: С суффиксом _mask (001.png -> 001_mask.png)
+                        if not found_match:
+                            gt_mask_file = gt_defect_path / f"{img_stem}_mask.png"
+                            if gt_mask_file.exists():
+                                samples.append({
+                                    "image_path": img_file,
+                                    "gt_path": gt_mask_file,
+                                    "defect_type": defect_name,
+                                    "sample_id": img_stem
+                                })
+                                matched_pairs += 1
+                                found_match = True
+                        
+                        # Вариант 3: Альтернативные расширения с _mask
+                        if not found_match:
+                            alt_extensions = ['.jpg', '.jpeg', '.bmp']
+                            for ext in alt_extensions:
+                                alt_gt_file = gt_defect_path / f"{img_stem}_mask{ext}"
+                                if alt_gt_file.exists():
+                                    samples.append({
+                                        "image_path": img_file,
+                                        "gt_path": alt_gt_file,
+                                        "defect_type": defect_name,
+                                        "sample_id": img_stem
+                                    })
+                                    matched_pairs += 1
+                                    found_match = True
+                                    print(f"      ✅ Найден GT с суффиксом _mask{ext}: {alt_gt_file.name}")
+                                    break
+                        
+                        # Диагностика для первого файла если не найден
+                        if not found_match and img_file == img_files[0]:
+                            print(f"      ⚠️ Не найден GT для: {img_file.name}")
+                            print(f"         Проверяли: {img_file.name}, {img_stem}_mask.png")
+                            print(f"         Доступно: {[f.name for f in gt_files[:5]]}")
+                    
+                    print(f"      ✅ Найдено совпадающих пар: {matched_pairs}/{len(img_files)}")
+                else:
+                    print(f"      ❌ Ground truth папка не найдена: {gt_defect_path}")
         
         print(f"📊 Найдено {len(samples)} тестовых образцов дерева")
         return samples
@@ -404,6 +495,24 @@ class MVTecValidator:
             f.write("🔬 ОТЧЕТ ПО ВАЛИДАЦИИ MVTec AD (WOOD)\n")
             f.write("=" * 50 + "\n\n")
             
+            # Проверяем наличие результатов
+            if not summary or "overall" not in summary:
+                f.write("❌ ВАЛИДАЦИЯ НЕ ВЫПОЛНЕНА\n")
+                f.write("   Причина: Не найдено образцов для валидации\n")
+                f.write("   Проверьте:\n")
+                f.write("   - Правильность пути к датасету\n")
+                f.write("   - Наличие папки wood/test/ с подпапками дефектов\n")
+                f.write("   - Наличие папки wood/ground_truth/ с масками\n\n")
+                
+                val_info = self.results.get("validation_info", {})
+                f.write(f"⏱️ ИНФОРМАЦИЯ О ПОПЫТКЕ ВАЛИДАЦИИ:\n")
+                f.write(f"   Всего найдено образцов: {val_info.get('total_samples', 0)}\n")
+                f.write(f"   Обработано успешно: {val_info.get('processed_samples', 0)}\n")
+                f.write(f"   Время выполнения: {val_info.get('total_time', 0):.2f} сек\n")
+                
+                print(f"📄 Отчет об ошибке сохранен: {report_file}")
+                return
+            
             # Общие метрики
             overall = summary["overall"]
             f.write("📊 ОБЩИЕ МЕТРИКИ:\n")
@@ -416,13 +525,17 @@ class MVTecValidator:
             
             # По типам дефектов
             f.write("📝 МЕТРИКИ ПО ТИПАМ ДЕФЕКТОВ:\n")
-            for defect_type, metrics in summary["by_defect_type"].items():
-                f.write(f"\n   {defect_type.upper()} ({metrics['count']} образцов):\n")
-                f.write(f"      Dice: {metrics['mean_dice']:.3f}\n")
-                f.write(f"      IoU: {metrics['mean_iou']:.3f}\n")
-                f.write(f"      F1: {metrics['mean_f1']:.3f}\n")
-                f.write(f"      Precision: {metrics['mean_precision']:.3f}\n")
-                f.write(f"      Recall: {metrics['mean_recall']:.3f}\n")
+            by_defect_type = summary.get("by_defect_type", {})
+            if by_defect_type:
+                for defect_type, metrics in by_defect_type.items():
+                    f.write(f"\n   {defect_type.upper()} ({metrics['count']} образцов):\n")
+                    f.write(f"      Dice: {metrics['mean_dice']:.3f}\n")
+                    f.write(f"      IoU: {metrics['mean_iou']:.3f}\n")
+                    f.write(f"      F1: {metrics['mean_f1']:.3f}\n")
+                    f.write(f"      Precision: {metrics['mean_precision']:.3f}\n")
+                    f.write(f"      Recall: {metrics['mean_recall']:.3f}\n")
+            else:
+                f.write("   Нет данных по типам дефектов\n")
             
             # Информация о валидации
             val_info = self.results["validation_info"]
@@ -434,11 +547,14 @@ class MVTecValidator:
         
         print(f"📄 Отчет сохранен: {report_file}")
         
-        # Создаем графики если возможно
-        try:
-            self.create_validation_plots(output_path)
-        except Exception as e:
-            print(f"⚠️ Не удалось создать графики: {e}")
+        # Создаем графики если есть данные
+        if summary and "overall" in summary and len(self.results["metrics"]) > 0:
+            try:
+                self.create_validation_plots(output_path)
+            except Exception as e:
+                print(f"⚠️ Не удалось создать графики: {e}")
+        else:
+            print("⚠️ Недостаточно данных для создания графиков")
     
     def create_validation_plots(self, output_path):
         """Создание графиков результатов валидации"""
@@ -534,14 +650,22 @@ def main():
     
     if results:
         # Выводим краткие результаты
-        overall = results["summary"]["overall"]
-        print(f"\n📊 ИТОГОВЫЕ РЕЗУЛЬТАТЫ:")
-        print(f"   🎯 Dice Score: {overall['mean_dice']:.3f}")
-        print(f"   🎯 IoU: {overall['mean_iou']:.3f}")
-        print(f"   🎯 F1-Score: {overall['mean_f1']:.3f}")
-        print(f"   🎯 Precision: {overall['mean_precision']:.3f}")
-        print(f"   🎯 Recall: {overall['mean_recall']:.3f}")
-        print(f"   🎯 Pixel Accuracy: {overall['mean_pixel_accuracy']:.3f}")
+        summary = results.get("summary", {})
+        if summary and "overall" in summary:
+            overall = summary["overall"]
+            print(f"\n📊 ИТОГОВЫЕ РЕЗУЛЬТАТЫ:")
+            print(f"   🎯 Dice Score: {overall['mean_dice']:.3f}")
+            print(f"   🎯 IoU: {overall['mean_iou']:.3f}")
+            print(f"   🎯 F1-Score: {overall['mean_f1']:.3f}")
+            print(f"   🎯 Precision: {overall['mean_precision']:.3f}")
+            print(f"   🎯 Recall: {overall['mean_recall']:.3f}")
+            print(f"   🎯 Pixel Accuracy: {overall['mean_pixel_accuracy']:.3f}")
+        else:
+            print(f"\n❌ ВАЛИДАЦИЯ НЕ УДАЛАСЬ:")
+            val_info = results.get("validation_info", {})
+            print(f"   📊 Найдено образцов: {val_info.get('total_samples', 0)}")
+            print(f"   ✅ Обработано: {val_info.get('processed_samples', 0)}")
+            print(f"   ⚠️ Проверьте структуру датасета и пути к файлам")
 
 
 if __name__ == "__main__":

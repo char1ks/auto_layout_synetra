@@ -39,12 +39,12 @@ except ImportError as e:
 class HybridDefectDetector:
     """Гибридный детектор: LLaVA + SearchDet + SAM2"""
     
-    def __init__(self, model_type="standard"):
+    def __init__(self, model_type="detailed"):
         print("🚀 Инициализация гибридного детектора...")
         
         # LLaVA для контекстного анализа
         self.llava_analyzer = MaterialAndDefectAnalyzer()
-        if model_type != "standard":
+        if model_type != "detailed":
             self.llava_analyzer.switch_model(model_type)
         
         # SAM2 для финальной сегментации
@@ -271,9 +271,9 @@ class HybridDefectDetector:
                 for q in pos_embeddings
             ], axis=0).astype(np.float32)
             
-            # Поиск отсутствующих элементов - максимально чувствительный threshold
+            # Поиск отсутствующих элементов - умеренно строгий threshold
             missing_elements = self._find_missing_elements(
-                example_img, adjusted_queries, similarity_threshold=0.45  # Максимально чувствительный: <55% сходства
+                example_img, adjusted_queries, similarity_threshold=0.25  # Умеренно строгий: только <75% сходства
             )
             
             return {
@@ -311,18 +311,16 @@ class HybridDefectDetector:
         from segment_anything_hq import SamAutomaticMaskGenerator
         import faiss
         
-        # Генерация масок с помощью SAM - максимально чувствительные настройки
+        # Генерация масок с помощью SAM (из SearchDet) - сбалансированные параметры
         mask_generator = SamAutomaticMaskGenerator(
             model=self.searchdet_sam,
-            points_per_side=48,  # Еще больше точек для максимальной детализации
-            points_per_batch=96,
-            pred_iou_thresh=0.65,  # Значительно снижено для слабых дефектов
-            stability_score_thresh=0.70,  # Принимаем менее стабильные маски
-            min_mask_region_area=200,  # Очень мелкие дефекты
-            box_nms_thresh=0.2,  # Минимальное подавление
-            crop_nms_thresh=0.2,  # Минимальное подавление
-            crop_n_layers=1,  # Добавляем обрезку для лучшего покрытия
-            crop_n_points_downscale_factor=2,  # Больше точек в обрезанных областях
+            points_per_side=28,  # Немного увеличили обратно
+            points_per_batch=56,
+            pred_iou_thresh=0.85,  # Немного снизили
+            stability_score_thresh=0.92,  # Немного снизили
+            min_mask_region_area=1200,  # Уменьшили немного
+            box_nms_thresh=0.5,  # Стандартный NMS
+            crop_nms_thresh=0.5,  # Стандартный NMS
         )
         
         masks = mask_generator.generate(np.array(image))
@@ -350,42 +348,15 @@ class HybridDefectDetector:
         
         # Поиск областей с низким сходством (потенциально отсутствующие элементы)
         missing_threshold = 1.0 - similarity_threshold  # Инвертируем логику
-        
-        # Многоуровневая система детекции
-        medium_threshold = missing_threshold + 0.15  # Расширенная буферная зона
-        weak_threshold = medium_threshold + 0.1      # Очень слабые сигналы
-        
-        # Явные дефекты (очень низкое сходство)
         missing_indices = np.where(normalized_similarities.flatten() < missing_threshold)[0]
-        
-        # Неявные дефекты (среднее сходство)
-        medium_indices = np.where(
-            (normalized_similarities.flatten() >= missing_threshold) & 
-            (normalized_similarities.flatten() < medium_threshold)
-        )[0]
-        
-        # Слабые сигналы (сомнительные области)
-        weak_indices = np.where(
-            (normalized_similarities.flatten() >= medium_threshold) & 
-            (normalized_similarities.flatten() < weak_threshold)
-        )[0]
-        
-        # Объединяем все подозрительные области
-        all_suspicious_indices = np.concatenate([missing_indices, medium_indices, weak_indices])
-        
-        print(f"   📊 Найдено областей: {len(missing_indices)} явных + {len(medium_indices)} неявных + {len(weak_indices)} слабых")
         
         missing_elements = []
         h, w = image_np.shape[:2]
         total_image_area = h * w
-        max_allowed_area_percentage = 0.30  # Максимум 40% от изображения
+        max_allowed_area_percentage = 0.15  # Максимум 15% от изображения
         max_allowed_area = int(total_image_area * max_allowed_area_percentage)
         
-        # Еще более низкий минимальный порог для микродефектов
-        min_allowed_area_percentage = 0.0005  # Минимум 0.05% от изображения (в 2 раза меньше)
-        min_allowed_area = int(total_image_area * min_allowed_area_percentage)
-        
-        for idx in all_suspicious_indices:
+        for idx in missing_indices:
             mask = masks[idx]
             seg = mask['segmentation']
             
@@ -399,45 +370,21 @@ class HybridDefectDetector:
                 mask_area = int(seg.sum())
                 mask_percentage = (mask_area / total_image_area) * 100
                 
-                # Фильтрация слишком больших и слишком маленьких масок
+                # Фильтрация слишком больших масок
                 if mask_area > max_allowed_area:
                     print(f"   🚫 Отфильтровали большую маску: {mask_area} пикселей ({mask_percentage:.1f}% изображения)")
                     continue
-                    
-                if mask_area < min_allowed_area:
-                    continue  # Тихо убираем микроскопический шум
                 
                 # Нормализованные координаты
                 bbox_norm = (x_min/w, y_min/h, x_max/w, y_max/h)
                 
-                # Определяем тип дефекта (трехуровневая система)
-                is_explicit = idx in missing_indices
-                is_subtle = idx in medium_indices
-                is_weak = idx in weak_indices
-                
-                if is_explicit:
-                    defect_type = "explicit_defect"
-                    confidence_multiplier = 1.0
-                elif is_subtle:
-                    defect_type = "subtle_defect"
-                    confidence_multiplier = 0.7
-                else:  # is_weak
-                    defect_type = "weak_signal"
-                    confidence_multiplier = 0.5
-                
-                base_confidence = float(1.0 - normalized_similarities[idx][0])
-                adjusted_confidence = base_confidence * confidence_multiplier
-                
                 missing_elements.append({
                     "type": "missing_element",
-                    "defect_category": defect_type,
                     "bbox": bbox_norm,
                     "area": mask_area,
                     "percentage": mask_percentage,
-                    "confidence": adjusted_confidence,
-                    "raw_confidence": base_confidence,
-                    "similarity_score": float(normalized_similarities[idx][0]),
-                    "description": f"{defect_type.replace('_', ' ').title()} detected by SearchDet"
+                    "confidence": float(1.0 - normalized_similarities[idx][0]),
+                    "description": "Potentially missing component detected by SearchDet"
                 })
         
         print(f"   ✅ После фильтрации: {len(missing_elements)} подходящих отсутствующих элементов")
@@ -957,9 +904,9 @@ def main():
     parser.add_argument("--positive", required=True, help="Папка с примерами правильных элементов")
     parser.add_argument("--negative", required=True, help="Папка с примерами неправильных/отсутствующих элементов")
     parser.add_argument("--output", default="./output", help="Директория для сохранения результатов")
-    parser.add_argument("--model", default="standard", 
+    parser.add_argument("--model", default="detailed", 
                        choices=["detailed", "standard", "latest", "onevision"],
-                       help="Тип модели LLaVA (по умолчанию: standard = 7B)")
+                       help="Тип модели LLaVA")
     parser.add_argument("--ground-truth", default=None, 
                        help="Путь к ground truth маске (черно-белое изображение) для сравнения")
     
