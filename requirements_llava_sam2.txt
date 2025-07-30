@@ -49,4 +49,10 @@ huggingface-hub>=0.16.4
 av>=10.0.0
 
 # Для автоматического скачивания моделей
-gdown>=4.7.1 
+gdown>=4.7.1
+
+# Зависимости для валидации на MVTec AD
+kagglehub>=0.2.0
+seaborn>=0.12.0
+pandas>=2.0.0
+scikit-learn>=1.3.0 

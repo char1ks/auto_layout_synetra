@@ -39,12 +39,12 @@ except ImportError as e:
 class HybridDefectDetector:
     """Гибридный детектор: LLaVA + SearchDet + SAM2"""
     
-    def __init__(self, model_type="detailed"):
+    def __init__(self, model_type="standard"):
         print("🚀 Инициализация гибридного детектора...")
         
         # LLaVA для контекстного анализа
         self.llava_analyzer = MaterialAndDefectAnalyzer()
-        if model_type != "detailed":
+        if model_type != "standard":
             self.llava_analyzer.switch_model(model_type)
         
         # SAM2 для финальной сегментации
@@ -957,9 +957,9 @@ def main():
     parser.add_argument("--positive", required=True, help="Папка с примерами правильных элементов")
     parser.add_argument("--negative", required=True, help="Папка с примерами неправильных/отсутствующих элементов")
     parser.add_argument("--output", default="./output", help="Директория для сохранения результатов")
-    parser.add_argument("--model", default="detailed", 
+    parser.add_argument("--model", default="standard", 
                        choices=["detailed", "standard", "latest", "onevision"],
-                       help="Тип модели LLaVA")
+                       help="Тип модели LLaVA (по умолчанию: standard = 7B)")
     parser.add_argument("--ground-truth", default=None, 
                        help="Путь к ground truth маске (черно-белое изображение) для сравнения")
     

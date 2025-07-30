@@ -69,13 +69,13 @@ except ImportError as e:
 class MaterialAndDefectAnalyzer:
     """LLaVA для определения типа материала и анализа дефектов"""
     
-    def __init__(self, model_path="liuhaotian/llava-v1.5-13b"):
+    def __init__(self, model_path="liuhaotian/llava-v1.5-7b"):
         self.model_path = model_path
         
         # Доступные модели по уровню детализации
         self.available_models = {
             "detailed": "liuhaotian/llava-v1.5-13b",  # 13B - очень детальный анализ
-            "standard": "liuhaotian/llava-v1.5-7b",   # 7B - стандартный
+            "standard": "liuhaotian/llava-v1.5-7b",   # 7B - стандартный (по умолчанию)
             "latest": "liuhaotian/llava-v1.6-vicuna-13b",  # Новейшая 13B версия
             "onevision": "lmms-lab/llava-onevision-qwen2-7b-ov"  # Специально для детального анализа
         }
@@ -1283,9 +1283,9 @@ def main():
     parser = argparse.ArgumentParser(description="Автоматическая разметка дефектов: LLaVA + SAM2 + OpenCV")
     parser.add_argument("--image", required=True, help="Путь к изображению для анализа")
     parser.add_argument("--output", default="./output", help="Директория для сохранения результатов")
-    parser.add_argument("--model", default="detailed", 
+    parser.add_argument("--model", default="standard", 
                        choices=["detailed", "standard", "latest", "onevision"],
-                       help="Тип модели LLaVA: detailed(13B), standard(7B), latest(13B-v1.6), onevision(7B-специальная)")
+                       help="Тип модели LLaVA: detailed(13B), standard(7B-по умолчанию), latest(13B-v1.6), onevision(7B-специальная)")
     
     args = parser.parse_args()
     
