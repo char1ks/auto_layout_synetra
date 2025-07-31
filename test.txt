@@ -968,3 +968,11 @@ def main():
 
 if __name__ == "__main__":
     main() 
+    git commit -m "🚀 Replace FastSAM with SAM2 and rewrite installation guide
+
+✅ New architecture: LLaVA (material) → LLaVA (defects) → SAM2 (segmentation)
+✅ Dual LLaVA queries for intelligent defect analysis
+✅ SAM2 with prompt-guided segmentation
+✅ Simple step-by-step installation instructions
+✅ Updated requirements for SAM2 dependencies
+✅ Performance improvements and better accuracy"
