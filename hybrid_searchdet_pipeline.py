@@ -353,7 +353,7 @@ class HybridDefectDetector:
         missing_elements = []
         h, w = image_np.shape[:2]
         total_image_area = h * w
-        max_allowed_area_percentage = 0.15  # Максимум 15% от изображения
+        max_allowed_area_percentage = 0.85  # Максимум 15% от изображения
         max_allowed_area = int(total_image_area * max_allowed_area_percentage)
         
         for idx in missing_indices:

@@ -976,3 +976,4 @@ if __name__ == "__main__":
 ✅ Simple step-by-step installation instructions
 ✅ Updated requirements for SAM2 dependencies
 ✅ Performance improvements and better accuracy"
+ git push origin main --force     
