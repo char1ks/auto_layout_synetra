@@ -163,8 +163,8 @@ class HybridDefectDetector:
         print(f"   🔍 LLaVA дефекты: {llava_defect_analysis.get('defects_found', False)}")
         print(f"   ⏱️ Время: {stage1_time:.2f} сек")
         
-        # ЭТАП 2: SearchDet - поиск отсутствующих элементов
-        print("\n🔍 ЭТАП 2: SearchDet поиск отсутствующих элементов...")
+        # ЭТАП 2: SearchDet - поиск и сегментация дефектов
+        print("\n🔍 ЭТАП 2: SearchDet поиск и сегментация дефектов...")
         stage2_start = time.time()
         
         searchdet_results = None
@@ -174,7 +174,7 @@ class HybridDefectDetector:
             )
         else:
             print("   ⚠️ SearchDet пропущен - нет примеров или модуль недоступен")
-            searchdet_results = {"missing_elements": [], "detected_areas": []}
+            searchdet_results = {"found_elements": [], "missing_elements": [], "detected_areas": []}
         
         stage2_time = time.time() - stage2_start
         results["stages"]["searchdet_analysis"] = {
@@ -182,7 +182,7 @@ class HybridDefectDetector:
             "result": searchdet_results
         }
         
-        print(f"   ✅ Найдено отсутствующих элементов: {len(searchdet_results.get('missing_elements', []))}")
+        print(f"   ✅ Найдено и сегментировано дефектов: {len(searchdet_results.get('found_elements', []))}")
         print(f"   ⏱️ Время: {stage2_time:.2f} сек")
         
         # ЭТАП 3: Объединение результатов
@@ -271,14 +271,15 @@ class HybridDefectDetector:
                 for q in pos_embeddings
             ], axis=0).astype(np.float32)
             
-            # Поиск отсутствующих элементов - умеренно строгий threshold
-            missing_elements = self._find_missing_elements(
-                example_img, adjusted_queries, similarity_threshold=0.25  # Умеренно строгий: только <75% сходства
+            # ИЗМЕНЕНО: Поиск дефектов - более мягкий threshold для обнаружения разнообразных дефектов
+            found_elements = self._find_missing_elements(
+                example_img, adjusted_queries, similarity_threshold=0.45  # Мягче: >45% сходства для обнаружения больше дефектов
             )
             
             return {
-                "missing_elements": missing_elements,
-                "detected_areas": [],
+                "missing_elements": [],  # Больше не ищем отсутствующие
+                "found_elements": found_elements,  # Найденные детали
+                "detected_areas": found_elements,  # Для совместимости
                 "positive_examples_count": len(positive_imgs),
                 "negative_examples_count": len(negative_imgs)
             }
@@ -305,22 +306,22 @@ class HybridDefectDetector:
         
         return images
     
-    def _find_missing_elements(self, image, query_vectors, similarity_threshold=0.25):
-        """Поиск отсутствующих элементов с помощью SearchDet"""
+    def _find_missing_elements(self, image, query_vectors, similarity_threshold=0.45):
+        """Поиск дефектов с помощью SearchDet (на основе позитивных примеров дефектов)"""
         
         from segment_anything_hq import SamAutomaticMaskGenerator
         import faiss
         
-        # Генерация масок с помощью SAM - настройки для неявных дефектов
+        # Генерация масок с помощью SAM - ОЧЕНЬ чувствительные параметры для детекции мелких дефектов
         mask_generator = SamAutomaticMaskGenerator(
             model=self.searchdet_sam,
-            points_per_side=32,  # Больше точек для детализации
-            points_per_batch=64,
-            pred_iou_thresh=0.75,  # Снижено для неявных дефектов
-            stability_score_thresh=0.80,  # Снижено для чувствительности  
-            min_mask_region_area=400,  # Меньше для мелких дефектов
-            box_nms_thresh=0.3,  # Более мягкий NMS
-            crop_nms_thresh=0.3,  # Более мягкий NMS
+            points_per_side=40,  # Еще больше точек для лучшего покрытия мелких дефектов
+            points_per_batch=80,
+            pred_iou_thresh=0.70,  # Еще ниже для детекции менее четких дефектов
+            stability_score_thresh=0.75,  # Еще ниже для большего количества масок
+            min_mask_region_area=200,  # СИЛЬНО уменьшили для мелких дефектов (царапины, точки)
+            box_nms_thresh=0.6,  # Еще слабее NMS
+            crop_nms_thresh=0.6,
         )
         
         masks = mask_generator.generate(np.array(image))
@@ -346,17 +347,19 @@ class HybridDefectDetector:
         similarities, indices = index.search(mask_vectors, 1)
         normalized_similarities = (similarities + 1) / 2
         
-        # Поиск областей с низким сходством (потенциально отсутствующие элементы)
-        missing_threshold = 1.0 - similarity_threshold  # Инвертируем логику
-        missing_indices = np.where(normalized_similarities.flatten() < missing_threshold)[0]
+        # ИЗМЕНЕНО: Поиск областей с ВЫСОКИМ сходством (присутствующие детали)
+        found_indices = np.where(normalized_similarities.flatten() >= similarity_threshold)[0]
         
-        missing_elements = []
+        found_elements = []
         h, w = image_np.shape[:2]
         total_image_area = h * w
-        max_allowed_area_percentage = 0.40  # Максимум 40% от изображения
+        min_allowed_area = 25  # УМЕНЬШИЛИ для мелких дефектов (царапины, точки, трещины)
+        max_allowed_area_percentage = 1.0  # Уменьшили максимум - дефекты обычно не занимают много места
         max_allowed_area = int(total_image_area * max_allowed_area_percentage)
         
-        for idx in missing_indices:
+        print(f"   🔍 Найдено {len(found_indices)} потенциальных деталей из {len(masks)} масок")
+        
+        for idx in found_indices:
             mask = masks[idx]
             seg = mask['segmentation']
             
@@ -370,7 +373,9 @@ class HybridDefectDetector:
                 mask_area = int(seg.sum())
                 mask_percentage = (mask_area / total_image_area) * 100
                 
-                # Фильтрация слишком больших масок
+                # Фильтрация слишком маленьких и больших масок
+                if mask_area < min_allowed_area:
+                    continue
                 if mask_area > max_allowed_area:
                     print(f"   🚫 Отфильтровали большую маску: {mask_area} пикселей ({mask_percentage:.1f}% изображения)")
                     continue
@@ -378,18 +383,19 @@ class HybridDefectDetector:
                 # Нормализованные координаты
                 bbox_norm = (x_min/w, y_min/h, x_max/w, y_max/h)
                 
-                missing_elements.append({
-                    "type": "missing_element",
+                found_elements.append({
+                    "type": "found_defect",  # ИЗМЕНЕНО: теперь найденный дефект
                     "bbox": bbox_norm,
                     "area": mask_area,
                     "percentage": mask_percentage,
-                    "confidence": float(1.0 - normalized_similarities[idx][0]),
-                    "description": "Potentially missing component detected by SearchDet"
+                    "confidence": float(normalized_similarities[idx][0]),
+                    "description": "Defect found and segmented by SearchDet",
+                    "mask": seg  # Добавляем саму маску для визуализации
                 })
         
-        print(f"   ✅ После фильтрации: {len(missing_elements)} подходящих отсутствующих элементов")
+        print(f"   ✅ После фильтрации: {len(found_elements)} подходящих дефектов")
         
-        return missing_elements
+        return found_elements
     
 
     
@@ -398,30 +404,30 @@ class HybridDefectDetector:
         
         combined = llava_results.copy()
         
-        # Добавляем отсутствующие элементы от SearchDet
-        missing_elements = searchdet_results.get("missing_elements", [])
-        if missing_elements:
-            # Добавляем новые типы дефектов
-            missing_types = ["missing_element", "absent_component"]
-            combined["defect_types"] = list(set(combined.get("defect_types", []) + missing_types))
+        # ИЗМЕНЕНО: Добавляем найденные детали от SearchDet
+        found_elements = searchdet_results.get("found_elements", [])
+        if found_elements:
+            # Добавляем новые типы дефектов (теперь это найденные детали)
+            found_types = ["found_detail", "segmented_component"]
+            combined["defect_types"] = list(set(combined.get("defect_types", []) + found_types))
             
-            # Обновляем серьезность если найдены отсутствующие элементы
-            if combined.get("severity") in ["unknown", "minor"]:
-                combined["severity"] = "moderate"
+            # Обновляем серьезность - если найдены детали, это не дефект
+            combined["severity"] = "info"  # Информационный статус
             
-            # Обновляем полноту
-            combined["completeness"] = "incomplete"
+            # Обновляем полноту - детали найдены и сегментированы
+            combined["completeness"] = "segmented"
             
             # Добавляем bounding boxes от SearchDet
-            searchdet_boxes = [elem["bbox"] for elem in missing_elements]
+            searchdet_boxes = [elem["bbox"] for elem in found_elements]
             existing_boxes = combined.get("bounding_boxes", [])
             combined["bounding_boxes"] = existing_boxes + searchdet_boxes
             
             # Обновляем описание
-            combined["description"] += f"\n\nSearchDet detected {len(missing_elements)} potentially missing elements."
+            combined["description"] += f"\n\nSearchDet found and segmented {len(found_elements)} matching details."
             
-            # Добавляем информацию о SearchDet
-            combined["searchdet_missing"] = missing_elements
+            # Добавляем информацию о SearchDet найденных элементах
+            combined["searchdet_found"] = found_elements
+            combined["searchdet_missing"] = []  # Больше не ищем отсутствующие
         
         return combined
     
@@ -437,8 +443,9 @@ class HybridDefectDetector:
             "material": material_result,
             "hybrid_analysis": {
                 "llava_defects": combined_defects,
+                "searchdet_found": searchdet_results.get("found_elements", []),  # ИЗМЕНЕНО
                 "searchdet_missing": searchdet_results.get("missing_elements", []),
-                "detection_methods": ["llava_coordinates", "searchdet_examples", "sam2_segmentation"]
+                "detection_methods": ["llava_coordinates", "searchdet_segmentation", "sam2_segmentation"]  # ИЗМЕНЕНО
             },
             "defects": []
         }
@@ -459,18 +466,18 @@ class HybridDefectDetector:
             defect_type = "defect"
             confidence = 0.85
             
-            # Проверка соответствия SearchDet результатам
-            if searchdet_results.get("missing_elements"):
-                for missing in searchdet_results["missing_elements"]:
-                    bbox = missing["bbox"]
+            # ИЗМЕНЕНО: Проверка соответствия SearchDet найденным элементам
+            if searchdet_results.get("found_elements"):
+                for found in searchdet_results["found_elements"]:
+                    bbox = found["bbox"]
                     # Проверка пересечения (упрощенная)
                     h_img, w_img = image.shape[:2]
                     search_x1, search_y1, search_x2, search_y2 = [int(c * dim) for c, dim in zip(bbox, [w_img, h_img, w_img, h_img])]
                     
                     if (abs(x - search_x1) < 50 and abs(y - search_y1) < 50):
-                        detection_method = "searchdet_missing"
-                        defect_type = "missing_element"
-                        confidence = missing["confidence"]
+                        detection_method = "searchdet_found"  # ИЗМЕНЕНО
+                        defect_type = "found_defect"  # ИЗМЕНЕНО
+                        confidence = found["confidence"]
                         break
             
             defect_annotation = {
@@ -549,8 +556,8 @@ class HybridDefectDetector:
                 detection_method = defect_info.get("detection_method", "sam2_segmentation")
                 category = defect_info.get("category", "defect")
                 
-                # Сохраняем ТОЛЬКО SearchDet маски (те же, что в _contours_only)
-                if detection_method == "searchdet_missing" or category == "missing_element":
+                # ИЗМЕНЕНО: Сохраняем ТОЛЬКО SearchDet найденные детали
+                if detection_method == "searchdet_found" or category == "found_detail":
                     searchdet_mask_count += 1
                     
                     # Бинарная маска
@@ -599,8 +606,8 @@ class HybridDefectDetector:
                 detection_method = defect_info.get("detection_method", "sam2_segmentation")
                 category = defect_info.get("category", "defect")
                 
-                # ПОКАЗЫВАЕМ ТОЛЬКО SearchDet маски (красные)
-                if detection_method == "searchdet_missing" or category == "missing_element":
+                # ИЗМЕНЕНО: ПОКАЗЫВАЕМ ТОЛЬКО SearchDet найденные детали (красные)
+                if detection_method == "searchdet_found" or category == "found_detail":
                     color = red_color
                 else:
                     # Пропускаем все остальные маски
@@ -645,8 +652,8 @@ class HybridDefectDetector:
                 detection_method = defect_info.get("detection_method", "sam2_segmentation")
                 category = defect_info.get("category", "defect")
                 
-                # ПОКАЗЫВАЕМ ТОЛЬКО SearchDet маски (красные)
-                if detection_method == "searchdet_missing" or category == "missing_element":
+                # ИЗМЕНЕНО: ПОКАЗЫВАЕМ ТОЛЬКО SearchDet найденные детали (красные)
+                if detection_method == "searchdet_found" or category == "found_detail":
                     color = red_color
                     searchdet_mask_count += 1
                 else:
@@ -759,10 +766,10 @@ class HybridDefectDetector:
                 category = defect_info.get("category", "defect")
                 severity = defect_info.get("severity", "unknown")
                 
-                # ПОКАЗЫВАЕМ ТОЛЬКО SearchDet маски (красные)
-                if detection_method == "searchdet_missing" or category == "missing_element":
-                    color = (0, 0, 255)  # КРАСНЫЙ для SearchDet
-                    category = "missing_element"
+                # ИЗМЕНЕНО: ПОКАЗЫВАЕМ ТОЛЬКО SearchDet найденные дефекты (красные)
+                if detection_method == "searchdet_found" or category == "found_detail":
+                    color = (0, 0, 255)  # КРАСНЫЙ для SearchDet найденных дефектов
+                    category = "found_defect"
                 else:
                     # Пропускаем все остальные маски (не от SearchDet)
                     continue
@@ -794,11 +801,11 @@ class HybridDefectDetector:
                     cx = int(M["m10"] / M["m00"])
                     cy = int(M["m01"] / M["m00"])
                     
-                    # Иконка для SearchDet отсутствующих элементов
-                    icon = "❌"
+                    # ИЗМЕНЕНО: Иконка для SearchDet найденных дефектов
+                    icon = "⚠️"
                     
                     # Текст с тенью для лучшей читаемости  
-                    text = f"{icon} MISSING {i+1}"
+                    text = f"{icon} DEFECT {i+1}"
                     font = cv2.FONT_HERSHEY_SIMPLEX
                     font_scale = 0.6
                     thickness = 2
@@ -841,22 +848,22 @@ class HybridDefectDetector:
         # Основная информация
         font = cv2.FONT_HERSHEY_SIMPLEX
         
-        # Заголовок
-        title = "🔍 SEARCHDET MISSING ELEMENTS (RED MASKS ONLY)"
+        # ИЗМЕНЕНО: Заголовок для найденных дефектов
+        title = "🔍 SEARCHDET FOUND DEFECTS (RED MASKS ONLY)"
         cv2.putText(panel, title, (10, 25), font, 0.7, (255, 255, 255), 2)
         
         # Материал
         material_text = f"📦 Material: {llava_result['material'].upper()} (conf: {llava_result['confidence']:.2f})"
         cv2.putText(panel, material_text, (10, 50), font, 0.5, (100, 255, 100), 1)
         
-        # Показываем только SearchDet результаты
-        missing_count = len(searchdet_result.get('missing_elements', []))
-        red_masks_text = f"🔴 RED MASKS (SearchDet): {missing_count} missing elements found"
+        # ИЗМЕНЕНО: Показываем только SearchDet найденные дефекты
+        found_count = len(searchdet_result.get('found_elements', []))
+        red_masks_text = f"🔴 RED MASKS (SearchDet): {found_count} defects found and segmented"
         cv2.putText(panel, red_masks_text, (10, 70), font, 0.5, (0, 100, 255), 1)
         
-        # Статус завершенности
-        status_text = "❌ INCOMPLETE ASSEMBLY" if missing_count > 0 else "✅ COMPLETE ASSEMBLY"
-        status_color = (0, 100, 255) if missing_count > 0 else (0, 255, 0)
+        # ИЗМЕНЕНО: Статус сегментации дефектов
+        status_text = "⚠️ DEFECTS DETECTED" if found_count > 0 else "✅ NO DEFECTS FOUND"
+        status_color = (0, 100, 255) if found_count > 0 else (0, 255, 0)  # Красный для дефектов, зеленый для их отсутствия
         cv2.putText(panel, status_text, (w-300, 50), font, 0.5, status_color, 1)
         
         # Объединяем панель с изображением
@@ -868,11 +875,11 @@ class HybridDefectDetector:
         
         h, w = image.shape[:2]
         
-        # Проверяем есть ли отсутствующие элементы SearchDet
+        # ИЗМЕНЕНО: Проверяем есть ли найденные детали SearchDet
         searchdet_result = results["stages"]["searchdet_analysis"]["result"]
-        missing_count = len(searchdet_result.get('missing_elements', []))
+        found_count = len(searchdet_result.get('found_elements', []))
         
-        if missing_count > 0:
+        if found_count > 0:
             # Простая легенда только для SearchDet
             legend_width = 250
             legend_height = 60
@@ -893,8 +900,8 @@ class HybridDefectDetector:
             cv2.rectangle(image, (legend_x + 10, legend_y + 35), (legend_x + 25, legend_y + 50), (0, 0, 255), -1)
             cv2.rectangle(image, (legend_x + 10, legend_y + 35), (legend_x + 25, legend_y + 50), (255, 255, 255), 1)
             
-            # Текст
-            cv2.putText(image, "Missing Elements (SearchDet)", (legend_x + 35, legend_y + 47), 
+            # ИЗМЕНЕНО: Текст для найденных дефектов
+            cv2.putText(image, "Found Defects (SearchDet)", (legend_x + 35, legend_y + 47), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
 
 
@@ -941,20 +948,20 @@ def main():
         print(f"\n📊 ИТОГОВАЯ СТАТИСТИКА:")
         print(f"   🧪 Материал: {results['stages']['llava_analysis']['material']['material']}")
         print(f"   🔍 LLaVA дефекты: {results['stages']['llava_analysis']['defects'].get('defects_found', False)}")
-        print(f"   🎯 SearchDet отсутствующие: {len(results['stages']['searchdet_analysis']['result'].get('missing_elements', []))}")
+        print(f"   🎯 SearchDet найденные дефекты: {len(results['stages']['searchdet_analysis']['result'].get('found_elements', []))}")
         
-        # Подсчитаем только SearchDet маски в визуализации
+        # ИЗМЕНЕНО: Подсчитаем только SearchDet найденные дефекты в визуализации
         searchdet_masks_shown = 0
         for defect in results['annotations']['defects']:
-            if (defect.get('detection_method') == 'searchdet_missing' or 
-                defect.get('category') == 'missing_element'):
+            if (defect.get('detection_method') == 'searchdet_found' or 
+                defect.get('category') == 'found_detail'):
                 searchdet_masks_shown += 1
         
-        print(f"   🔴 КРАСНЫХ масок показано: {searchdet_masks_shown} (только SearchDet)")
+        print(f"   🔴 КРАСНЫХ масок показано: {searchdet_masks_shown} (только SearchDet найденные дефекты)")
         print(f"   📝 Всего аннотаций: {len(results['annotations']['defects'])}")
         total_time = sum(stage['duration'] for stage in results['stages'].values())
         print(f"   ⏱️ Общее время: {total_time:.2f} сек")
-        print(f"\n🔴 В визуализации показываются ТОЛЬКО КРАСНЫЕ маски от SearchDet!")
+        print(f"\n🔴 В визуализации показываются ТОЛЬКО КРАСНЫЕ маски найденных дефектов от SearchDet!")
         
         # Показываем результаты сравнения с ground truth
         if 'ground_truth_comparison' in results:
@@ -968,12 +975,3 @@ def main():
 
 if __name__ == "__main__":
     main() 
-    git commit -m "🚀 Replace FastSAM with SAM2 and rewrite installation guide
-
-✅ New architecture: LLaVA (material) → LLaVA (defects) → SAM2 (segmentation)
-✅ Dual LLaVA queries for intelligent defect analysis
-✅ SAM2 with prompt-guided segmentation
-✅ Simple step-by-step installation instructions
-✅ Updated requirements for SAM2 dependencies
-✅ Performance improvements and better accuracy"
- git push origin main --force     
