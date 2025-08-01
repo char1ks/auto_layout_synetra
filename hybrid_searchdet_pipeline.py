@@ -354,7 +354,7 @@ class HybridDefectDetector:
         h, w = image_np.shape[:2]
         total_image_area = h * w
         min_allowed_area = 100  # Увеличили для фильтрации мелкого шума
-        max_allowed_area_percentage = 0.4  # Уменьшили максимум - дефекты обычно компактные
+        max_allowed_area_percentage = 1.0  # Уменьшили максимум - дефекты обычно компактные
         max_allowed_area = int(total_image_area * max_allowed_area_percentage)
         
         print(f"   🔍 Найдено {len(found_indices)} потенциальных деталей из {len(masks)} масок")
