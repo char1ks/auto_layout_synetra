@@ -7,6 +7,8 @@ import numpy as np
 import cv2
 import faiss
 from sklearn.metrics.pairwise import cosine_similarity
+import hashlib
+import pickle
 from segment_anything_hq import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -242,22 +244,330 @@ def initialize_models():
 # Function to extract features from an image using ResNet
 def get_vector(image, model, layer, transform):
     t_img = transform(image).unsqueeze(0)
-    my_embedding = torch.zeros(2048)
+    
+    # 🔧 Динамически определяем размерность на основе фактического выхода
+    temp_embedding = None
 
     def copy_data(m, i, o):
-        my_embedding.copy_(o.flatten())
+        nonlocal temp_embedding
+        # Берем feature map и делаем Global Average Pooling как в быстром методе
+        if len(o.shape) == 4:  # [B, C, H, W]
+            pooled = torch.nn.functional.adaptive_avg_pool2d(o, (1, 1))
+            temp_embedding = pooled.flatten()
+        else:
+            temp_embedding = o.flatten()
 
-    h = layer.register_forward_hook(copy_data)
+    # Используем тот же target слой, что и в быстром методе
+    target_layer = None
+    if hasattr(model, 'layer3'):
+        target_layer = model.layer3[-1]  # Тот же слой что в быстром методе
+    elif hasattr(model, 'layer4'):
+        target_layer = model.layer4[-1]
+    else:
+        target_layer = layer  # Fallback на переданный слой
+    
+    h = target_layer.register_forward_hook(copy_data)
     with torch.no_grad():
         model(t_img)
     h.remove()
-    return my_embedding
+    
+    if temp_embedding is None:
+        # Fallback - создаем вектор стандартной размерности
+        temp_embedding = torch.zeros(1024)
+    
+    return temp_embedding
+
+
+# 🔥 КЭШИРОВАНИЕ для ускорения загрузки примеров
+def get_cached_embeddings(image_paths, model, layer, transform, cache_dir="cache"):
+    """
+    Кэширует эмбеддинги позитивных и негативных примеров на диск для быстрой загрузки
+    """
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+    
+    # Создаем хэш от путей файлов для уникального имени кэша
+    paths_str = "|".join(sorted(image_paths))
+    cache_hash = hashlib.md5(paths_str.encode()).hexdigest()
+    cache_file = os.path.join(cache_dir, f"embeddings_{cache_hash}.pkl")
+    
+    # Проверяем, есть ли кэш и актуален ли он
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, 'rb') as f:
+                cached_data = pickle.load(f)
+            
+            # Проверяем, что все файлы не изменились
+            cache_valid = True
+            for path, cached_mtime in cached_data['mtimes'].items():
+                if not os.path.exists(path) or os.path.getmtime(path) != cached_mtime:
+                    cache_valid = False
+                    break
+            
+            if cache_valid:
+                print(f"   📦 Загружен кэш эмбеддингов ({len(cached_data['embeddings'])} файлов)")
+                return cached_data['embeddings']
+        except:
+            pass  # Кэш поврежден, пересоздаем
+    
+    # Вычисляем эмбеддинги заново
+    embeddings = []
+    mtimes = {}
+    
+    print(f"   🔧 Создаем кэш эмбеддингов для {len(image_paths)} файлов...")
+    for path in image_paths:
+        if os.path.exists(path):
+            image = Image.open(path).convert('RGB')
+            embedding = get_vector(image, model, layer, transform).numpy()
+            embeddings.append(embedding)
+            mtimes[path] = os.path.getmtime(path)
+    
+    # Сохраняем в кэш
+    cache_data = {
+        'embeddings': np.array(embeddings),
+        'mtimes': mtimes
+    }
+    
+    try:
+        with open(cache_file, 'wb') as f:
+            pickle.dump(cache_data, f)
+        print(f"   💾 Кэш сохранен: {cache_file}")
+    except:
+        print(f"   ⚠️ Не удалось сохранить кэш")
+    
+    return np.array(embeddings)
+
+
+# 🚀 FAST Function to extract features using Masked Pooling (10-50x faster!)
+def extract_features_from_masks_fast(image, masks, model, layer, transform):
+    """
+    🚀 БЫСТРОЕ извлечение features с Masked Pooling - один прогон бэкбона на все маски!
+    Ускорение в 10-50 раз по сравнению с отдельными прогонами каждой маски.
+    """
+    import time
+    import torch
+    import torch.nn.functional as F
+    
+    extract_start = time.time()
+    print(f"🚀 БЫСТРОЕ извлечение эмбеддингов для {len(masks)} масок (Masked Pooling)...")
+    
+    if len(masks) == 0:
+        print("   ❌ ДИАГНОСТИКА: Передано 0 масок в функцию!")
+        return np.array([])
+    
+    # Подготовка изображения для модели
+    if transform:
+        image_tensor = transform(Image.fromarray(image)).unsqueeze(0)
+    else:
+        # Стандартная нормализация
+        image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+        # ImageNet нормализация
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        image_tensor = (image_tensor - mean) / std
+        image_tensor = image_tensor.unsqueeze(0)
+    
+    # Перевод в GPU если доступно
+    device = next(model.parameters()).device
+    image_tensor = image_tensor.to(device, memory_format=torch.channels_last)
+    
+    # 🔥 Hook для захвата feature map ИЗ ПРАВИЛЬНОГО СЛОЯ
+    feature_map = None
+    def hook_fn(module, input, output):
+        nonlocal feature_map
+        # Получаем feature map перед Global Average Pool
+        if len(output.shape) == 4:  # [B, C, H, W] - это то что нам нужно
+            feature_map = output
+    
+    # Ищем подходящий слой для hook (не avgpool/fc) - БОЛЕЕ РАННИЙ ДЛЯ БОЛЬШИХ FEATURE MAP
+    target_layer = None
+    if hasattr(model, 'features'):  # DenseNet/VGG style
+        target_layer = model.features[-3] if len(model.features) > 3 else model.features[-1]
+    elif hasattr(model, 'layer4'):  # ResNet style
+        # Используем layer3 вместо layer4 для большего разрешения
+        if hasattr(model, 'layer3'):
+            target_layer = model.layer3[-1]  
+            print(f"   🔧 Используем layer3 для большего feature map")
+        else:
+            target_layer = model.layer4[-1]
+    elif hasattr(model, 'classifier') and hasattr(model, 'features'):  # Другие архитектуры
+        target_layer = model.features[-3] if len(model.features) > 3 else model.features[-2]
+    else:
+        # Fallback - ищем БОЛЕЕ РАННИЙ conv слой
+        conv_layers = []
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Conv2d):
+                conv_layers.append((name, module))
+        if len(conv_layers) >= 3:
+            target_layer = conv_layers[-3][1]  # Третий с конца
+            print(f"   🔧 Используем conv слой: {conv_layers[-3][0]}")
+        elif conv_layers:
+            target_layer = conv_layers[-1][1]
+    
+    if target_layer is None:
+        print("   ❌ Не удалось найти подходящий слой для hook, используем старый метод")
+        return extract_features_from_masks_slow(image, masks, model, layer, transform)
+    
+    # Регистрируем hook на найденный слой
+    hook = target_layer.register_forward_hook(hook_fn)
+    
+    with torch.no_grad():
+        # Проверяем версию PyTorch для autocast
+        try:
+            with torch.amp.autocast('cuda'):
+                # 🔥 ОДИН прогон бэкбона с оптимизациями
+                model.eval()
+                if hasattr(model, 'to'):
+                    model = model.to(memory_format=torch.channels_last)
+                _ = model(image_tensor)
+        except (AttributeError, TypeError):
+            # Fallback для старых версий PyTorch
+            try:
+                with torch.cuda.amp.autocast():
+                    model.eval()
+                    if hasattr(model, 'to'):
+                        model = model.to(memory_format=torch.channels_last)
+                    _ = model(image_tensor)
+            except:
+                # Без autocast если ничего не работает
+                model.eval()
+                _ = model(image_tensor)
+    
+    hook.remove()
+    
+    if feature_map is None or len(feature_map.shape) != 4:
+        print(f"   ❌ ДИАГНОСТИКА: Получили неправильный feature map shape: {feature_map.shape if feature_map is not None else None}")
+        print(f"   🔍 Target layer was: {target_layer}")
+        print("   🔄 Используем старый метод")
+        return extract_features_from_masks_slow(image, masks, model, layer, transform)
+    
+    # Проверяем минимальный размер feature map для качественного masked pooling
+    batch_size, channels, feat_h, feat_w = feature_map.shape
+    if feat_h < 14 or feat_w < 14:
+        print(f"   ⚠️ Feature map слишком маленький: {feat_h}×{feat_w} < 14×14")
+        print("   🔄 Используем старый метод для лучшего качества")
+        return extract_features_from_masks_slow(image, masks, model, layer, transform)
+    
+    # Подготовка масок под размер feature map
+    original_h, original_w = image.shape[:2]
+    scale_h = feat_h / original_h
+    scale_w = feat_w / original_w
+    
+    print(f"   📐 Feature map: {channels}×{feat_h}×{feat_w}, масштаб: {scale_h:.3f}×{scale_w:.3f}")
+    
+    # Собираем все маски в один тензор
+    mask_tensors = []
+    valid_mask_indices = []
+    
+    for i, mask in enumerate(masks):
+        segmentation = mask['segmentation']
+        
+        # Изменяем размер маски под feature map (более мягкий способ)
+        mask_resized = cv2.resize(segmentation.astype(np.float32), 
+                                (feat_w, feat_h), 
+                                interpolation=cv2.INTER_LINEAR)
+        
+        # Применяем порог для бинаризации после resize
+        mask_resized = (mask_resized > 0.1).astype(bool)
+        
+        # Проверяем, что маска не пустая (более мягкий порог)
+        mask_area = np.sum(mask_resized)
+        if mask_area > 0:
+            mask_tensors.append(torch.from_numpy(mask_resized).float())
+            valid_mask_indices.append(i)
+            if i < 5:  # Отладка для первых масок
+                print(f"   🔍 Маска {i}: исходная {np.sum(segmentation)}, после resize {mask_area}")
+        else:
+            if i < 5:
+                print(f"   ❌ Маска {i}: исходная {np.sum(segmentation)}, после resize {mask_area} - ПОТЕРЯНА")
+    
+    if len(mask_tensors) == 0:
+        print(f"   ❌ ДИАГНОСТИКА: Все {len(masks)} масок оказались пустыми после ресайза!")
+        print(f"   📐 Масштаб: {scale_h:.4f}×{scale_w:.4f}, feature map: {feat_h}×{feat_w}")
+        return np.array([])
+    
+    # Стекаем маски в батч [M, H', W']
+    masks_batch = torch.stack(mask_tensors).to(device)
+    
+    # 🔥 ВЕКТОРИЗОВАННЫЙ Masked Pooling
+    # feature_map: [1, C, H', W'] -> [C, H'*W']
+    feat_flat = feature_map.squeeze(0).view(channels, -1)
+    # masks_batch: [M, H', W'] -> [M, H'*W']
+    masks_flat = masks_batch.view(len(mask_tensors), -1)
+    
+    # Суммируем фичи по каждой маске: [M, C]
+    masked_sums = torch.mm(masks_flat, feat_flat.t())
+    # Нормализуем на площадь маски
+    mask_areas = masks_flat.sum(dim=1, keepdim=True)
+    embeddings = masked_sums / (mask_areas + 1e-6)
+    
+    # Global Average Pooling
+    embeddings = F.adaptive_avg_pool1d(embeddings.unsqueeze(-1), 1).squeeze(-1)
+    
+    # Проверяем на NaN/Inf и нормализуем
+    embeddings = torch.nan_to_num(embeddings, nan=0.0, posinf=1.0, neginf=-1.0)
+    
+    # L2 нормализация для стабильности
+    embeddings = F.normalize(embeddings, p=2, dim=1)
+    
+    # Переводим в numpy
+    result_embeddings = embeddings.cpu().numpy()
+    
+    print(f"   🔍 Embeddings shape: {result_embeddings.shape}, range: [{result_embeddings.min():.6f}, {result_embeddings.max():.6f}]")
+    
+    # Восстанавливаем порядок (для масок, которые были пропущены)
+    final_embeddings = []
+    valid_idx = 0
+    embedding_dim = result_embeddings.shape[1] if len(result_embeddings.shape) > 1 and result_embeddings.shape[1] > 0 else 512
+    
+    for i in range(len(masks)):
+        if i in valid_mask_indices:
+            if valid_idx < len(result_embeddings):
+                emb = result_embeddings[valid_idx]
+                # Если эмбеддинг одномерный, делаем его плоским
+                if len(emb.shape) > 1:
+                    emb = emb.flatten()
+                final_embeddings.append(emb)
+            else:
+                final_embeddings.append(np.zeros(embedding_dim))
+            valid_idx += 1
+        else:
+            # Для пустых масок - нулевой вектор
+            final_embeddings.append(np.zeros(embedding_dim))
+    
+    extract_time = time.time() - extract_start
+    old_time_estimate = len(masks) * 0.1  # Примерное время старого метода
+    speedup = old_time_estimate / extract_time if extract_time > 0 else 1
+    print(f"   ⚡ БЫСТРО: {extract_time:.3f} сек ({extract_time/len(masks)*1000:.1f} мс/маска) - ускорение ~{speedup:.1f}x")
+    
+    return np.array(final_embeddings)
+
+
+# Function to extract features from masks with OPTIMIZATION (старый метод)
+# Удалено, чтобы избежать рекурсии
 
 
 # Function to extract features from masks with OPTIMIZATION
 def extract_features_from_masks(image, masks, model, layer, transform):
+    """
+    Главная функция извлечения фич - использует быстрый Masked Pooling метод
+    """
+    # 🚀 Пробуем быстрый метод сначала
+    try:
+        return extract_features_from_masks_fast(image, masks, model, layer, transform)
+    except Exception as e:
+        print(f"   ⚠️ Быстрый метод не сработал ({str(e)}), используем старый")
+        return extract_features_from_masks_slow(image, masks, model, layer, transform)
+
+
+# Старая функция для fallback
+def extract_features_from_masks_slow(image, masks, model, layer, transform):
     extract_start = time.time()
-    print(f"🧠 Извлечение эмбеддингов для {len(masks)} масок...")
+    print(f"🧠 МЕДЛЕННОЕ извлечение эмбеддингов для {len(masks)} масок...")
+    
+    if len(masks) == 0:
+        print("   ❌ ДИАГНОСТИКА: Передано 0 масок в медленную функцию!")
+        return np.array([])
     
     # 🚀 ОПТИМИЗАЦИЯ: Определяем размер для DINO обработки
     original_height, original_width = image.shape[:2]

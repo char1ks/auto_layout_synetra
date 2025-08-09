@@ -364,7 +364,9 @@ class HybridDefectDetector:
             }
             
         except Exception as e:
+            import traceback
             print(f"   ❌ Ошибка SearchDet: {e}")
+            print(f"   🔍 Детали ошибки: {traceback.format_exc()}")
             return {"missing_elements": [], "detected_areas": []}
     
     def _load_example_images(self, directory):
@@ -474,101 +476,145 @@ class HybridDefectDetector:
         
         from segment_anything_hq import SamAutomaticMaskGenerator, SamPredictor
         import faiss
+        import time
         
-        # 🚀 ОПТИМИЗАЦИЯ 1: Уменьшение размера изображения для ускорения
+        # ⏱️ Начинаем измерение общего времени
+        pipeline_start = time.time()
+        
+        # 📐 Работаем с оригинальным размером изображения
         original_image = np.array(image)
         original_height, original_width = original_image.shape[:2]
         
-        # Уменьшаем изображение для SAM (максимум 1024px по большей стороне)
-        max_size = 1024
-        if max(original_height, original_width) > max_size:
-            scale = max_size / max(original_height, original_width)
-            new_height = int(original_height * scale)
-            new_width = int(original_width * scale)
-            
-            resized_image = cv2.resize(original_image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
-            print(f"   🔧 Оптимизация: уменьшили изображение {original_width}x{original_height} → {new_width}x{new_height} (scale={scale:.2f})")
-            
-            # Корректируем параметры SAM для меньшего изображения
-            adjusted_min_area = max(100, int(2000 * scale * scale))  # Масштабируем минимальную площадь
-            processing_image = resized_image
-        else:
-            scale = 1.0
-            adjusted_min_area = 2000
-            processing_image = original_image
-            print(f"   ✅ Изображение достаточно маленькое: {original_width}x{original_height}")
+        # Убираем уменьшение изображения - работаем с полным разрешением
+        scale = 1.0
+        processing_image = original_image
+        adjusted_min_area = 2000  # Стандартная минимальная площадь для полного разрешения
         
-        # Генерация масок с помощью SAM - ОПТИМИЗИРОВАННЫЕ параметры
+        print(f"   📐 Обрабатываем в оригинальном размере: {original_width}x{original_height}")
+        
+        # ⏱️ ЭТАП 1: Генерация масок SAM (БЫСТРАЯ ВЕРСИЯ)
+        sam_start = time.time()
+        print(f"\n🚀 ЭТАП 1: Генерация масок SAM (БЫСТРАЯ ВЕРСИЯ) на изображении {processing_image.shape[:2]}...")
+        
+        # 🔧 СТАБИЛЬНЫЕ параметры SAM (исправляем division by zero)
         mask_generator = SamAutomaticMaskGenerator(
             model=self.searchdet_sam,
-            points_per_side=48,  # УМЕНЬШЕНО для скорости - меньше точек = меньше масок
-            points_per_batch=96,  # УМЕНЬШЕНО для экономии памяти
-            pred_iou_thresh=0.8,  # УЖЕСТОЧЕНО - только качественные маски
-            stability_score_thresh=0.8,  # УЖЕСТОЧЕНО - только стабильные маски  
-            min_mask_region_area=adjusted_min_area,  # АДАПТИВНАЯ минимальная площадь
-            box_nms_thresh=0.7,  # УЖЕСТОЧЕНО - строже фильтрация дубликатов
-            crop_nms_thresh=0.7,  # УЖЕСТОЧЕНО
+            points_per_side=64,  # Хороший баланс качества и скорости
+            points_per_batch=128,  # Размер батча
+            pred_iou_thresh=0.75,  # Немного понижен для больше масок
+            stability_score_thresh=0.75,  # Немного понижен для больше масок
+            min_mask_region_area=adjusted_min_area,  # Убираем умножение на 2
+            box_nms_thresh=0.5,  # Стандартное значение
+            crop_nms_thresh=0.5,  # Стандартное значение
+            crop_n_layers=1,  # МИНИМУМ 1 для избежания ошибок (0 может вызывать проблемы)
+            crop_n_points_downscale_factor=1,  # МИНИМУМ 1 для избежания division by zero
         )
         
-        print(f"   ⚡ Генерация масок на изображении {processing_image.shape[:2]}")
         masks = mask_generator.generate(processing_image)
+        sam_time = time.time() - sam_start
         
+        print(f"   🔍 SAM сгенерировал {len(masks)} масок за {sam_time:.2f} сек")
         if not masks:
+            print("   ❌ Генератор масок не вернул ни одной маски")
+            print("   🔧 Возможные причины:")
+            print("   - Слишком строгие параметры SAM")
+            print("   - Изображение слишком маленькое или однородное")
+            print("   - Проблема с моделью SAM")
             return []
-        
-        # 🚀 ОПТИМИЗАЦИЯ 2: Слияние перекрывающихся масок для уменьшения количества
-        print(f"   🔄 Было масок до слияния: {len(masks)}")
-        merged_masks = self._merge_overlapping_masks(masks, iou_threshold=0.7)
-        print(f"   ✅ Стало масок после слияния: {len(merged_masks)}")
-        
-        # Масштабируем маски обратно к оригинальному размеру если нужно
-        if scale != 1.0:
-            print(f"   🔧 Масштабируем маски обратно к размеру {original_width}x{original_height}")
-            scaled_masks = []
-            for mask_data in merged_masks:
-                mask = mask_data['segmentation']
-                # Масштабируем маску обратно
-                scaled_mask = cv2.resize(mask.astype(np.uint8), (original_width, original_height), interpolation=cv2.INTER_NEAREST)
-                scaled_mask = scaled_mask.astype(bool)
-                
-                # Обновляем данные маски
-                mask_data['segmentation'] = scaled_mask
-                mask_data['area'] = int(scaled_mask.sum())
-                
-                # Масштабируем bbox
-                if 'bbox' in mask_data:
-                    bbox = mask_data['bbox']
-                    mask_data['bbox'] = [int(bbox[0]/scale), int(bbox[1]/scale), 
-                                       int(bbox[2]/scale), int(bbox[3]/scale)]
-                
-                scaled_masks.append(mask_data)
-            
-            final_masks = scaled_masks
         else:
-            final_masks = merged_masks
+            print(f"   ✅ Размеры первых масок: {[np.sum(m['segmentation']) for m in masks[:3]]}")
         
-        # Извлечение признаков масок (работаем с оригинальным изображением для точности)
+        # ⏱️ ЭТАП 2: Слияние перекрывающихся масок
+        merge_start = time.time()
+        print(f"\n🔗 ЭТАП 2: Слияние перекрывающихся масок...")
+        print(f"   🔄 Было масок: {len(masks)}")
+        
+        merged_masks = self._merge_overlapping_masks(masks, iou_threshold=0.7)
+        merge_time = time.time() - merge_start
+        
+        print(f"   ✅ Стало масок: {len(merged_masks)} за {merge_time:.2f} сек")
+        
+        # ⏱️ ЭТАП 3: Подготовка масок (без масштабирования)
+        scale_start = time.time()
+        print(f"\n📏 ЭТАП 3: Подготовка масок...")
+        
+        # Так как работаем с оригинальным размером, просто используем merged_masks
+        final_masks = merged_masks
+        scale_time = time.time() - scale_start
+        
+        print(f"   ✅ Маски готовы за {scale_time:.3f} сек (без масштабирования)")
+        
+        # ⏱️ ЭТАП 4: Извлечение эмбеддингов
+        import time
+        embedding_start = time.time()
         image_np = original_image
+        print(f"\n🧠 ЭТАП 4: Извлечение эмбеддингов из {len(final_masks)} масок...")
+        
+        if len(final_masks) == 0:
+            print("   ❌ ПРОБЛЕМА: У нас 0 масок после merge/scale!")
+            return []
+        else:
+            print(f"   ✅ Первая маска: shape={final_masks[0]['segmentation'].shape}, pixels={np.sum(final_masks[0]['segmentation'])}")
+        
         mask_vectors = extract_features_from_masks(
             image_np, final_masks, self.searchdet_resnet, self.searchdet_layer, self.searchdet_transform
         )
         mask_vectors = np.array(mask_vectors, dtype=np.float32)
+        embedding_time = time.time() - embedding_start
         
-        # Нормализация для cosine similarity
-        query_vectors = query_vectors / np.linalg.norm(query_vectors, axis=1, keepdims=True)
-        mask_vectors = mask_vectors / np.linalg.norm(mask_vectors, axis=1, keepdims=True)
+        print(f"   ⚡ Эмбеддинги извлечены за {embedding_time:.2f} сек")
         
-        # FAISS поиск
+        # ⏱️ ЭТАП 5: Нормализация векторов
+        norm_start = time.time()
+        print(f"\n🔧 ЭТАП 5: Нормализация векторов...")
+        print(f"   📊 Исходные vectors: shape={mask_vectors.shape}, range=[{mask_vectors.min():.3f}, {mask_vectors.max():.3f}]")
+        
+        # Проверяем на пустые эмбеддинги
+        if mask_vectors.shape[0] == 0:
+            print("   ❌ КРИТИЧЕСКАЯ ОШИБКА: Нет эмбеддингов масок!")
+            return []
+        
+        # Проверяем на NaN/Inf
+        mask_vectors = np.nan_to_num(mask_vectors, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        query_norms = np.linalg.norm(query_vectors, axis=1, keepdims=True)
+        query_norms = np.where(query_norms > 1e-12, query_norms, 1.0)
+        query_vectors = query_vectors / query_norms
+        
+        mask_norms = np.linalg.norm(mask_vectors, axis=1, keepdims=True) 
+        mask_norms = np.where(mask_norms > 1e-12, mask_norms, 1.0)
+        mask_vectors = mask_vectors / mask_norms
+        
+        norm_time = time.time() - norm_start
+        print(f"   🔧 Нормализация завершена за {norm_time:.3f} сек")
+        print(f"   📈 Результат: mask_vectors=[{mask_vectors.min():.3f}, {mask_vectors.max():.3f}], query_vectors=[{query_vectors.min():.3f}, {query_vectors.max():.3f}]")
+        
+        # Проверяем совместимость размерностей
+        if query_vectors.shape[1] != mask_vectors.shape[1]:
+            print(f"   ❌ КРИТИЧЕСКАЯ ОШИБКА: Несовпадение размерностей!")
+            print(f"   📐 Query: {query_vectors.shape[1]}, Mask: {mask_vectors.shape[1]}")
+            return []
+        
+        # ⏱️ ЭТАП 6: FAISS поиск схожести
+        faiss_start = time.time()
+        print(f"\n🔍 ЭТАП 6: FAISS поиск схожести...")
+        print(f"   🔧 Размерности: query_vectors={query_vectors.shape}, mask_vectors={mask_vectors.shape}")
+        
         index = faiss.IndexFlatIP(query_vectors.shape[1])
         index.add(query_vectors)
         
         similarities, indices = index.search(mask_vectors, 1)
         normalized_similarities = (similarities + 1) / 2
+        faiss_time = time.time() - faiss_start
         
-        # 🔍 ОТЛАДОЧНАЯ ИНФОРМАЦИЯ
+        print(f"   🔍 FAISS поиск завершен за {faiss_time:.3f} сек")
         print(f"   📊 Similarities: min={normalized_similarities.min():.3f}, max={normalized_similarities.max():.3f}, mean={normalized_similarities.mean():.3f}")
         print(f"   🎯 Threshold: {similarity_threshold}")
         print(f"   📈 Топ-5 similarities: {np.sort(normalized_similarities.flatten())[-5:]}")
+        
+        # ⏱️ ЭТАП 7: Базовая фильтрация
+        filter_start = time.time()
+        print(f"\n🎯 ЭТАП 7: Базовая фильтрация...")
         
         # ИЗМЕНЕНО: Поиск областей с ВЫСОКИМ сходством (присутствующие детали)
         found_indices = np.where(normalized_similarities.flatten() >= similarity_threshold)[0]
@@ -579,14 +625,15 @@ class HybridDefectDetector:
             sorted_order = np.argsort(similarities_for_found)[::-1]  # По убыванию
             found_indices = found_indices[sorted_order]
         
+        print(f"   🔍 Найдено {len(found_indices)} потенциальных деталей из {len(final_masks)} масок")
+        
         found_elements = []
         h, w = image_np.shape[:2]
         total_image_area = h * w
-        min_allowed_area = 40  # УВЕЛИЧЕНО - отфильтровываем мелкий шум и случайные пиксели
-        max_allowed_area_percentage = 0.05  # УМЕНЬШЕНО - максимум 25% от изображения
+        min_allowed_area = 40
+        max_allowed_area_percentage = 0.05
         max_allowed_area = int(total_image_area * max_allowed_area_percentage)
         
-        print(f"   🔍 Найдено {len(found_indices)} потенциальных деталей из {len(final_masks)} масок")
         print(f"   📏 Фильтр площади: {min_allowed_area} - {max_allowed_area} пикселей")
         
         processed_count = 0
@@ -640,7 +687,41 @@ class HybridDefectDetector:
                 "similarity": float(normalized_similarities[idx][0])  # Для отладки
             })
         
-        print(f"   ✅ После фильтрации: {len(found_elements)} подходящих деталей")
+        filter_time = time.time() - filter_start
+        filtered_count = len(found_indices) - len(found_elements)
+        print(f"   ✅ Базовая фильтрация завершена за {filter_time:.3f} сек")
+        print(f"   📊 Обработано: {len(found_indices)}, отфильтровано: {filtered_count}, осталось: {len(found_elements)}")
+        
+        # ⏱️ ЭТАП 8: Фильтр касающихся/обволакивающих масок
+        if len(found_elements) > 1:
+            import time
+            touching_start = time.time()
+            print(f"\n🔗 ЭТАП 8: Фильтр касающихся/обволакивающих масок...")
+            
+            initial_count = len(found_elements)
+            found_elements = self._remove_touching_large_masks(found_elements)
+            touching_time = time.time() - touching_start
+            
+            removed_count = initial_count - len(found_elements)
+            print(f"   ✅ Фильтр обволакивания завершен за {touching_time:.3f} сек")
+            print(f"   📊 Удалено: {removed_count}, осталось: {len(found_elements)}")
+        else:
+            touching_time = 0.0
+            print(f"\n🔗 ЭТАП 8: Пропуск фильтра касания (≤1 маски)")
+        
+        # ⏱️ ИТОГОВАЯ СТАТИСТИКА
+        total_time = time.time() - pipeline_start
+        print(f"\n📊 ИТОГОВАЯ СТАТИСТИКА SearchDet:")
+        print(f"   ⏱️ SAM генерация: {sam_time:.2f} сек ({sam_time/total_time*100:.1f}%)")
+        print(f"   ⏱️ Слияние масок: {merge_time:.2f} сек ({merge_time/total_time*100:.1f}%)")
+        print(f"   ⏱️ Масштабирование: {scale_time:.2f} сек ({scale_time/total_time*100:.1f}%)")
+        print(f"   ⏱️ Эмбеддинги: {embedding_time:.2f} сек ({embedding_time/total_time*100:.1f}%)")
+        print(f"   ⏱️ Нормализация: {norm_time:.3f} сек ({norm_time/total_time*100:.1f}%)")
+        print(f"   ⏱️ FAISS поиск: {faiss_time:.3f} сек ({faiss_time/total_time*100:.1f}%)")
+        print(f"   ⏱️ Базовая фильтрация: {filter_time:.3f} сек ({filter_time/total_time*100:.1f}%)")
+        print(f"   ⏱️ Фильтр касания: {touching_time:.3f} сек ({touching_time/total_time*100:.1f}%)")
+        print(f"   🎯 ОБЩЕЕ ВРЕМЯ: {total_time:.2f} сек")
+        print(f"   🏆 ФИНАЛЬНЫЙ РЕЗУЛЬТАТ: {len(found_elements)} масок")
         
         return found_elements
     
@@ -1401,6 +1482,53 @@ class HybridDefectDetector:
             # Текст
             cv2.putText(image, "Missing Elements (SearchDet)", (legend_x + 35, legend_y + 47), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+
+    def _remove_touching_large_masks(self, found_elements):
+        """БЫСТРАЯ версия: удаляет большие маски, которые обволакивают меньших"""
+        if len(found_elements) <= 1:
+            return found_elements
+        
+        import cv2
+        
+        elements_to_remove = set()
+        
+        # 🚀 ОПТИМИЗАЦИЯ: Предварительно сортируем по убыванию площади для быстрого поиска
+        sorted_elements = sorted(enumerate(found_elements), key=lambda x: np.sum(x[1]['mask']), reverse=True)
+        
+        for idx_i, (i, element1) in enumerate(sorted_elements):
+            if i in elements_to_remove:
+                continue
+                
+            seg1 = element1['mask'].astype(np.uint8)
+            area1 = np.sum(seg1)
+            
+            # 🚀 ОПТИМИЗАЦИЯ: Проверяем только меньшие маски (индексы после текущего)
+            for idx_j in range(idx_i + 1, len(sorted_elements)):
+                j, element2 = sorted_elements[idx_j]
+                
+                if j in elements_to_remove:
+                    continue
+                
+                seg2 = element2['mask'].astype(np.uint8)
+                area2 = np.sum(seg2)
+                
+                # 🚀 БЫСТРАЯ ПРОВЕРКА: Только обволакивание (убираем медленную проверку касания)
+                intersection = np.logical_and(seg1, seg2)
+                intersection_area = np.sum(intersection)
+                containment_ratio = intersection_area / area2 if area2 > 0 else 0
+                
+                if containment_ratio >= 0.65:  # ПОНИЖЕН порог для более быстрой фильтрации
+                    elements_to_remove.add(i)
+                    print(f"   🎁 Удаляем обволакивающую маску {i} (содержит {containment_ratio:.1%} маски {j}, area1={area1}, area2={area2})")
+                    break  # Выходим сразу после первого найденного
+        
+        # Возвращаем элементы без удалённых
+        filtered_elements = [elem for i, elem in enumerate(found_elements) if i not in elements_to_remove]
+        
+        if len(elements_to_remove) > 0:
+            print(f"   🎯 Удалено {len(elements_to_remove)} обволакивающих масок (БЫСТРЫЙ режим)")
+        
+        return filtered_elements
 
 
 def main():

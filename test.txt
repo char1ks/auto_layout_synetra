@@ -19,7 +19,7 @@ import time
 sys.path.append('./searchdet-main')
 
 # Импортируем наши модули
-from llava_sam2_pipeline import MaterialAndDefectAnalyzer, SAM2DefectSegmenter
+from llava_sam2_pipeline import MaterialAndDefectAnalyzer
 
 # Импортируем SearchDet
 try:
@@ -37,18 +37,20 @@ except ImportError as e:
 
 
 class HybridDefectDetector:
-    """Гибридный детектор: LLaVA + SearchDet + SAM2"""
+    """Гибридный детектор: LLaVA + SearchDet"""
     
-    def __init__(self, model_type="detailed"):
-        print("🚀 Инициализация гибридного детектора...")
-        
-        # LLaVA для контекстного анализа
-        self.llava_analyzer = MaterialAndDefectAnalyzer()
-        if model_type != "detailed":
-            self.llava_analyzer.switch_model(model_type)
-        
-        # SAM2 для финальной сегментации
-        self.sam2_segmenter = SAM2DefectSegmenter()
+    def __init__(self, model_type="detailed", searchdet_only=False):
+        if searchdet_only:
+            print("🚀 Инициализация ТОЛЬКО SearchDet детектора...")
+            self.searchdet_only = True
+            self.llava_analyzer = None
+        else:
+            print("🚀 Инициализация гибридного детектора...")
+            self.searchdet_only = False
+            # LLaVA для контекстного анализа
+            self.llava_analyzer = MaterialAndDefectAnalyzer()
+            if model_type != "detailed":
+                self.llava_analyzer.switch_model(model_type)
         
         # SearchDet для поиска отсутствующих элементов
         if SEARCHDET_AVAILABLE:
@@ -80,7 +82,7 @@ class HybridDefectDetector:
         for i, mask in enumerate(all_masks):
             if i < len(results["annotations"]["defects"]):
                 defect_info = results["annotations"]["defects"][i]
-                detection_method = defect_info.get("detection_method", "sam2_segmentation")
+                detection_method = defect_info.get("detection_method", "searchdet_found")
                 category = defect_info.get("category", "defect")
                 
                 # Берем ТОЛЬКО SearchDet маски (те же, что в папке masks/)
@@ -132,7 +134,7 @@ class HybridDefectDetector:
         
         return comparison_results, predicted_combined
         
-    def analyze_with_examples(self, image_path, positive_examples_dir, negative_examples_dir, output_dir="./output", ground_truth_path=None):
+    def analyze_with_examples(self, image_path, positive_examples_dir, negative_examples_dir, output_dir="./output", ground_truth_path=None, use_prompts=True, max_masks=50, min_confidence=0.5, min_area=500):
         """Полный анализ с использованием примеров для SearchDet"""
         
         print(f"\n🔍 ГИБРИДНЫЙ АНАЛИЗ: {image_path}")
@@ -145,36 +147,55 @@ class HybridDefectDetector:
             "stages": {}
         }
         
-        # ЭТАП 1: LLaVA - контекстный анализ
-        print("🧠 ЭТАП 1: LLaVA контекстный анализ...")
-        stage1_start = time.time()
+        # ЭТАП 1: LLaVA - контекстный анализ (пропускаем если searchdet_only)
+        if not self.searchdet_only:
+            print("🧠 ЭТАП 1: LLaVA контекстный анализ...")
+            stage1_start = time.time()
+            
+            material_result = self.llava_analyzer.classify_material(image_path)
+            llava_defect_analysis = self.llava_analyzer.analyze_defects(image_path, material_result['material'])
+            
+            stage1_time = time.time() - stage1_start
+            results["stages"]["llava_analysis"] = {
+                "duration": stage1_time,
+                "material": material_result,
+                "defects": llava_defect_analysis
+            }
+            
+            print(f"   ✅ Материал: {material_result['material']}")
+            print(f"   🔍 LLaVA дефекты: {llava_defect_analysis.get('defects_found', False)}")
+            print(f"   ⏱️ Время: {stage1_time:.2f} сек")
+        else:
+            print("🚀 Режим ТОЛЬКО SearchDet - пропускаем LLaVA анализ")
+            # Создаем заглушку для совместимости
+            results["stages"]["llava_analysis"] = {
+                "duration": 0,
+                "material": {"material": "unknown", "confidence": 0},
+                "defects": {"defects_found": False, "analysis": "SearchDet only mode"}
+            }
         
-        material_result = self.llava_analyzer.classify_material(image_path)
-        llava_defect_analysis = self.llava_analyzer.analyze_defects(image_path, material_result['material'])
-        
-        stage1_time = time.time() - stage1_start
-        results["stages"]["llava_analysis"] = {
-            "duration": stage1_time,
-            "material": material_result,
-            "defects": llava_defect_analysis
-        }
-        
-        print(f"   ✅ Материал: {material_result['material']}")
-        print(f"   🔍 LLaVA дефекты: {llava_defect_analysis.get('defects_found', False)}")
-        print(f"   ⏱️ Время: {stage1_time:.2f} сек")
-        
-        # ЭТАП 2: SearchDet - поиск и сегментация дефектов
-        print("\n🔍 ЭТАП 2: SearchDet поиск и сегментация дефектов...")
+        # ЭТАП 2: SearchDet - поиск отсутствующих элементов
+        print("\n🔍 ЭТАП 2: SearchDet поиск отсутствующих элементов...")
         stage2_start = time.time()
         
         searchdet_results = None
         if SEARCHDET_AVAILABLE and os.path.exists(positive_examples_dir) and os.path.exists(negative_examples_dir):
+            # Получаем LLaVA bounding boxes для промптов (только если LLaVA анализ выполнялся)
+            llava_boxes = []
+            if not self.searchdet_only and hasattr(self, 'llava_analyzer') and self.llava_analyzer is not None:
+                # Получаем результаты LLaVA анализа из results
+                llava_defect_analysis = results["stages"]["llava_analysis"]["defects"]
+                if llava_defect_analysis.get("has_defects") and use_prompts:
+                    llava_boxes = llava_defect_analysis.get("bounding_boxes", [])
+                    print(f"🎯 Подготовлено {len(llava_boxes)} промптов от LLaVA для SAM-HQ")
+            
             searchdet_results = self._run_searchdet_analysis(
-                image_path, positive_examples_dir, negative_examples_dir
+                image_path, positive_examples_dir, negative_examples_dir,
+                llava_boxes=llava_boxes, use_prompts=(use_prompts and not self.searchdet_only)
             )
         else:
             print("   ⚠️ SearchDet пропущен - нет примеров или модуль недоступен")
-            searchdet_results = {"found_elements": [], "missing_elements": [], "detected_areas": []}
+            searchdet_results = {"missing_elements": [], "detected_areas": []}
         
         stage2_time = time.time() - stage2_start
         results["stages"]["searchdet_analysis"] = {
@@ -182,45 +203,90 @@ class HybridDefectDetector:
             "result": searchdet_results
         }
         
-        print(f"   ✅ Найдено и сегментировано дефектов: {len(searchdet_results.get('found_elements', []))}")
+        print(f"   ✅ Найдено деталей SearchDet: {len(searchdet_results.get('found_elements', []))}")
+        print(f"   🔴 Для визуализации будет показано: {len(searchdet_results.get('found_elements', []))} красных масок")
         print(f"   ⏱️ Время: {stage2_time:.2f} сек")
         
         # ЭТАП 3: Объединение результатов
-        print("\n🔄 ЭТАП 3: Объединение LLaVA + SearchDet...")
-        combined_defects = self._combine_llava_searchdet_results(llava_defect_analysis, searchdet_results)
+        if not self.searchdet_only:
+            print("\n🔄 ЭТАП 3: Объединение LLaVA + SearchDet...")
+            llava_defect_analysis = results["stages"]["llava_analysis"]["defects"]
+            combined_defects = self._combine_llava_searchdet_results(llava_defect_analysis, searchdet_results)
+        else:
+            print("\n🔄 ЭТАП 3: Обработка только SearchDet результатов...")
+            # В режиме только SearchDet объединение не нужно
+            combined_defects = []
         
-        # ЭТАП 4: SAM2 финальная сегментация
-        print("\n🎯 ЭТАП 4: SAM2 финальная сегментация...")
+        # 🔴 ИСПОЛЬЗУЕМ ТОЛЬКО SearchDet маски (БЕЗ SAM2)
+        print("\n🎯 ЭТАП 4: Формирование финальных масок...")
         stage4_start = time.time()
         
-        sam2_results = self.sam2_segmenter.segment_defects_with_prompts(image_path, combined_defects)
+        all_masks = []
+        searchdet_found = searchdet_results.get("found_elements", [])
         
-        stage4_time = time.time() - stage4_start
-        results["stages"]["sam2_segmentation"] = {
+        if searchdet_found:
+            # Убираем только ограничения на количество масок
+            print(f"   🔥 ОБРАБАТЫВАЕМ ВСЕ {len(searchdet_found)} МАСОК (без лимитов по количеству)")
+            limited_found = searchdet_found  # Берем все маски без ограничения количества
+            
+            print(f"   🔴 Используем {len(limited_found)} SearchDet масок...")
+            for i, found_elem in enumerate(limited_found):
+                if "mask" in found_elem:
+                    searchdet_mask = found_elem["mask"]
+                    all_masks.append(searchdet_mask)
+                    confidence = found_elem.get("confidence", 0.0)
+                    print(f"   🔴 Маска {i+1}: SearchDet найденная деталь (confidence={confidence:.3f})")
+            
+            stage4_time = time.time() - stage4_start
+            print(f"   ✅ Общий список масок: {len(all_masks)} (только SearchDet)")
+            print(f"   ⏱️ Время: {stage4_time:.2f} сек")
+        else:
+            stage4_time = time.time() - stage4_start
+            print("   ⚠️ SearchDet не нашел подходящих элементов")
+        
+        # Обновляем результаты без SAM2
+        results["stages"]["final_masks"] = {
             "duration": stage4_time,
-            "result": sam2_results
+            "searchdet_masks": len(all_masks)
         }
         
-        print(f"   ✅ SAM2 маски: {sam2_results.get('num_detections', 0)}")
-        print(f"   ⏱️ Время: {stage4_time:.2f} сек")
-        
         # Создание финальных аннотаций
+        print("\n📝 ЭТАП 5: Создание аннотаций...")
+        annotation_start = time.time()
+        
         image = cv2.imread(str(image_path))
+        print(f"   📐 Размер изображения: {image.shape}")
+        print(f"   🎭 Количество масок для обработки: {len(all_masks)}")
+        
+        # Получаем material_result из results (или создаем заглушку для режима только SearchDet)
+        material_result = results["stages"]["llava_analysis"]["material"]
+        
         annotations = self._create_hybrid_annotations(
-            image, sam2_results.get("masks", []), material_result, combined_defects, searchdet_results
+            image, all_masks, material_result, combined_defects, searchdet_results
         )
         results["annotations"] = annotations
         
+        annotation_time = time.time() - annotation_start
+        print(f"   ✅ Аннотации созданы за {annotation_time:.2f} сек")
+        
         # Сохранение результатов
+        print("\n💾 ЭТАП 6: Сохранение результатов...")
+        save_start = time.time()
+        
         output_path = Path(output_dir)
         output_path.mkdir(exist_ok=True)
-        self._save_hybrid_results(image_path, image, sam2_results.get("masks", []), results, output_path)
+        print(f"   📁 Папка вывода: {output_path}")
+        
+        self._save_hybrid_results(image_path, image, all_masks, results, output_path)
+        
+        save_time = time.time() - save_start
+        print(f"   ✅ Сохранение завершено за {save_time:.2f} сек")
         
         # Сравнение с ground truth (если предоставлено)
         if ground_truth_path:
             print(f"\n🔍 ЭТАП 5: Сравнение с Ground Truth...")
             comparison_results, predicted_combined = self._compare_masks_with_ground_truth(
-                sam2_results.get("masks", []), ground_truth_path, image.shape, results
+                all_masks, ground_truth_path, image.shape, results
             )
             results["ground_truth_comparison"] = comparison_results
             
@@ -236,8 +302,13 @@ class HybridDefectDetector:
         
         return results
     
-    def _run_searchdet_analysis(self, image_path, positive_dir, negative_dir):
-        """Запуск SearchDet для поиска отсутствующих элементов"""
+    def _run_searchdet_analysis(self, image_path, positive_dir, negative_dir, llava_boxes=None, use_prompts=False):
+        """Запуск SearchDet для поиска отсутствующих элементов
+        
+        Args:
+            use_prompts: если True, использует LLaVA bounding boxes как промпты для SAM-HQ
+            llava_boxes: список bounding boxes от LLaVA для промптов
+        """
         
         try:
             # Загрузка изображения
@@ -271,10 +342,18 @@ class HybridDefectDetector:
                 for q in pos_embeddings
             ], axis=0).astype(np.float32)
             
-            # ИЗМЕНЕНО: Поиск дефектов - более мягкий threshold для обнаружения разнообразных дефектов
-            found_elements = self._find_missing_elements(
-                example_img, adjusted_queries, similarity_threshold=0.45  # Мягче: >45% сходства для обнаружения больше дефектов
-            )
+            # ИЗМЕНЕНО: Поиск присутствующих деталей - строгий threshold для точности
+            if use_prompts and llava_boxes and len(llava_boxes) > 0:
+                print("🎯 Используем ПРОМПТ-РЕЖИМ с LLaVA bounding boxes")
+                found_elements = self._find_elements_with_prompts(
+                    example_img, adjusted_queries, llava_boxes, similarity_threshold=0.5
+                )
+            else:
+                print("🔄 Используем АВТОМАТИЧЕСКУЮ генерацию масок")
+                print("💪 УСИЛЕННЫЙ режим поиска с акцентом на положительные примеры")
+                found_elements = self._find_missing_elements(
+                    example_img, adjusted_queries, similarity_threshold=0.45  # НАСТРОЕН: оптимальный баланс чувствительности
+                )
             
             return {
                 "missing_elements": [],  # Больше не ищем отсутствующие
@@ -285,15 +364,17 @@ class HybridDefectDetector:
             }
             
         except Exception as e:
+            import traceback
             print(f"   ❌ Ошибка SearchDet: {e}")
+            print(f"   🔍 Детали ошибки: {traceback.format_exc()}")
             return {"missing_elements": [], "detected_areas": []}
     
     def _load_example_images(self, directory):
         """Загрузка примеров изображений из директории"""
-        images = []
+        images = [] 
         if not os.path.exists(directory):
             return images
-            
+        
         for filename in os.listdir(directory):
             if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
                 try:
@@ -306,97 +387,467 @@ class HybridDefectDetector:
         
         return images
     
-    def _find_missing_elements(self, image, query_vectors, similarity_threshold=0.45):
-        """Поиск дефектов с помощью SearchDet (на основе позитивных примеров дефектов)"""
+    def _merge_overlapping_masks(self, masks, iou_threshold=0.7):
+        """Слияние перекрывающихся масок для оптимизации"""
         
-        from segment_anything_hq import SamAutomaticMaskGenerator
+        if len(masks) == 0:
+            return masks
+        
+        # Вычисляем IoU между всеми парами масок
+        merged_masks = []
+        used_indices = set()
+        
+        for i, mask1 in enumerate(masks):
+            if i in used_indices:
+                continue
+                
+            # Группируем маски для слияния
+            group_to_merge = [mask1]
+            group_indices = {i}
+            
+            seg1 = mask1['segmentation']
+            
+            for j, mask2 in enumerate(masks[i+1:], i+1):
+                if j in used_indices:
+                    continue
+                    
+                seg2 = mask2['segmentation']
+                
+                # Вычисляем IoU
+                intersection = np.logical_and(seg1, seg2).sum()
+                union = np.logical_or(seg1, seg2).sum()
+                
+                if union > 0:
+                    iou = intersection / union
+                    if iou > iou_threshold:
+                        group_to_merge.append(mask2)
+                        group_indices.add(j)
+            
+            # Объединяем маски в группе
+            if len(group_to_merge) > 1:
+                merged_mask = self._merge_mask_group(group_to_merge)
+            else:
+                merged_mask = mask1
+            
+            merged_masks.append(merged_mask)
+            used_indices.update(group_indices)
+        
+        return merged_masks
+    
+    def _merge_mask_group(self, mask_group):
+        """Объединение группы масок в одну"""
+        
+        # Объединяем все сегментации
+        combined_seg = mask_group[0]['segmentation'].copy()
+        for mask in mask_group[1:]:
+            combined_seg = np.logical_or(combined_seg, mask['segmentation'])
+        
+        # Вычисляем новые параметры
+        new_area = int(combined_seg.sum())
+        
+        # Находим bounding box объединенной маски
+        rows = np.any(combined_seg, axis=1)
+        cols = np.any(combined_seg, axis=0)
+        
+        if rows.any() and cols.any():
+            y_indices = np.where(rows)[0]
+            x_indices = np.where(cols)[0]
+            y_min, y_max = y_indices[0], y_indices[-1]
+            x_min, x_max = x_indices[0], x_indices[-1]
+            new_bbox = [x_min, y_min, x_max - x_min, y_max - y_min]
+        else:
+            new_bbox = [0, 0, 0, 0]
+        
+        # Берем максимальные значения качества
+        max_stability_score = max(mask.get('stability_score', 0) for mask in mask_group)
+        max_predicted_iou = max(mask.get('predicted_iou', 0) for mask in mask_group)
+        
+        return {
+            'segmentation': combined_seg,
+            'area': new_area,
+            'bbox': new_bbox,
+            'stability_score': max_stability_score,
+            'predicted_iou': max_predicted_iou,
+            'crop_box': mask_group[0].get('crop_box', [0, 0, combined_seg.shape[1], combined_seg.shape[0]])
+        }
+    
+    def _find_missing_elements(self, image, query_vectors, similarity_threshold=0.25):
+        """Поиск присутствующих деталей с помощью SearchDet (изменено с поиска отсутствующих)"""
+        
+        from segment_anything_hq import SamAutomaticMaskGenerator, SamPredictor
         import faiss
+        import time
         
-        # Генерация масок с помощью SAM - ОЧЕНЬ чувствительные параметры для детекции мелких дефектов
+        # ⏱️ Начинаем измерение общего времени
+        pipeline_start = time.time()
+        
+        # 📐 Работаем с оригинальным размером изображения
+        original_image = np.array(image)
+        original_height, original_width = original_image.shape[:2]
+        
+        # Убираем уменьшение изображения - работаем с полным разрешением
+        scale = 1.0
+        processing_image = original_image
+        adjusted_min_area = 2000  # Стандартная минимальная площадь для полного разрешения
+        
+        print(f"   📐 Обрабатываем в оригинальном размере: {original_width}x{original_height}")
+        
+        # ⏱️ ЭТАП 1: Генерация масок SAM (БЫСТРАЯ ВЕРСИЯ)
+        sam_start = time.time()
+        print(f"\n🚀 ЭТАП 1: Генерация масок SAM (БЫСТРАЯ ВЕРСИЯ) на изображении {processing_image.shape[:2]}...")
+        
+        # 🔧 СТАБИЛЬНЫЕ параметры SAM (исправляем division by zero)
         mask_generator = SamAutomaticMaskGenerator(
             model=self.searchdet_sam,
-            points_per_side=40,  # Еще больше точек для лучшего покрытия мелких дефектов
-            points_per_batch=80,
-            pred_iou_thresh=0.70,  # Еще ниже для детекции менее четких дефектов
-            stability_score_thresh=0.75,  # Еще ниже для большего количества масок
-            min_mask_region_area=200,  # СИЛЬНО уменьшили для мелких дефектов (царапины, точки)
-            box_nms_thresh=0.6,  # Еще слабее NMS
-            crop_nms_thresh=0.6,
+            points_per_side=40,  # Хороший баланс качества и скорости
+            points_per_batch=128,  # Размер батча
+            pred_iou_thresh=0.8,  # Немного понижен для больше масок
+            stability_score_thresh=0.8,  # Немного понижен для больше масок
+            min_mask_region_area=adjusted_min_area,  # Убираем умножение на 2
+            box_nms_thresh=0.7,  # Стандартное значение
+            crop_nms_thresh=0.7,  # Стандартное значение
+            crop_n_layers=1,  # МИНИМУМ 1 для избежания ошибок (0 может вызывать проблемы)
+            crop_n_points_downscale_factor=1,  # МИНИМУМ 1 для избежания division by zero
         )
         
-        masks = mask_generator.generate(np.array(image))
+        masks = mask_generator.generate(processing_image)
+        sam_time = time.time() - sam_start
         
+        print(f"   🔍 SAM сгенерировал {len(masks)} масок за {sam_time:.2f} сек")
         if not masks:
+            print("   ❌ Генератор масок не вернул ни одной маски")
+            print("   🔧 Возможные причины:")
+            print("   - Слишком строгие параметры SAM")
+            print("   - Изображение слишком маленькое или однородное")
+            print("   - Проблема с моделью SAM")
             return []
+        else:
+            print(f"   ✅ Размеры первых масок: {[np.sum(m['segmentation']) for m in masks[:3]]}")
         
-        # Извлечение признаков масок
-        image_np = np.array(image)
+        # ⏱️ ЭТАП 2: Слияние перекрывающихся масок
+        merge_start = time.time()
+        print(f"\n🔗 ЭТАП 2: Слияние перекрывающихся масок...")
+        print(f"   🔄 Было масок: {len(masks)}")
+        
+        merged_masks = self._merge_overlapping_masks(masks, iou_threshold=0.7)
+        merge_time = time.time() - merge_start
+        
+        print(f"   ✅ Стало масок: {len(merged_masks)} за {merge_time:.2f} сек")
+        
+        # ⏱️ ЭТАП 3: Подготовка масок (без масштабирования)
+        scale_start = time.time()
+        print(f"\n📏 ЭТАП 3: Подготовка масок...")
+        
+        # Так как работаем с оригинальным размером, просто используем merged_masks
+        final_masks = merged_masks
+        scale_time = time.time() - scale_start
+        
+        print(f"   ✅ Маски готовы за {scale_time:.3f} сек (без масштабирования)")
+        
+        # ⏱️ ЭТАП 4: Извлечение эмбеддингов
+        import time
+        embedding_start = time.time()
+        image_np = original_image
+        print(f"\n🧠 ЭТАП 4: Извлечение эмбеддингов из {len(final_masks)} масок...")
+        
+        if len(final_masks) == 0:
+            print("   ❌ ПРОБЛЕМА: У нас 0 масок после merge/scale!")
+            return []
+        else:
+            print(f"   ✅ Первая маска: shape={final_masks[0]['segmentation'].shape}, pixels={np.sum(final_masks[0]['segmentation'])}")
+        
         mask_vectors = extract_features_from_masks(
-            image_np, masks, self.searchdet_resnet, self.searchdet_layer, self.searchdet_transform
+            image_np, final_masks, self.searchdet_resnet, self.searchdet_layer, self.searchdet_transform
         )
         mask_vectors = np.array(mask_vectors, dtype=np.float32)
+        embedding_time = time.time() - embedding_start
         
-        # Нормализация для cosine similarity
-        query_vectors = query_vectors / np.linalg.norm(query_vectors, axis=1, keepdims=True)
-        mask_vectors = mask_vectors / np.linalg.norm(mask_vectors, axis=1, keepdims=True)
+        print(f"   ⚡ Эмбеддинги извлечены за {embedding_time:.2f} сек")
         
-        # FAISS поиск
+        # ⏱️ ЭТАП 5: Нормализация векторов
+        norm_start = time.time()
+        print(f"\n🔧 ЭТАП 5: Нормализация векторов...")
+        print(f"   📊 Исходные vectors: shape={mask_vectors.shape}, range=[{mask_vectors.min():.3f}, {mask_vectors.max():.3f}]")
+        
+        # Проверяем на пустые эмбеддинги
+        if mask_vectors.shape[0] == 0:
+            print("   ❌ КРИТИЧЕСКАЯ ОШИБКА: Нет эмбеддингов масок!")
+            return []
+        
+        # Проверяем на NaN/Inf
+        mask_vectors = np.nan_to_num(mask_vectors, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        query_norms = np.linalg.norm(query_vectors, axis=1, keepdims=True)
+        query_norms = np.where(query_norms > 1e-12, query_norms, 1.0)
+        query_vectors = query_vectors / query_norms
+        
+        mask_norms = np.linalg.norm(mask_vectors, axis=1, keepdims=True) 
+        mask_norms = np.where(mask_norms > 1e-12, mask_norms, 1.0)
+        mask_vectors = mask_vectors / mask_norms
+        
+        norm_time = time.time() - norm_start
+        print(f"   🔧 Нормализация завершена за {norm_time:.3f} сек")
+        print(f"   📈 Результат: mask_vectors=[{mask_vectors.min():.3f}, {mask_vectors.max():.3f}], query_vectors=[{query_vectors.min():.3f}, {query_vectors.max():.3f}]")
+        
+        # Проверяем совместимость размерностей
+        if query_vectors.shape[1] != mask_vectors.shape[1]:
+            print(f"   ❌ КРИТИЧЕСКАЯ ОШИБКА: Несовпадение размерностей!")
+            print(f"   📐 Query: {query_vectors.shape[1]}, Mask: {mask_vectors.shape[1]}")
+            return []
+        
+        # ⏱️ ЭТАП 6: FAISS поиск схожести
+        faiss_start = time.time()
+        print(f"\n🔍 ЭТАП 6: FAISS поиск схожести...")
+        print(f"   🔧 Размерности: query_vectors={query_vectors.shape}, mask_vectors={mask_vectors.shape}")
+        
         index = faiss.IndexFlatIP(query_vectors.shape[1])
         index.add(query_vectors)
         
         similarities, indices = index.search(mask_vectors, 1)
         normalized_similarities = (similarities + 1) / 2
+        faiss_time = time.time() - faiss_start
+        
+        print(f"   🔍 FAISS поиск завершен за {faiss_time:.3f} сек")
+        print(f"   📊 Similarities: min={normalized_similarities.min():.3f}, max={normalized_similarities.max():.3f}, mean={normalized_similarities.mean():.3f}")
+        print(f"   🎯 Threshold: {similarity_threshold}")
+        print(f"   📈 Топ-5 similarities: {np.sort(normalized_similarities.flatten())[-5:]}")
+        
+        # ⏱️ ЭТАП 7: Базовая фильтрация
+        filter_start = time.time()
+        print(f"\n🎯 ЭТАП 7: Базовая фильтрация...")
         
         # ИЗМЕНЕНО: Поиск областей с ВЫСОКИМ сходством (присутствующие детали)
         found_indices = np.where(normalized_similarities.flatten() >= similarity_threshold)[0]
         
+        # Сортируем индексы по убыванию similarity для обработки лучших масок первыми
+        if len(found_indices) > 0:
+            similarities_for_found = normalized_similarities.flatten()[found_indices]
+            sorted_order = np.argsort(similarities_for_found)[::-1]  # По убыванию
+            found_indices = found_indices[sorted_order]
+        
+        print(f"   🔍 Найдено {len(found_indices)} потенциальных деталей из {len(final_masks)} масок")
+        
         found_elements = []
         h, w = image_np.shape[:2]
         total_image_area = h * w
-        min_allowed_area = 25  # УМЕНЬШИЛИ для мелких дефектов (царапины, точки, трещины)
-        max_allowed_area_percentage = 1.0  # Уменьшили максимум - дефекты обычно не занимают много места
+        min_allowed_area = 40
+        max_allowed_area_percentage = 0.05
         max_allowed_area = int(total_image_area * max_allowed_area_percentage)
         
-        print(f"   🔍 Найдено {len(found_indices)} потенциальных деталей из {len(masks)} масок")
+        print(f"   📏 Фильтр площади: {min_allowed_area} - {max_allowed_area} пикселей")
+        
+        processed_count = 0
+        max_masks_to_process = len(found_indices)  # Общее количество масок для обработки
         
         for idx in found_indices:
-            mask = masks[idx]
+            processed_count += 1
+            mask = final_masks[idx]
             seg = mask['segmentation']
             
-            # Вычисление bounding box
-            coords = np.column_stack(np.where(seg))
-            if len(coords) > 0:
-                y_min, x_min = coords.min(axis=0)
-                y_max, x_max = coords.max(axis=0)
-                
-                # Вычисляем параметры маски
-                mask_area = int(seg.sum())
-                mask_percentage = (mask_area / total_image_area) * 100
-                
-                # Фильтрация слишком маленьких и больших масок
-                if mask_area < min_allowed_area:
-                    continue
-                if mask_area > max_allowed_area:
-                    print(f"   🚫 Отфильтровали большую маску: {mask_area} пикселей ({mask_percentage:.1f}% изображения)")
-                    continue
-                
-                # Нормализованные координаты
-                bbox_norm = (x_min/w, y_min/h, x_max/w, y_max/h)
-                
-                found_elements.append({
-                    "type": "found_defect",  # ИЗМЕНЕНО: теперь найденный дефект
-                    "bbox": bbox_norm,
-                    "area": mask_area,
-                    "percentage": mask_percentage,
-                    "confidence": float(normalized_similarities[idx][0]),
-                    "description": "Defect found and segmented by SearchDet",
-                    "mask": seg  # Добавляем саму маску для визуализации
-                })
+            # Быстрое вычисление параметров маски
+            mask_area = int(seg.sum())
+            mask_percentage = (mask_area / total_image_area) * 100
+            
+            # 🔍 ОТЛАДКА: информация о каждой маске
+            similarity_score = normalized_similarities[idx][0]
+            print(f"   🎯 Маска {idx}: similarity={similarity_score:.3f}, area={mask_area}px ({mask_percentage:.1f}%) [#{processed_count+1}/{max_masks_to_process}] {'✅ ВЫСОКОЕ КАЧЕСТВО' if similarity_score >= 0.8 else '⚠️ СРЕДНЕЕ КАЧЕСТВО' if similarity_score >= 0.7 else '❌ НИЗКОЕ КАЧЕСТВО'}")
+            
+            # Быстрая фильтрация по размеру маски ДО вычисления bounding box
+            if mask_area < min_allowed_area:
+                print(f"   🚫 Отфильтровали маленькую маску: {mask_area} < {min_allowed_area}")
+                continue
+            if mask_area > max_allowed_area:
+                print(f"   🚫 Отфильтровали большую маску: {mask_area} пикселей ({mask_percentage:.1f}% изображения)")
+                continue
+            
+            # Быстрое вычисление bounding box (эффективно для больших масок)
+            rows = np.any(seg, axis=1)
+            cols = np.any(seg, axis=0)
+            
+            if rows.any() and cols.any():
+                y_indices = np.where(rows)[0]
+                x_indices = np.where(cols)[0]
+                y_min, y_max = y_indices[0], y_indices[-1]
+                x_min, x_max = x_indices[0], x_indices[-1]
+            else:
+                continue  # Пропускаем пустые маски
+            
+            # Нормализованные координаты
+            bbox_norm = (x_min/w, y_min/h, x_max/w, y_max/h)
+            
+            found_elements.append({
+                "type": "found_detail",  # ИЗМЕНЕНО: теперь найденная деталь
+                "bbox": bbox_norm,
+                "area": mask_area,
+                "percentage": mask_percentage,
+                "confidence": float(normalized_similarities[idx][0]),
+                "description": "Detail found and segmented by SearchDet",
+                "mask": seg,  # Добавляем саму маску для визуализации
+                "mask_index": idx,  # Индекс маски для отладки
+                "similarity": float(normalized_similarities[idx][0])  # Для отладки
+            })
         
-        print(f"   ✅ После фильтрации: {len(found_elements)} подходящих дефектов")
+        filter_time = time.time() - filter_start
+        filtered_count = len(found_indices) - len(found_elements)
+        print(f"   ✅ Базовая фильтрация завершена за {filter_time:.3f} сек")
+        print(f"   📊 Обработано: {len(found_indices)}, отфильтровано: {filtered_count}, осталось: {len(found_elements)}")
+        
+        # ⏱️ ЭТАП 8: Фильтр касающихся/обволакивающих масок
+        if len(found_elements) > 1:
+            import time
+            touching_start = time.time()
+            print(f"\n🔗 ЭТАП 8: Фильтр касающихся/обволакивающих масок...")
+            
+            initial_count = len(found_elements)
+            found_elements = self._remove_touching_large_masks(found_elements)
+            touching_time = time.time() - touching_start
+            
+            removed_count = initial_count - len(found_elements)
+            print(f"   ✅ Фильтр обволакивания завершен за {touching_time:.3f} сек")
+            print(f"   📊 Удалено: {removed_count}, осталось: {len(found_elements)}")
+        else:
+            touching_time = 0.0
+            print(f"\n🔗 ЭТАП 8: Пропуск фильтра касания (≤1 маски)")
+        
+        # ⏱️ ИТОГОВАЯ СТАТИСТИКА
+        total_time = time.time() - pipeline_start
+        print(f"\n📊 ИТОГОВАЯ СТАТИСТИКА SearchDet:")
+        print(f"   ⏱️ SAM генерация: {sam_time:.2f} сек ({sam_time/total_time*100:.1f}%)")
+        print(f"   ⏱️ Слияние масок: {merge_time:.2f} сек ({merge_time/total_time*100:.1f}%)")
+        print(f"   ⏱️ Масштабирование: {scale_time:.2f} сек ({scale_time/total_time*100:.1f}%)")
+        print(f"   ⏱️ Эмбеддинги: {embedding_time:.2f} сек ({embedding_time/total_time*100:.1f}%)")
+        print(f"   ⏱️ Нормализация: {norm_time:.3f} сек ({norm_time/total_time*100:.1f}%)")
+        print(f"   ⏱️ FAISS поиск: {faiss_time:.3f} сек ({faiss_time/total_time*100:.1f}%)")
+        print(f"   ⏱️ Базовая фильтрация: {filter_time:.3f} сек ({filter_time/total_time*100:.1f}%)")
+        print(f"   ⏱️ Фильтр касания: {touching_time:.3f} сек ({touching_time/total_time*100:.1f}%)")
+        print(f"   🎯 ОБЩЕЕ ВРЕМЯ: {total_time:.2f} сек")
+        print(f"   🏆 ФИНАЛЬНЫЙ РЕЗУЛЬТАТ: {len(found_elements)} масок")
         
         return found_elements
     
+    def _find_elements_with_prompts(self, image, query_vectors, llava_boxes, similarity_threshold=0.65):
+        """🎯 Поиск деталей с использованием LLaVA bounding boxes как промптов для SAM-HQ"""
+        
+        from segment_anything_hq import SamPredictor
+        import faiss
+        
+        print(f"🎯 ПРОМПТ-РЕЖИМ: Используем {len(llava_boxes)} bounding boxes как промпты для SAM-HQ")
+        
+        # Инициализируем SAM Predictor для промптов
+        predictor = SamPredictor(self.searchdet_sam)
+        predictor.set_image(np.array(image))
+        
+        all_prompted_masks = []
+        
+        # Генерируем маски для каждого bounding box от LLaVA
+        for i, bbox in enumerate(llava_boxes):
+            x1, y1, x2, y2 = bbox['coordinates']
+            
+            # Конвертируем в формат SAM (x, y, w, h)
+            input_box = np.array([x1, y1, x2, y2])
+            
+            try:
+                # Генерируем маски с помощью промптов
+                masks, scores, logits = predictor.predict(
+                    point_coords=None,
+                    point_labels=None,
+                    box=input_box[None, :],  # SAM ожидает batch dimension
+                    multimask_output=True  # Получаем несколько вариантов масок
+                )
+                
+                # Берем лучшую маску (с наивысшим score)
+                best_mask_idx = np.argmax(scores)
+                best_mask = masks[best_mask_idx]
+                best_score = scores[best_mask_idx]
+                
+                # Создаем маску в формате совместимом с автогенератором
+                mask_data = {
+                    'segmentation': best_mask,
+                    'bbox': [x1, y1, x2-x1, y2-y1],  # x, y, w, h
+                    'area': int(best_mask.sum()),
+                    'predicted_iou': float(best_score),
+                    'point_coords': [[int((x1+x2)/2), int((y1+y2)/2)]],  # Центр bbox
+                    'stability_score': float(best_score),
+                    'crop_box': [0, 0, image.width, image.height]
+                }
+                
+                all_prompted_masks.append(mask_data)
+                print(f"   ✅ Промпт {i+1}: bbox=({x1},{y1})-({x2},{y2}), score={best_score:.3f}, area={mask_data['area']}px")
+                
+            except Exception as e:
+                print(f"   ❌ Ошибка промпта {i+1}: {e}")
+                continue
+        
+        print(f"🎯 Сгенерировано {len(all_prompted_masks)} масок с помощью промптов")
+        
+        if not all_prompted_masks:
+            print("⚠️ Нет масок от промптов, используем автоматическую генерацию")
+            return self._find_missing_elements(image, query_vectors, similarity_threshold)
+        
+        # Извлечение признаков для промптированных масок
+        print("🧠 Извлечение эмбеддингов для промптированных масок...")
+        image_np = np.array(image)
+        mask_vectors = extract_features_from_masks(
+            image_np, all_prompted_masks, self.searchdet_resnet, self.searchdet_layer, self.searchdet_transform
+        )
+        mask_vectors = np.array(mask_vectors, dtype=np.float32)
+        
+        # Нормализация векторов
+        query_vectors = query_vectors / np.linalg.norm(query_vectors, axis=1, keepdims=True)
+        mask_vectors = mask_vectors / np.linalg.norm(mask_vectors, axis=1, keepdims=True)
+        
+        # FAISS поиск
+        index = faiss.IndexFlatIP(mask_vectors.shape[1])
+        index.add(query_vectors)
+        similarities, indices = index.search(mask_vectors, 1)
+        normalized_similarities = (similarities + 1) / 2
+        
+        print(f"📊 Промпт-сходства: min={normalized_similarities.min():.3f}, max={normalized_similarities.max():.3f}, mean={normalized_similarities.mean():.3f}")
+        
+        # Фильтрация по threshold
+        found_indices = np.where(normalized_similarities.flatten() >= similarity_threshold)[0]
+        
+        # Сортировка по качеству
+        if len(found_indices) > 0:
+            similarities_for_found = normalized_similarities.flatten()[found_indices]
+            sorted_order = np.argsort(similarities_for_found)[::-1]
+            found_indices = found_indices[sorted_order]
+        
+        found_elements = []
+        h, w = image_np.shape[:2]
+        total_image_area = h * w
+        
+        print(f"🔍 Найдено {len(found_indices)} подходящих промптированных масок")
+        
+        for idx in found_indices:
+            mask_data = all_prompted_masks[idx]
+            seg = mask_data['segmentation']
+            mask_area = int(seg.sum())
+            similarity_score = normalized_similarities[idx][0]
+            
+            print(f"   🎯 Промпт-маска {idx}: similarity={similarity_score:.3f}, area={mask_area}px, SAM_score={mask_data['predicted_iou']:.3f}")
+            
+            # Быстрое вычисление bounding box
+            y_indices = np.any(seg, axis=1)
+            x_indices = np.any(seg, axis=0)
+            
+            if not np.any(y_indices) or not np.any(x_indices):
+                continue
+                
+            y_min, y_max = np.where(y_indices)[0][[0, -1]]
+            x_min, x_max = np.where(x_indices)[0][[0, -1]]
+            
+            found_elements.append({
+                'mask': seg,
+                'bbox': [int(x_min), int(y_min), int(x_max), int(y_max)],
+                'similarity': float(similarity_score),
+                'area': mask_area,
+                'sam_score': float(mask_data['predicted_iou']),
+                'source': 'prompted_sam'
+            })
+        
+        print(f"✅ Промпт-режим: найдено {len(found_elements)} высококачественных деталей")
+        return found_elements
 
     
     def _combine_llava_searchdet_results(self, llava_results, searchdet_results):
@@ -431,6 +882,7 @@ class HybridDefectDetector:
         
         return combined
     
+
     def _create_hybrid_annotations(self, image, masks, material_result, combined_defects, searchdet_results):
         """Создание аннотаций с информацией от обеих систем"""
         
@@ -445,40 +897,60 @@ class HybridDefectDetector:
                 "llava_defects": combined_defects,
                 "searchdet_found": searchdet_results.get("found_elements", []),  # ИЗМЕНЕНО
                 "searchdet_missing": searchdet_results.get("missing_elements", []),
-                "detection_methods": ["llava_coordinates", "searchdet_segmentation", "sam2_segmentation"]  # ИЗМЕНЕНО
+                "detection_methods": ["llava_coordinates", "searchdet_segmentation"]  # Только LLaVA + SearchDet
             },
             "defects": []
         }
         
-        # Аннотации от масок SAM2
+        # Аннотации от масок SearchDet
+        searchdet_found = searchdet_results.get("found_elements", [])
+        print(f"   🔍 Обработка {len(masks)} масок для аннотаций...")
+        
         for i, mask in enumerate(masks):
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if i % 5 == 0:  # Принт каждые 5 масок
+                print(f"      🎭 Обрабатываем маску {i+1}/{len(masks)}...")
+            
+            # Конвертируем boolean маску в uint8 для OpenCV
+            mask_uint8 = (mask * 255).astype(np.uint8)
+            contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if not contours:
                 continue
             
             main_contour = max(contours, key=cv2.contourArea)
             x, y, w, h = cv2.boundingRect(main_contour)
-            area = cv2.countNonZero(mask)
+            area = cv2.countNonZero(mask_uint8)
+            
+            # Оптимизация: упрощаем полигон для больших контуров
+            if len(main_contour) > 1000:  # Если контур очень большой
+                epsilon = 0.002 * cv2.arcLength(main_contour, True)  # 0.2% от периметра
+                main_contour = cv2.approxPolyDP(main_contour, epsilon, True)
+                print(f"      ⚡ Упростили контур маски {i+1}: {len(main_contour)} точек")
+            
             polygon = main_contour.flatten().tolist()
             
-            # Определение источника детекции
-            detection_method = "sam2_segmentation"
-            defect_type = "defect"
-            confidence = 0.85
+            # Ограничиваем размер полигона в JSON
+            if len(polygon) > 2000:  # Максимум 1000 точек (x,y пар)
+                step = len(polygon) // 2000
+                polygon = polygon[::step]
+                print(f"      ⚡ Сэмплировали полигон маски {i+1}: {len(polygon)//2} точек")
             
-            # ИЗМЕНЕНО: Проверка соответствия SearchDet найденным элементам
-            if searchdet_results.get("found_elements"):
-                for found in searchdet_results["found_elements"]:
-                    bbox = found["bbox"]
-                    # Проверка пересечения (упрощенная)
-                    h_img, w_img = image.shape[:2]
-                    search_x1, search_y1, search_x2, search_y2 = [int(c * dim) for c, dim in zip(bbox, [w_img, h_img, w_img, h_img])]
-                    
-                    if (abs(x - search_x1) < 50 and abs(y - search_y1) < 50):
-                        detection_method = "searchdet_found"  # ИЗМЕНЕНО
-                        defect_type = "found_defect"  # ИЗМЕНЕНО
-                        confidence = found["confidence"]
-                        break
+            # Все маски теперь от SearchDet
+            detection_method = "searchdet_found"
+            defect_type = "found_detail"
+            
+            # Получаем confidence от SearchDet
+            confidence = 0.85  # Значение по умолчанию
+            if i < len(searchdet_found):
+                confidence = searchdet_found[i].get("confidence", 0.85)
+            
+            # Получаем severity и completeness из combined_defects (если это словарь)
+            if isinstance(combined_defects, dict):
+                severity = combined_defects.get("severity", "unknown")
+                completeness = combined_defects.get("completeness", "unknown")
+            else:
+                # В режиме только SearchDet используем значения по умолчанию
+                severity = "medium"
+                completeness = "complete"
             
             defect_annotation = {
                 "id": i + 1,
@@ -488,8 +960,8 @@ class HybridDefectDetector:
                 "segmentation": [polygon],
                 "confidence": confidence,
                 "detection_method": detection_method,
-                "severity": combined_defects.get("severity", "unknown"),
-                "completeness": combined_defects.get("completeness", "unknown")
+                "severity": severity,
+                "completeness": completeness
             }
             
             annotations["defects"].append(defect_annotation)
@@ -531,19 +1003,28 @@ class HybridDefectDetector:
         print(f"📁 Сохраняем результаты: {output_path}")
         
         # 1. Основная визуализация с полной информацией
+        print("   🎨 Создание основной визуализации...")
+        vis_start = time.time()
         main_visualization = self._create_hybrid_visualization(image, masks, results)
         cv2.imwrite(str(output_path / f"{image_name}_hybrid_result.jpg"), main_visualization)
-        print("   ✅ Основная визуализация сохранена")
+        vis_time = time.time() - vis_start
+        print(f"   ✅ Основная визуализация сохранена за {vis_time:.2f} сек")
         
         # 2. Оригинальное изображение с масками (без панелей)
+        print("   🖼️ Создание чистого наложения...")
+        clean_start = time.time()
         clean_overlay = self._create_clean_overlay(image, masks, results)
         cv2.imwrite(str(output_path / f"{image_name}_clean_overlay.jpg"), clean_overlay)
-        print("   ✅ Чистое наложение сохранено")
+        clean_time = time.time() - clean_start
+        print(f"   ✅ Чистое наложение сохранено за {clean_time:.2f} сек")
         
         # 3. Только контуры (без заливки)
+        print("   📐 Создание контуров...")
+        contour_start = time.time()
         contours_only = self._create_contours_visualization(image, masks, results)
         cv2.imwrite(str(output_path / f"{image_name}_contours_only.jpg"), contours_only)
-        print("   ✅ Визуализация контуров сохранена")
+        contour_time = time.time() - contour_start
+        print(f"   ✅ Визуализация контуров сохранена за {contour_time:.2f} сек")
         
         # 4. Отдельные маски (только SearchDet маски в папке masks)
         masks_folder = output_path / "masks"
@@ -553,12 +1034,21 @@ class HybridDefectDetector:
         for i, mask in enumerate(masks):
             if i < len(results["annotations"]["defects"]):
                 defect_info = results["annotations"]["defects"][i]
-                detection_method = defect_info.get("detection_method", "sam2_segmentation")
+                detection_method = defect_info.get("detection_method", "searchdet_found")
                 category = defect_info.get("category", "defect")
                 
                 # ИЗМЕНЕНО: Сохраняем ТОЛЬКО SearchDet найденные детали
                 if detection_method == "searchdet_found" or category == "found_detail":
                     searchdet_mask_count += 1
+                    
+                    # Проверяем размер маски и корректируем без изменения оригинала
+                    h_img, w_img = image.shape[:2]
+                    if mask.shape != (h_img, w_img):
+                        mask_h, mask_w = mask.shape
+                        min_h, min_w = min(h_img, mask_h), min(w_img, mask_w)
+                        temp_mask = np.zeros((h_img, w_img), dtype=bool)
+                        temp_mask[:min_h, :min_w] = mask[:min_h, :min_w] > 0
+                        mask = temp_mask
                     
                     # Бинарная маска
                     binary_mask = (mask > 0).astype(np.uint8) * 255
@@ -589,7 +1079,14 @@ class HybridDefectDetector:
             cv2.imwrite(str(output_path / f"{image_name}_composite_mask.png"), composite_mask)
             print("   ✅ Композитная маска сохранена")
         
-        # 6. Side-by-side сравнение
+        # 6. Черно-белая маска: белое = найденные области, черное = остальное
+        total_mask = self._create_total_binary_mask(masks, image.shape[:2], results)
+        if total_mask is not None:
+            total_mask_path = output_path / f"total_mask_{image_name}.png"
+            cv2.imwrite(str(total_mask_path), total_mask)
+            print(f"   ✅ Черно-белая маска сохранена: {total_mask_path.name}")
+        
+        # 7. Side-by-side сравнение
         comparison = self._create_before_after_comparison(image, main_visualization)
         cv2.imwrite(str(output_path / f"{image_name}_comparison.jpg"), comparison)
         print("   ✅ Сравнение до/после сохранено")
@@ -603,7 +1100,7 @@ class HybridDefectDetector:
         for i, mask in enumerate(masks):
             if i < len(results["annotations"]["defects"]):
                 defect_info = results["annotations"]["defects"][i]
-                detection_method = defect_info.get("detection_method", "sam2_segmentation")
+                detection_method = defect_info.get("detection_method", "searchdet_found")
                 category = defect_info.get("category", "defect")
                 
                 # ИЗМЕНЕНО: ПОКАЗЫВАЕМ ТОЛЬКО SearchDet найденные детали (красные)
@@ -616,6 +1113,15 @@ class HybridDefectDetector:
                 # Пропускаем неизвестные маски
                 continue
             
+            # Проверяем размер маски и корректируем без изменения оригинала
+            h_img, w_img = overlay.shape[:2]
+            if mask.shape != (h_img, w_img):
+                mask_h, mask_w = mask.shape
+                min_h, min_w = min(h_img, mask_h), min(w_img, mask_w)
+                temp_mask = np.zeros((h_img, w_img), dtype=bool)
+                temp_mask[:min_h, :min_w] = mask[:min_h, :min_w] > 0
+                mask = temp_mask
+            
             # Полупрозрачная красная маска
             colored_mask = np.zeros_like(overlay)
             colored_mask[mask > 0] = color
@@ -624,7 +1130,8 @@ class HybridDefectDetector:
             cv2.addWeighted(overlay, 1-alpha, colored_mask, alpha, 0, overlay)
             
             # Красный контур
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            mask_uint8 = (mask * 255).astype(np.uint8)
+            contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if contours:
                 thickness = 2
                 cv2.drawContours(overlay, contours, -1, color, thickness)
@@ -644,18 +1151,17 @@ class HybridDefectDetector:
         contour_image = image.copy()
         red_color = (0, 0, 255)  # Красный для SearchDet
         
-        searchdet_mask_count = 0  # Счетчик для нумерации только SearchDet масок
+        # Счетчик убран - номера больше не отображаются
         
         for i, mask in enumerate(masks):
             if i < len(results["annotations"]["defects"]):
                 defect_info = results["annotations"]["defects"][i]
-                detection_method = defect_info.get("detection_method", "sam2_segmentation")
+                detection_method = defect_info.get("detection_method", "searchdet_found")
                 category = defect_info.get("category", "defect")
                 
                 # ИЗМЕНЕНО: ПОКАЗЫВАЕМ ТОЛЬКО SearchDet найденные детали (красные)
                 if detection_method == "searchdet_found" or category == "found_detail":
                     color = red_color
-                    searchdet_mask_count += 1
                 else:
                     # Пропускаем все остальные маски
                     continue
@@ -663,22 +1169,22 @@ class HybridDefectDetector:
                 # Пропускаем неизвестные маски
                 continue
             
-            # Только красные контуры
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # Проверяем размер маски и корректируем без изменения оригинала
+            h_img, w_img = contour_image.shape[:2]
+            if mask.shape != (h_img, w_img):
+                mask_h, mask_w = mask.shape
+                min_h, min_w = min(h_img, mask_h), min(w_img, mask_w)
+                temp_mask = np.zeros((h_img, w_img), dtype=bool)
+                temp_mask[:min_h, :min_w] = mask[:min_h, :min_w] > 0
+                mask = temp_mask
+            
+            # Только красные контуры БЕЗ номеров
+            mask_uint8 = (mask * 255).astype(np.uint8)
+            contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if contours:
                 thickness = 3  # Толстые контуры для SearchDet
                 cv2.drawContours(contour_image, contours, -1, color, thickness)
-                
-                # Номер SearchDet маски в красном кружке
-                main_contour = max(contours, key=cv2.contourArea)
-                M = cv2.moments(main_contour)
-                if M["m00"] != 0:
-                    cx = int(M["m10"] / M["m00"])
-                    cy = int(M["m01"] / M["m00"])
-                    
-                    cv2.circle(contour_image, (cx, cy), 20, color, -1)
-                    cv2.putText(contour_image, str(searchdet_mask_count), (cx-8, cy+8), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                # УБРАНО: Номера масок больше не рисуются
          
         # Накладываем 10px рамку от оригинального изображения поверх визуализации
         border_width = 10
@@ -691,6 +1197,56 @@ class HybridDefectDetector:
 
         return contour_image
     
+    def _create_total_binary_mask(self, masks, image_shape, results):
+        """Создание черно-белой маски: белое = найденные SearchDet области, черное = остальное"""
+        
+        h, w = image_shape
+        total_mask = np.zeros((h, w), dtype=np.uint8)  # Начинаем с черного
+        
+        found_searchdet_masks = 0
+        total_masks_processed = 0
+        
+        print(f"   🔍 Анализируем {len(masks)} масок для создания total_mask...")
+        
+        for i, mask in enumerate(masks):
+            if i < len(results["annotations"]["defects"]):
+                defect_info = results["annotations"]["defects"][i]
+                detection_method = defect_info.get("detection_method", "searchdet_found")
+                category = defect_info.get("category", "defect")
+                
+                print(f"   🎯 Маска {i+1}: method={detection_method}, category={category}")
+                total_masks_processed += 1
+                
+                # Добавляем ТОЛЬКО SearchDet найденные области (делаем их белыми)
+                if (detection_method == "searchdet_found" or 
+                    category == "found_detail"):
+                    
+                    print(f"   🔴 Маска {i+1}: Добавляем в total_mask (белый цвет)")
+                    
+                    # Приводим маску к нужному размеру если необходимо
+                    if mask.shape[:2] != (h, w):
+                        mask_resized = cv2.resize(mask, (w, h))
+                    else:
+                        mask_resized = mask
+                    
+                    # Проверяем размер маски
+                    mask_area = np.sum(mask_resized > 0)
+                    mask_percentage = (mask_area / (h * w)) * 100
+                    print(f"      📐 Размер маски: {mask_area} пикселей ({mask_percentage:.1f}% изображения)")
+                    
+                    # Делаем найденные области белыми (255)
+                    total_mask[mask_resized > 0] = 255
+                    found_searchdet_masks += 1
+                else:
+                    print(f"   ⚫ Маска {i+1}: Пропускаем (не SearchDet)")
+        
+        if found_searchdet_masks > 0:
+            print(f"   🎨 Создана черно-белая маска с {found_searchdet_masks} белыми областями")
+            return total_mask
+        else:
+            print("   ⚠️ Нет SearchDet масок для создания черно-белой маски")
+            return None
+    
     def _create_composite_mask(self, masks, image_shape):
         """Создание композитной маски со всеми дефектами"""
         
@@ -698,6 +1254,17 @@ class HybridDefectDetector:
         composite = np.zeros((h, w), dtype=np.uint8)
         
         for i, mask in enumerate(masks):
+            # Проверяем размер маски и корректируем если нужно
+            if mask.shape != (h, w):
+                # Создаем маску правильного размера и копируем данные
+                mask_h, mask_w = mask.shape
+                min_h, min_w = min(h, mask_h), min(w, mask_w)
+                
+                # Создаем временную маску правильного размера
+                temp_mask = np.zeros((h, w), dtype=bool)
+                temp_mask[:min_h, :min_w] = mask[:min_h, :min_w] > 0
+                mask = temp_mask
+            
             # Каждая маска получает уникальное значение (1, 2, 3, ...)
             composite[mask > 0] = i + 1
         
@@ -743,12 +1310,13 @@ class HybridDefectDetector:
         vis_image = image.copy()
         overlay = image.copy()
         
-        # Улучшенные цвета для разных типов детекции (в BGR формате)
+        # Цвета для разных типов детекции (в BGR формате)
         colors = {
-            "sam2_segmentation": (0, 255, 128),        # Ярко-зеленый  
+            "searchdet_found": (0, 0, 255),           # Красный для найденных деталей
             "searchdet_missing": (0, 64, 255),        # Красно-оранжевый
             "llava_coordinates": (255, 128, 0),       # Голубой
             "missing_element": (0, 0, 255),           # Красный
+            "found_detail": (0, 0, 255),              # Красный
             "defect": (0, 255, 0),                    # Зеленый
             "wire_missing": (0, 100, 255),            # Оранжевый
             "scratch": (0, 255, 255),                 # Желтый
@@ -762,14 +1330,14 @@ class HybridDefectDetector:
         for i, mask in enumerate(masks):
             if i < len(results["annotations"]["defects"]):
                 defect_info = results["annotations"]["defects"][i]
-                detection_method = defect_info.get("detection_method", "sam2_segmentation")
+                detection_method = defect_info.get("detection_method", "searchdet_found")
                 category = defect_info.get("category", "defect")
                 severity = defect_info.get("severity", "unknown")
                 
-                # ИЗМЕНЕНО: ПОКАЗЫВАЕМ ТОЛЬКО SearchDet найденные дефекты (красные)
+                # ИЗМЕНЕНО: ПОКАЗЫВАЕМ ТОЛЬКО SearchDet найденные детали (красные)
                 if detection_method == "searchdet_found" or category == "found_detail":
-                    color = (0, 0, 255)  # КРАСНЫЙ для SearchDet найденных дефектов
-                    category = "found_defect"
+                    color = (0, 0, 255)  # КРАСНЫЙ для SearchDet найденных деталей
+                    category = "found_detail"
                 else:
                     # Пропускаем все остальные маски (не от SearchDet)
                     continue
@@ -777,6 +1345,16 @@ class HybridDefectDetector:
             else:
                 # Пропускаем неизвестные маски
                 continue
+            
+            # Проверяем размер маски и корректируем без изменения оригинала
+            h_img, w_img = vis_image.shape[:2]
+            if mask.shape != (h_img, w_img):
+                # Создаем маску правильного размера и копируем данные
+                mask_h, mask_w = mask.shape
+                min_h, min_w = min(h_img, mask_h), min(w_img, mask_w)
+                temp_mask = np.zeros((h_img, w_img), dtype=bool)
+                temp_mask[:min_h, :min_w] = mask[:min_h, :min_w] > 0
+                mask = temp_mask
             
             # Создание цветной маски с градиентом к краям
             colored_mask = np.zeros_like(vis_image)
@@ -789,7 +1367,8 @@ class HybridDefectDetector:
             cv2.addWeighted(overlay, 1-alpha, colored_mask, alpha, 0, overlay)
             
             # Контур с переменной толщиной в зависимости от серьезности
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            mask_uint8 = (mask * 255).astype(np.uint8)
+            contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if contours:
                 thickness = 3 if severity in ["critical", "severe"] else 2
                 cv2.drawContours(overlay, contours, -1, color, thickness)
@@ -801,11 +1380,11 @@ class HybridDefectDetector:
                     cx = int(M["m10"] / M["m00"])
                     cy = int(M["m01"] / M["m00"])
                     
-                    # ИЗМЕНЕНО: Иконка для SearchDet найденных дефектов
-                    icon = "⚠️"
+                    # Иконка для SearchDet отсутствующих элементов
+                    icon = "❌"
                     
                     # Текст с тенью для лучшей читаемости  
-                    text = f"{icon} DEFECT {i+1}"
+                    text = f"{icon} MISSING {i+1}"
                     font = cv2.FONT_HERSHEY_SIMPLEX
                     font_scale = 0.6
                     thickness = 2
@@ -848,22 +1427,22 @@ class HybridDefectDetector:
         # Основная информация
         font = cv2.FONT_HERSHEY_SIMPLEX
         
-        # ИЗМЕНЕНО: Заголовок для найденных дефектов
-        title = "🔍 SEARCHDET FOUND DEFECTS (RED MASKS ONLY)"
+        # Заголовок
+        title = "🔍 SEARCHDET MISSING ELEMENTS (RED MASKS ONLY)"
         cv2.putText(panel, title, (10, 25), font, 0.7, (255, 255, 255), 2)
         
         # Материал
         material_text = f"📦 Material: {llava_result['material'].upper()} (conf: {llava_result['confidence']:.2f})"
         cv2.putText(panel, material_text, (10, 50), font, 0.5, (100, 255, 100), 1)
         
-        # ИЗМЕНЕНО: Показываем только SearchDet найденные дефекты
-        found_count = len(searchdet_result.get('found_elements', []))
-        red_masks_text = f"🔴 RED MASKS (SearchDet): {found_count} defects found and segmented"
+        # Показываем только SearchDet результаты
+        missing_count = len(searchdet_result.get('missing_elements', []))
+        red_masks_text = f"🔴 RED MASKS (SearchDet): {missing_count} missing elements found"
         cv2.putText(panel, red_masks_text, (10, 70), font, 0.5, (0, 100, 255), 1)
         
-        # ИЗМЕНЕНО: Статус сегментации дефектов
-        status_text = "⚠️ DEFECTS DETECTED" if found_count > 0 else "✅ NO DEFECTS FOUND"
-        status_color = (0, 100, 255) if found_count > 0 else (0, 255, 0)  # Красный для дефектов, зеленый для их отсутствия
+        # Статус завершенности
+        status_text = "❌ INCOMPLETE ASSEMBLY" if missing_count > 0 else "✅ COMPLETE ASSEMBLY"
+        status_color = (0, 100, 255) if missing_count > 0 else (0, 255, 0)
         cv2.putText(panel, status_text, (w-300, 50), font, 0.5, status_color, 1)
         
         # Объединяем панель с изображением
@@ -875,11 +1454,11 @@ class HybridDefectDetector:
         
         h, w = image.shape[:2]
         
-        # ИЗМЕНЕНО: Проверяем есть ли найденные детали SearchDet
+        # Проверяем есть ли отсутствующие элементы SearchDet
         searchdet_result = results["stages"]["searchdet_analysis"]["result"]
-        found_count = len(searchdet_result.get('found_elements', []))
+        missing_count = len(searchdet_result.get('missing_elements', []))
         
-        if found_count > 0:
+        if missing_count > 0:
             # Простая легенда только для SearchDet
             legend_width = 250
             legend_height = 60
@@ -900,9 +1479,56 @@ class HybridDefectDetector:
             cv2.rectangle(image, (legend_x + 10, legend_y + 35), (legend_x + 25, legend_y + 50), (0, 0, 255), -1)
             cv2.rectangle(image, (legend_x + 10, legend_y + 35), (legend_x + 25, legend_y + 50), (255, 255, 255), 1)
             
-            # ИЗМЕНЕНО: Текст для найденных дефектов
-            cv2.putText(image, "Found Defects (SearchDet)", (legend_x + 35, legend_y + 47), 
+            # Текст
+            cv2.putText(image, "Missing Elements (SearchDet)", (legend_x + 35, legend_y + 47), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+
+    def _remove_touching_large_masks(self, found_elements):
+        """БЫСТРАЯ версия: удаляет большие маски, которые обволакивают меньших"""
+        if len(found_elements) <= 1:
+            return found_elements
+        
+        import cv2
+        
+        elements_to_remove = set()
+        
+        # 🚀 ОПТИМИЗАЦИЯ: Предварительно сортируем по убыванию площади для быстрого поиска
+        sorted_elements = sorted(enumerate(found_elements), key=lambda x: np.sum(x[1]['mask']), reverse=True)
+        
+        for idx_i, (i, element1) in enumerate(sorted_elements):
+            if i in elements_to_remove:
+                continue
+                
+            seg1 = element1['mask'].astype(np.uint8)
+            area1 = np.sum(seg1)
+            
+            # 🚀 ОПТИМИЗАЦИЯ: Проверяем только меньшие маски (индексы после текущего)
+            for idx_j in range(idx_i + 1, len(sorted_elements)):
+                j, element2 = sorted_elements[idx_j]
+                
+                if j in elements_to_remove:
+                    continue
+                
+                seg2 = element2['mask'].astype(np.uint8)
+                area2 = np.sum(seg2)
+                
+                # 🚀 БЫСТРАЯ ПРОВЕРКА: Только обволакивание (убираем медленную проверку касания)
+                intersection = np.logical_and(seg1, seg2)
+                intersection_area = np.sum(intersection)
+                containment_ratio = intersection_area / area2 if area2 > 0 else 0
+                
+                if containment_ratio >= 0.65:  # ПОНИЖЕН порог для более быстрой фильтрации
+                    elements_to_remove.add(i)
+                    print(f"   🎁 Удаляем обволакивающую маску {i} (содержит {containment_ratio:.1%} маски {j}, area1={area1}, area2={area2})")
+                    break  # Выходим сразу после первого найденного
+        
+        # Возвращаем элементы без удалённых
+        filtered_elements = [elem for i, elem in enumerate(found_elements) if i not in elements_to_remove]
+        
+        if len(elements_to_remove) > 0:
+            print(f"   🎯 Удалено {len(elements_to_remove)} обволакивающих масок (БЫСТРЫЙ режим)")
+        
+        return filtered_elements
 
 
 def main():
@@ -916,6 +1542,18 @@ def main():
                        help="Тип модели LLaVA")
     parser.add_argument("--ground-truth", default=None, 
                        help="Путь к ground truth маске (черно-белое изображение) для сравнения")
+    parser.add_argument("--use-prompts", action='store_true', default=True,
+                       help="Использовать LLaVA bounding boxes как промпты для SAM-HQ (по умолчанию включено)")
+    parser.add_argument("--no-prompts", action='store_true', 
+                       help="Отключить промпты и использовать автоматическую генерацию масок")
+    parser.add_argument("--max-masks", type=int, default=25,
+                       help="Максимальное количество масок для обработки (по умолчанию 25)")
+    parser.add_argument("--min-confidence", type=float, default=0.5,
+                       help="Минимальный confidence для маски (по умолчанию 0.5)")
+    parser.add_argument("--min-area", type=int, default=500,
+                       help="Минимальная площадь маски в пикселях (по умолчанию 500)")
+    parser.add_argument("--searchdet-only", action='store_true',
+                       help="Запустить только SearchDet без LLaVA (быстрее, меньше памяти)")
     
     args = parser.parse_args()
     
@@ -936,32 +1574,66 @@ def main():
         print(f"❌ Ground truth маска не найдена: {args.ground_truth}")
         return
     
-    # Создание детектора
-    detector = HybridDefectDetector(model_type=args.model)
-    
-    # Запуск анализа
-    results = detector.analyze_with_examples(
-        args.image, args.positive, args.negative, args.output, args.ground_truth
-    )
+    # Проверяем режим работы
+    if args.searchdet_only:
+        print("🚀 Режим: ТОЛЬКО SearchDet (без LLaVA)")
+        print("💡 Это быстрее и требует меньше памяти!")
+        
+        # Создание детектора в режиме только SearchDet
+        detector = HybridDefectDetector(model_type=args.model, searchdet_only=True)
+        
+        # Запуск анализа только SearchDet (отключаем промпты)
+        results = detector.analyze_with_examples(
+            args.image, args.positive, args.negative, args.output, args.ground_truth, use_prompts=False
+        )
+    else:
+        print("🚀 Режим: Гибридный анализ (LLaVA + SearchDet)")
+        
+        # Создание детектора
+        detector = HybridDefectDetector(model_type=args.model)
+        
+        # Определяем режим промптов
+        use_prompts = args.use_prompts and not args.no_prompts
+        print(f"🎯 Режим промптов: {'ВКЛЮЧЕН' if use_prompts else 'ОТКЛЮЧЕН'}")
+        
+        # Запуск анализа
+        results = detector.analyze_with_examples(
+            args.image, args.positive, args.negative, args.output, args.ground_truth, use_prompts=use_prompts
+        )
     
     if results:
         print(f"\n📊 ИТОГОВАЯ СТАТИСТИКА:")
-        print(f"   🧪 Материал: {results['stages']['llava_analysis']['material']['material']}")
-        print(f"   🔍 LLaVA дефекты: {results['stages']['llava_analysis']['defects'].get('defects_found', False)}")
-        print(f"   🎯 SearchDet найденные дефекты: {len(results['stages']['searchdet_analysis']['result'].get('found_elements', []))}")
         
-        # ИЗМЕНЕНО: Подсчитаем только SearchDet найденные дефекты в визуализации
+        # Материал (показываем только если не SearchDet only)
+        material_info = results['stages']['llava_analysis']['material']['material']
+        if not args.searchdet_only:
+            print(f"   🧪 Материал: {material_info}")
+            print(f"   🔍 LLaVA дефекты: {results['stages']['llava_analysis']['defects'].get('defects_found', False)}")
+        else:
+            print(f"   🧪 Материал: не анализировался (режим только SearchDet)")
+        
+        # SearchDet результаты
+        searchdet_elements = results['stages']['searchdet_analysis']['result'].get('missing_elements', [])
+        print(f"   🎯 SearchDet найдено: {len(searchdet_elements)}")
+        
+        # Подсчитаем только SearchDet маски в визуализации
         searchdet_masks_shown = 0
         for defect in results['annotations']['defects']:
-            if (defect.get('detection_method') == 'searchdet_found' or 
+            if (defect.get('detection_method') == 'searchdet_missing' or 
+                defect.get('category') == 'missing_element' or
+                defect.get('detection_method') == 'searchdet_found' or 
                 defect.get('category') == 'found_detail'):
                 searchdet_masks_shown += 1
         
-        print(f"   🔴 КРАСНЫХ масок показано: {searchdet_masks_shown} (только SearchDet найденные дефекты)")
+        print(f"   🔴 КРАСНЫХ масок показано: {searchdet_masks_shown} (SearchDet)")
         print(f"   📝 Всего аннотаций: {len(results['annotations']['defects'])}")
         total_time = sum(stage['duration'] for stage in results['stages'].values())
         print(f"   ⏱️ Общее время: {total_time:.2f} сек")
-        print(f"\n🔴 В визуализации показываются ТОЛЬКО КРАСНЫЕ маски найденных дефектов от SearchDet!")
+        
+        if args.searchdet_only:
+            print(f"\n🔴 Режим ТОЛЬКО SearchDet - показываются маски найденных элементов!")
+        else:
+            print(f"\n🔴 В визуализации показываются ТОЛЬКО КРАСНЫЕ маски от SearchDet!")
         
         # Показываем результаты сравнения с ground truth
         if 'ground_truth_comparison' in results:
