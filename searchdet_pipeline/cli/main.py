@@ -296,7 +296,8 @@ def _execute_detect(args) -> int:
         result = detector.find_present_elements(
             args.image,
             args.positive,
-            args.negative
+            args.negative,
+            args.output if hasattr(args, 'output') and args.output else "output"
         )
         
         # Выводим результат
@@ -428,7 +429,8 @@ def _execute_quick(args) -> int:
         result = detector.find_present_elements(
             args.image,
             str(positive_path) if positive_path else None,
-            str(negative_path) if negative_path else None
+            str(negative_path) if negative_path else None,
+            args.output if hasattr(args, 'output') and args.output else "output"
         )
         
         # Выводим результат
@@ -585,7 +587,7 @@ def _print_result(result: dict, args):
         else:
             print(f"\n❌ Ошибка детекции: {result.get('error', 'Неизвестная ошибка')}")
     else:
-        # Старый формат (из hybrid_searchdet_pipeline.py)
+        # Старый формат (из detector.py)
         if 'found_elements' in result:
             found_elements = result['found_elements']
             print(f"\n✅ Детекция завершена успешно!")
@@ -596,8 +598,31 @@ def _print_result(result: dict, args):
                 if any(c > 0 for c in confidences):
                     print(f"📊 Средняя уверенность: {sum(confidences)/len(confidences):.3f}")
             
-            if hasattr(args, 'output') and args.output:
-                print(f"💾 Результаты будут сохранены в: {args.output}")
+            # Выводим информацию о папке сохранения
+            output_dir = result.get('output_directory', 'output')
+            print(f"💾 Результаты сохранены в: {output_dir}")
+            
+            # Показываем сохранённые файлы
+            if 'saved_files' in result and result['saved_files']:
+                saved_files = result['saved_files']
+                print(f"📁 Сохранено файлов: {len(saved_files)}")
+                if hasattr(args, 'verbose') and args.verbose:
+                    print("   📋 Список файлов:")
+                    for file_type, file_path in saved_files.items():
+                        print(f"     • {file_type}: {Path(file_path).name}")
+            
+            # Если есть детальная статистика времени, выводим краткую сводку
+            if 'timing_info' in result and (hasattr(args, 'verbose') and args.verbose):
+                timing_info = result['timing_info']
+                print(f"\n⏱️ КРАТКАЯ СТАТИСТИКА ВРЕМЕНИ:")
+                if 'mask_generation' in timing_info:
+                    print(f"   🎯 Генерация масок: {timing_info['mask_generation']:.3f}с")
+                if 'embedding_extraction' in timing_info:
+                    print(f"   🧠 Извлечение эмбеддингов: {timing_info['embedding_extraction']:.3f}с")
+                if 'scoring_and_decisions' in timing_info:
+                    print(f"   📊 Скоринг: {timing_info['scoring_and_decisions']:.3f}с")
+                if 'result_saving' in timing_info:
+                    print(f"   💾 Сохранение: {timing_info['result_saving']:.3f}с")
         else:
             print(f"\n❌ Неожиданный формат результата: {result}")
 

@@ -219,15 +219,29 @@ def load_image(image_path: str) -> np.ndarray:
 
 def save_json(data: Any, filepath: str) -> None:
     """
-    Сохраняет данные в JSON файл.
+    Сохраняет данные в JSON файл с поддержкой numpy типов.
     
     Args:
         data: Данные для сохранения
         filepath: Путь к файлу
     """
     import json
+    
+    class NumpyEncoder(json.JSONEncoder):
+        """Кастомный JSON encoder для numpy типов."""
+        def default(self, obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, np.bool_):
+                return bool(obj)
+            return super().default(obj)
+    
     with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2, cls=NumpyEncoder)
 
 
 def create_output_dir(base_path: str, image_name: str) -> Path:

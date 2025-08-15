@@ -100,15 +100,22 @@ class EmbeddingExtractor:
                 segmentation = mask['segmentation'].astype(bool)
                 mask_list.append(segmentation)
             
+            # Получаем модели из searchdet_models
+            if self.searchdet_models is None:
+                print("     ❌ SearchDet модели не инициализированы")
+                return np.array([])
+            
+            # Предполагаем, что searchdet_models это кортеж (model, layer, transform, sam)
+            if isinstance(self.searchdet_models, tuple) and len(self.searchdet_models) >= 3:
+                model, layer, transform = self.searchdet_models[0], self.searchdet_models[1], self.searchdet_models[2]
+            else:
+                print("     ❌ Неправильный формат searchdet_models")
+                return np.array([])
+            
             # Используем функцию extract_features_from_masks из SearchDet
-            # Эта функция:
-            # 1. Пропускает изображение через ResNet
-            # 2. Извлекает feature map с указанного слоя 
-            # 3. Применяет Masked Pooling для каждой маски
-            # 4. Выполняет Global Average Pooling
-            # 5. Применяет L2 normalization
+            # Правильная сигнатура: extract_features_from_masks(image, masks, model, layer, transform)
             mask_embeddings = extract_features_from_masks(
-                image, mask_list, self.searchdet_models
+                image, mask_list, model, layer, transform
             )
             
             print(f"     ✅ Эмбеддинги масок извлечены: {mask_embeddings.shape}")
@@ -167,19 +174,30 @@ class EmbeddingExtractor:
         if not examples:
             return np.array([])
         
+        # Получаем модели из searchdet_models
+        if self.searchdet_models is None:
+            print(f"     ❌ SearchDet модели не инициализированы для {example_type} примеров")
+            return np.array([])
+        
+        # Предполагаем, что searchdet_models это кортеж (model, layer, transform, sam)
+        if isinstance(self.searchdet_models, tuple) and len(self.searchdet_models) >= 3:
+            model, layer, transform = self.searchdet_models[0], self.searchdet_models[1], self.searchdet_models[2]
+        else:
+            print(f"     ❌ Неправильный формат searchdet_models для {example_type} примеров")
+            return np.array([])
+        
         embeddings = []
         
         for i, example in enumerate(examples):
             try:
-                # Конвертируем PIL Image в numpy для SearchDet
-                example_np = np.array(example)
-                
                 # Используем get_vector из SearchDet для извлечения эмбеддинга
-                # Эта функция:
-                # 1. Пропускает изображение через ResNet
-                # 2. Применяет Global Average Pooling по всей feature map
-                # 3. Применяет L2 normalization
-                embedding = get_vector(example_np, self.searchdet_models)
+                # Правильная сигнатура: get_vector(image, model, layer, transform)
+                embedding = get_vector(example, model, layer, transform)
+                
+                # Конвертируем в numpy если это тензор
+                if hasattr(embedding, 'numpy'):
+                    embedding = embedding.numpy()
+                
                 embeddings.append(embedding)
                 
             except Exception as e:
@@ -212,12 +230,9 @@ class EmbeddingExtractor:
             
             for pos_emb in positive_embeddings:
                 # Используем adjust_embedding из SearchDet
-                # Эта функция:
-                # 1. Вычисляет центроид negative примеров
-                # 2. "Сдвигает" positive вектор от negative центроида
-                # 3. Применяет L2 normalization к результату
+                # Сигнатура: adjust_embedding(query_embedding, positive_embeddings, negative_embeddings, positive_weight=3.0, negative_weight=1.5)
                 adjusted_emb = adjust_embedding(
-                    pos_emb, negative_embeddings, self.searchdet_models
+                    pos_emb, positive_embeddings, negative_embeddings
                 )
                 adjusted_embeddings.append(adjusted_emb)
             

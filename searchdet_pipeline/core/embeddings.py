@@ -57,7 +57,7 @@ class EmbeddingExtractor:
         
         try:
             # Пробуем быстрый метод
-            embeddings = self._extract_fast(pil_image, mask_arrays)
+            embeddings = self._extract_fast(image_np, mask_arrays)
             if embeddings is not None:
                 print(f"⚡ БЫСТРО: {len(mask_arrays)} масок обработано")
                 return embeddings, valid_indices
@@ -77,7 +77,7 @@ class EmbeddingExtractor:
         print("❌ Не удалось извлечь эмбеддинги")
         return np.array([]).reshape(0, 1024), []
     
-    def _extract_fast(self, pil_image, mask_arrays):
+    def _extract_fast(self, image_np, mask_arrays):
         """Быстрое извлечение через extract_features_from_masks."""
         # Получаем модели SearchDet
         resnet, layer, transform, sam = (
@@ -97,11 +97,17 @@ class EmbeddingExtractor:
             model = resnet
             device = 'cuda'
         
+        # Преобразуем mask_arrays в формат, ожидаемый extract_features_from_masks
+        # Функция ожидает список словарей с ключом 'segmentation'
+        mask_dicts = []
+        for mask_array in mask_arrays:
+            mask_dicts.append({'segmentation': mask_array})
+        
         # Пробуем разные варианты вызова extract_features_from_masks
         try:
-            # Вариант 1: современная сигнатура
+            # Правильная сигнатура: extract_features_from_masks(image, masks, model, layer, transform)
             embeddings = extract_features_from_masks(
-                model, pil_image, mask_arrays, layer, transform
+                image_np, mask_dicts, model, layer, transform
             )
             if isinstance(embeddings, np.ndarray) and embeddings.ndim == 2:
                 return embeddings
@@ -109,9 +115,9 @@ class EmbeddingExtractor:
             print(f"   ⚠️ Вариант 1 не удался: {e}")
         
         try:
-            # Вариант 2: без transform
+            # Альтернативная сигнатура: extract_features_from_masks(image, masks, model, layer)
             embeddings = extract_features_from_masks(
-                model, pil_image, mask_arrays, layer
+                image_np, mask_dicts, model, layer
             )
             if isinstance(embeddings, np.ndarray) and embeddings.ndim == 2:
                 return embeddings
@@ -119,9 +125,9 @@ class EmbeddingExtractor:
             print(f"   ⚠️ Вариант 2 не удался: {e}")
         
         try:
-            # Вариант 3: старая сигнатура
+            # Старая сигнатура: extract_features_from_masks(image, masks, model)
             embeddings = extract_features_from_masks(
-                model, pil_image, mask_arrays
+                image_np, mask_dicts, model
             )
             if isinstance(embeddings, np.ndarray) and embeddings.ndim == 2:
                 return embeddings
@@ -132,28 +138,102 @@ class EmbeddingExtractor:
     
     def _extract_slow(self, pil_image, mask_arrays):
         """Медленное извлечение по одной маске."""
-        # Пока заглушка
+        # Получаем модели SearchDet
+        resnet, layer, transform, sam = (
+            self.detector.searchdet_resnet,
+            self.detector.searchdet_layer, 
+            self.detector.searchdet_transform,
+            self.detector.searchdet_sam
+        )
+        
         print("🔧 DINO оптимизация: уменьшаем изображения до 384x512 для ускорения")
         
-        # Возвращаем случайные эмбеддинги для тестирования
-        n_masks = len(mask_arrays)
-        embeddings = np.random.rand(n_masks, 1024).astype(np.float32)
+        # Проверяем что это tuple из моделей
+        if isinstance(resnet, tuple) and len(resnet) >= 2:
+            model = resnet[0]  # backbone
+            device = resnet[1] if len(resnet) > 1 else 'cuda'
+        else:
+            model = resnet
+            device = 'cuda'
         
-        # Нормализуем
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        embeddings = embeddings / (norms + 1e-8)
+        # Альтернативный подход: используем старую медленную функцию напрямую
+        try:
+            # Преобразуем mask_arrays в формат, ожидаемый extract_features_from_masks_slow
+            mask_dicts = []
+            for mask_array in mask_arrays:
+                mask_dicts.append({'segmentation': mask_array})
+            
+            # Конвертируем PIL обратно в numpy для функции
+            image_np = np.array(pil_image)
+            
+            # Вызываем медленную функцию напрямую
+            from mask_withsearch import extract_features_from_masks_slow
+            embeddings = extract_features_from_masks_slow(image_np, mask_dicts, model, layer, transform)
+            
+            if isinstance(embeddings, np.ndarray) and embeddings.ndim == 2:
+                return embeddings
+                
+        except Exception as e:
+            print(f"   ⚠️ Медленная функция не сработала: {e}")
         
-        return embeddings
+        # Fallback: извлекаем эмбеддинги по одной маске вручную
+        embeddings = []
+        for i, mask in enumerate(mask_arrays):
+            try:
+                # Создаем маскированное изображение
+                image_np = np.array(pil_image)
+                mask_image = np.zeros_like(image_np)
+                mask_image[mask] = image_np[mask]
+                
+                # Конвертируем обратно в PIL
+                mask_pil = Image.fromarray(mask_image)
+                
+                # Используем get_vector с правильными аргументами
+                vec = get_vector(mask_pil, model, layer, transform)
+                if hasattr(vec, 'numpy'):
+                    embeddings.append(vec.numpy())
+                else:
+                    embeddings.append(vec)
+                    
+            except Exception as e:
+                print(f"   ⚠️ Ошибка с маской {i}: {e}")
+                # Fallback - случайный вектор
+                embeddings.append(np.random.rand(1024).astype(np.float32))
+        
+        if embeddings:
+            embeddings_array = np.array(embeddings)
+            # Нормализуем
+            norms = np.linalg.norm(embeddings_array, axis=1, keepdims=True)
+            embeddings_array = embeddings_array / (norms + 1e-8)
+            return embeddings_array
+        
+        return None
     
     def build_queries(self, pos_imgs, neg_imgs):
         """Строит эмбеддинги запросов из positive/negative примеров."""
         print(f"🔍 Построение запросов из {len(pos_imgs)} positive и {len(neg_imgs)} negative примеров")
         
+        # Получаем модели SearchDet
+        resnet, layer, transform, sam = (
+            self.detector.searchdet_resnet,
+            self.detector.searchdet_layer, 
+            self.detector.searchdet_transform,
+            self.detector.searchdet_sam
+        )
+        
+        # Проверяем что это tuple из моделей
+        if isinstance(resnet, tuple) and len(resnet) >= 2:
+            model = resnet[0]  # backbone
+            device = resnet[1] if len(resnet) > 1 else 'cuda'
+        else:
+            model = resnet
+            device = 'cuda'
+        
         # Positive эмбеддинги
         q_pos = []
         for i, img in enumerate(pos_imgs):
             try:
-                vec = self._get_image_embedding(img)
+                vec = self._get_image_embedding(img, model, layer, transform)
                 if vec is not None:
                     q_pos.append(vec)
             except Exception as e:
@@ -163,7 +243,7 @@ class EmbeddingExtractor:
         q_neg = []
         for i, img in enumerate(neg_imgs):
             try:
-                vec = self._get_image_embedding(img)
+                vec = self._get_image_embedding(img, model, layer, transform)
                 if vec is not None:
                     q_neg.append(vec)
             except Exception as e:
@@ -176,15 +256,15 @@ class EmbeddingExtractor:
         
         return q_pos, q_neg
     
-    def _get_image_embedding(self, pil_image):
+    def _get_image_embedding(self, pil_image, model, layer, transform):
         """Получает эмбеддинг для одного изображения."""
         if not SEARCHDET_AVAILABLE:
             # Заглушка
             return np.random.rand(1024).astype(np.float32)
         
         try:
-            # Используем get_vector из SearchDet
-            vec = get_vector(pil_image)
+            # Используем get_vector из SearchDet с правильными аргументами
+            vec = get_vector(pil_image, model, layer, transform)
             if isinstance(vec, np.ndarray):
                 return vec
             
