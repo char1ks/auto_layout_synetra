@@ -114,6 +114,7 @@ def main():
     print("   ✅ Основные зависимости найдены")
     
     print("\n🚀 Запуск SearchDet Pipeline CLI...")
+    print("🔗 Передача управления в: searchdet_pipeline.cli.main.main()")
     
     # Импортируем и запускаем CLI
     try:

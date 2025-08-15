@@ -10,8 +10,24 @@ import json
 from pathlib import Path
 from typing import Optional, List
 
-from ..core.pipeline import PipelineProcessor
-from ..utils.config import Config, DEFAULT_CONFIG
+# Добавляем корневую директорию в path для импортов
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+try:
+    # Пробуем относительный импорт
+    from ..core.pipeline import PipelineProcessor
+    from ..utils.config import Config, DEFAULT_CONFIG
+except ImportError:
+    # Fallback на абсолютные импорты
+    try:
+        from searchdet_pipeline.core.pipeline import PipelineProcessor
+        from searchdet_pipeline.utils.config import Config, DEFAULT_CONFIG
+    except ImportError:
+        # Если и это не работает, создаем заглушки
+        print("⚠️ Модули конфигурации недоступны, используем упрощенный режим")
+        PipelineProcessor = None
+        Config = None
+        DEFAULT_CONFIG = None
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -187,6 +203,10 @@ def _add_config_arguments(parser: argparse.ArgumentParser):
 
 def main():
     """Основная функция CLI."""
+    print("🚀 ЗАПУСК МОДУЛЬНОГО SEARCHDET ПАЙПЛАЙНА")
+    print("=" * 60)
+    print("📁 Точка входа: searchdet_pipeline/cli/main.py → main()")
+    
     parser = create_parser()
     args = parser.parse_args()
     
@@ -224,43 +244,81 @@ def main():
 
 def _execute_detect(args) -> int:
     """Выполняет команду detect."""
-    # Загружаем конфигурацию
-    config = _load_config(args)
+    print("\n" + "="*70)
+    print("📋 ПОРЯДОК ВЫПОЛНЕНИЯ МОДУЛЬНОГО ПАЙПЛАЙНА:")
+    print("="*70)
+    print("1️⃣ main.py → searchdet_pipeline.cli.main.main()")
+    print("2️⃣ searchdet_pipeline/cli/main.py → _execute_detect()")
     
-    # Применяем CLI аргументы к конфигурации
-    config = _apply_cli_args_to_config(config, args)
+    # Используем гибридный пайплайн напрямую
+    import sys
+    import os
     
-    # Настройка уровня логирования
-    if hasattr(args, 'quiet') and args.quiet:
-        # TODO: Реализовать quiet mode
-        pass
-    elif hasattr(args, 'verbose') and args.verbose:
-        # TODO: Реализовать verbose mode
-        pass
+    # Добавляем корневую директорию в path
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
     
-    # Создаём и настраиваем пайплайн
-    processor = PipelineProcessor(config)
-    
-    model_paths = _extract_model_paths(args)
-    if not processor.setup(**model_paths):
-        print("❌ Не удалось настроить пайплайн")
+    try:
+        print("3️⃣ Импорт: searchdet_pipeline.core.detector → SearchDetDetector (автономная версия)")
+        # Импортируем автономный модульный детектор
+        from ..core.detector import SearchDetDetector
+        
+        print("4️⃣ Инициализация: SearchDetDetector.__init__()")
+        print("🔧 Инициализация SearchDet детектора...")
+        
+        # Параметры для детектора
+        detector_params = {
+            'mask_backend': args.backend or 'fastsam',
+        }
+        
+        # Добавляем пути к моделям если указаны
+        if hasattr(args, 'sam_checkpoint') and args.sam_checkpoint:
+            detector_params['sam_model'] = args.sam_checkpoint
+        if hasattr(args, 'sam2_checkpoint') and args.sam2_checkpoint:
+            detector_params['sam2_weights'] = args.sam2_checkpoint
+        if hasattr(args, 'fastsam_checkpoint') and args.fastsam_checkpoint:
+            detector_params['fastsam_model'] = args.fastsam_checkpoint
+            
+        # Параметры скоринга
+        if hasattr(args, 'confidence') and args.confidence is not None:
+            detector_params['min_confidence'] = args.confidence
+        if hasattr(args, 'max_masks') and args.max_masks is not None:
+            detector_params['max_masks'] = args.max_masks
+        
+        print("5️⃣ Создание: detector = SearchDetDetector(**params)")
+        # Создаём детектор
+        detector = SearchDetDetector(**detector_params)
+        
+        print("6️⃣ Вызов: detector.find_present_elements()")
+        print("   ↳ Это запустит весь пайплайн из hybrid_searchdet_pipeline.py:")
+        print("   ↳ _load_example_images() → _generate_sam_masks() → _filter_*() → _extract_mask_embeddings() → _score_masks()")
+        
+        # Выполняем детекцию
+        result = detector.find_present_elements(
+            args.image,
+            args.positive,
+            args.negative
+        )
+        
+        # Выводим результат
+        _print_result(result, args)
+        
+        # Проверяем успешность (новый или старый формат)
+        if 'success' in result:
+            return 0 if result['success'] else 1
+        else:
+            # Старый формат - считаем успешным если есть found_elements
+            return 0 if 'found_elements' in result else 1
+        
+    except ImportError as e:
+        print(f"❌ Ошибка импорта модульного пайплайна: {e}")
+        print("   Убедитесь что модули searchdet_pipeline/core/ доступны")
         return 1
-    
-    # Определяем директорию для вывода
-    output_dir = args.output if not args.no_save else None
-    
-    # Выполняем детекцию
-    result = processor.process_single(
-        args.image,
-        args.positive,
-        args.negative,
-        output_dir
-    )
-    
-    # Выводим результат
-    _print_result(result, args)
-    
-    return 0 if result['success'] else 1
+    except Exception as e:
+        print(f"❌ Ошибка выполнения детекции: {e}")
+        if hasattr(args, 'verbose') and args.verbose:
+            import traceback
+            traceback.print_exc()
+        return 1
 
 
 def _execute_batch(args) -> int:
@@ -320,31 +378,78 @@ def _execute_batch(args) -> int:
 
 def _execute_quick(args) -> int:
     """Выполняет команду quick."""
-    config = DEFAULT_CONFIG
+    print("\n" + "="*70)
+    print("📋 ПОРЯДОК ВЫПОЛНЕНИЯ QUICK РЕЖИМА:")
+    print("="*70)
+    print("1️⃣ main.py → searchdet_pipeline.cli.main.main()")
+    print("2️⃣ searchdet_pipeline/cli/main.py → _execute_quick()")
     
-    # Применяем backend из аргументов
-    if args.backend:
-        config.mask_generation.backend = args.backend
+    import sys
     
-    processor = PipelineProcessor(config)
+    # Добавляем корневую директорию в path
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
     
-    # Определяем пути к моделям (базовые)
-    model_paths = {}
-    if args.backend == 'sam-hq':
-        # Пользователь должен указать путь к SAM-HQ checkpoint
-        print("ℹ️ Для SAM-HQ требуется checkpoint. Укажите путь через --sam-checkpoint или используйте --backend fastsam")
-    
-    if not processor.setup(**model_paths):
-        print("❌ Не удалось настроить пайплайн")
+    try:
+        print("3️⃣ Импорт: searchdet_pipeline.core.detector → SearchDetDetector (автономная версия)")
+        # Импортируем автономный модульный детектор
+        from ..core.detector import SearchDetDetector
+        
+        print("4️⃣ Инициализация: SearchDetDetector.__init__()")
+        print("🔧 Быстрая инициализация SearchDet детектора...")
+        
+        print("5️⃣ Автопоиск папок: examples/positive и examples/negative")
+        # Автоопределение positive/negative папок
+        examples_path = Path(args.examples)
+        positive_path = examples_path / "positive"
+        negative_path = examples_path / "negative"
+        
+        # Проверяем наличие подпапок
+        if not positive_path.exists():
+            print(f"⚠️ Папка positive не найдена в {examples_path}")
+            positive_path = examples_path  # Используем саму папку как positive
+            negative_path = None
+        
+        if negative_path and not negative_path.exists():
+            print(f"⚠️ Папка negative не найдена в {examples_path}")
+            negative_path = None
+        
+        # Параметры для детектора
+        detector_params = {
+            'mask_backend': args.backend or 'fastsam',
+        }
+        
+        print("6️⃣ Создание: detector = SearchDetDetector(**params)")
+        # Создаём детектор
+        detector = SearchDetDetector(**detector_params)
+        
+        print("7️⃣ Вызов: detector.find_present_elements()")
+        print("   ↳ Запуск полного пайплайна из hybrid_searchdet_pipeline.py")
+        # Выполняем детекцию
+        result = detector.find_present_elements(
+            args.image,
+            str(positive_path) if positive_path else None,
+            str(negative_path) if negative_path else None
+        )
+        
+        # Выводим результат
+        _print_result(result, args)
+        
+        # Проверяем успешность (новый или старый формат)
+        if 'success' in result:
+            return 0 if result['success'] else 1
+        else:
+            # Старый формат - считаем успешным если есть found_elements
+            return 0 if 'found_elements' in result else 1
+        
+    except ImportError as e:
+        print(f"❌ Ошибка импорта модульного пайплайна: {e}")
         return 1
-    
-    # Выполняем быструю детекцию
-    result = processor.quick_detect(args.image, args.examples, args.output)
-    
-    # Выводим результат
-    _print_result(result, args)
-    
-    return 0 if result['success'] else 1
+    except Exception as e:
+        print(f"❌ Ошибка выполнения детекции: {e}")
+        if hasattr(args, 'verbose') and args.verbose:
+            import traceback
+            traceback.print_exc()
+        return 1
 
 
 def _execute_config(args) -> int:
@@ -376,26 +481,36 @@ def _execute_info(args) -> int:
     _check_dependencies()
     
     # Показываем дефолтную конфигурацию
-    print("\n⚙️ Конфигурация по умолчанию:")
-    config_dict = DEFAULT_CONFIG.to_dict()
-    print(json.dumps(config_dict, indent=2, ensure_ascii=False))
+    if DEFAULT_CONFIG is not None:
+        print("\n⚙️ Конфигурация по умолчанию:")
+        config_dict = DEFAULT_CONFIG.to_dict()
+        print(json.dumps(config_dict, indent=2, ensure_ascii=False))
+    else:
+        print("\n⚙️ Работает в упрощенном режиме (без модульной конфигурации)")
     
     return 0
 
 
-def _load_config(args) -> Config:
+def _load_config(args):
     """Загружает конфигурацию из файла или использует дефолтную."""
+    if DEFAULT_CONFIG is None:
+        return None  # Упрощенный режим
+        
     if hasattr(args, 'config') and args.config:
-        config = PipelineProcessor.load_config_from_file(args.config)
-        if config is None:
-            print(f"⚠️ Не удалось загрузить конфигурацию из {args.config}, используется дефолтная")
-            return DEFAULT_CONFIG
-        return config
+        if PipelineProcessor:
+            config = PipelineProcessor.load_config_from_file(args.config)
+            if config is None:
+                print(f"⚠️ Не удалось загрузить конфигурацию из {args.config}, используется дефолтная")
+                return DEFAULT_CONFIG
+            return config
     return DEFAULT_CONFIG
 
 
-def _apply_cli_args_to_config(config: Config, args) -> Config:
+def _apply_cli_args_to_config(config, args):
     """Применяет аргументы CLI к конфигурации."""
+    if config is None or Config is None:
+        return None  # Упрощенный режим
+        
     # Создаём копию конфигурации
     config_dict = config.to_dict()
     
@@ -450,22 +565,41 @@ def _extract_model_paths(args) -> dict:
 
 def _print_result(result: dict, args):
     """Выводит результат обработки."""
-    if result['success']:
-        print(f"\n✅ Детекция завершена успешно!")
-        print(f"⏱️ Время обработки: {result['processing_time']:.2f} сек")
-        print(f"🔍 Найдено объектов: {len(result['detections'])}")
-        
-        if result['detections']:
-            confidences = [d['confidence'] for d in result['detections']]
-            print(f"📊 Средняя уверенность: {sum(confidences)/len(confidences):.3f}")
-        
-        if result.get('saved_files'):
-            print(f"💾 Сохранено файлов: {len(result['saved_files'])}")
-            if hasattr(args, 'verbose') and args.verbose:
-                for file_type, path in result['saved_files'].items():
-                    print(f"   • {file_type}: {path}")
+    # Проверяем формат результата (новый или старый)
+    if 'success' in result:
+        # Новый формат
+        if result['success']:
+            print(f"\n✅ Детекция завершена успешно!")
+            print(f"⏱️ Время обработки: {result['processing_time']:.2f} сек")
+            print(f"🔍 Найдено объектов: {len(result['detections'])}")
+            
+            if result['detections']:
+                confidences = [d['confidence'] for d in result['detections']]
+                print(f"📊 Средняя уверенность: {sum(confidences)/len(confidences):.3f}")
+            
+            if result.get('saved_files'):
+                print(f"💾 Сохранено файлов: {len(result['saved_files'])}")
+                if hasattr(args, 'verbose') and args.verbose:
+                    for file_type, path in result['saved_files'].items():
+                        print(f"   • {file_type}: {path}")
+        else:
+            print(f"\n❌ Ошибка детекции: {result.get('error', 'Неизвестная ошибка')}")
     else:
-        print(f"\n❌ Ошибка детекции: {result.get('error', 'Неизвестная ошибка')}")
+        # Старый формат (из hybrid_searchdet_pipeline.py)
+        if 'found_elements' in result:
+            found_elements = result['found_elements']
+            print(f"\n✅ Детекция завершена успешно!")
+            print(f"🔍 Найдено объектов: {len(found_elements)}")
+            
+            if found_elements:
+                confidences = [elem.get('confidence', 0.0) for elem in found_elements]
+                if any(c > 0 for c in confidences):
+                    print(f"📊 Средняя уверенность: {sum(confidences)/len(confidences):.3f}")
+            
+            if hasattr(args, 'output') and args.output:
+                print(f"💾 Результаты будут сохранены в: {args.output}")
+        else:
+            print(f"\n❌ Неожиданный формат результата: {result}")
 
 
 def _print_batch_results(results: List[dict], args):

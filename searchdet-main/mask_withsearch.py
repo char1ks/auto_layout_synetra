@@ -379,6 +379,10 @@ def extract_features_from_masks_fast(image, masks, model, layer, transform):
     device = next(model.parameters()).device
     image_tensor = image_tensor.to(device, memory_format=torch.channels_last)
     
+    # Диагностика размера входного тензора
+    print(f"   🧪 Backbone input tensor: {list(image_tensor.shape)}")  # должен быть [1,3,?,?] где ? ~512
+    print(f"   🧪 SEARCHDET_FEAT_SHORT_SIDE = {os.getenv('SEARCHDET_FEAT_SHORT_SIDE', 'не установлено')}")
+    
     # 🔥 Hook для захвата feature map ИЗ ПРАВИЛЬНОГО СЛОЯ
     feature_map = None
     def hook_fn(module, input, output):
@@ -463,8 +467,10 @@ def extract_features_from_masks_fast(image, masks, model, layer, transform):
     
     # Проверяем минимальный размер feature map для качественного masked pooling
     batch_size, channels, feat_h, feat_w = feature_map.shape
-    if feat_h < 20 or feat_w < 20:  # Увеличили порог с 14 до 20
-        print(f"   ⚠️ Feature map слишком маленький: {feat_h}×{feat_w} < 20×20")
+    print(f"   🧪 Feature map @{layer if isinstance(layer, str) else 'layer'}: [{feat_h}, {feat_w}]")  # диагностика
+    
+    if feat_h < 18 or feat_w < 18:  # Оптимизированный порог для SEARCHDET_FEAT_SHORT_SIDE=384
+        print(f"   ⚠️ Feature map слишком маленький: {feat_h}×{feat_w} < 18×18")
         print("   💡 Советы: запустите с --layer layer2 или установите SEARCHDET_FEAT_SHORT_SIDE=384/512")
         print("   🔄 Используем старый метод для лучшего качества")
         return extract_features_from_masks_slow(image, masks, model, layer, transform)

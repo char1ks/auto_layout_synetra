@@ -186,8 +186,28 @@ class SearchDetDetector:
         if not SEARCHDET_AVAILABLE:
             raise RuntimeError("SearchDet не найден. Убедись, что searchdet-main в проекте и mask_withsearch импортируется.")
 
+        # Устанавливаем переменную окружения для оптимального feature map
+        import os
+        os.environ['SEARCHDET_FEAT_SHORT_SIDE'] = '384'  # Оптимальный размер для баланса скорости и качества
+        print("🔧 Установлено SEARCHDET_FEAT_SHORT_SIDE=384 для оптимального feature map")
+
         self.searchdet_resnet, self.searchdet_layer, self.searchdet_transform, self.searchdet_sam = init_searchdet()
-        if layer_override:
+        
+        # Переопределяем трансформацию для правильного размера
+        import torchvision.transforms as transforms
+        feat_short_side = int(os.getenv('SEARCHDET_FEAT_SHORT_SIDE', '384'))
+        self.searchdet_transform = transforms.Compose([
+            transforms.Resize(feat_short_side),  # используем переменную окружения, БЕЗ CenterCrop
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        print(f"🔧 Переопределена трансформация с Resize({feat_short_side}) без CenterCrop")
+        
+        # Принудительно устанавливаем layer3 для оптимального feature map
+        if hasattr(self.searchdet_resnet, 'layer3'):
+            self.searchdet_layer = 'layer3'
+            print("🔧 Принудительно установлен layer3 для лучшего feature map")
+        elif layer_override:
             self.searchdet_layer = layer_override
 
         # thresholds
@@ -618,6 +638,7 @@ class SearchDetDetector:
     def _extract_mask_embeddings(self, image_np, masks):
         if not masks:
             return np.zeros((0, 1), dtype=np.float32), []
+        print(f"   🔧 Извлечение эмбеддингов: layer={self.searchdet_layer}, transform={type(self.searchdet_transform)}")
         vecs = extract_features_from_masks(
             image_np, masks, self.searchdet_resnet, self.searchdet_layer, self.searchdet_transform
         )
@@ -908,6 +929,7 @@ class SearchDetDetector:
     def _extract_mask_embeddings(self, image_np, masks):
         if not masks:
             return np.zeros((0, 1), dtype=np.float32), []
+        print(f"   🔧 Извлечение эмбеддингов: layer={self.searchdet_layer}, transform={type(self.searchdet_transform)}")
         vecs = extract_features_from_masks(
             image_np, masks, self.searchdet_resnet, self.searchdet_layer, self.searchdet_transform
         )
@@ -1039,6 +1061,9 @@ class SearchDetDetector:
     # --------------------------- Main search -------------------------- #
     def find_present_elements(self, image_path, positive_dir, negative_dir=None):
         print(f"🔍 SearchDet-only анализ: {image_path}" + "="*60)
+        print("🔄 ДЕТАЛЬНАЯ ПОСЛЕДОВАТЕЛЬНОСТЬ ВЫПОЛНЕНИЯ HYBRID PIPELINE:")
+        print("=" * 80)
+        print("7️⃣ hybrid_searchdet_pipeline.py → find_present_elements()")
         t_total = time.time()
         img_bgr = cv2.imread(str(image_path))
         if img_bgr is None:
@@ -1046,6 +1071,7 @@ class SearchDetDetector:
         image_np = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
         # 0) примеры
+        print("8️⃣ Шаг 1: _load_example_images() - загрузка positive/negative примеров")
         pos_imgs = self._load_example_images(positive_dir)
         neg_imgs = self._load_example_images(negative_dir) if negative_dir else []
         if len(pos_imgs) == 0:
@@ -1054,11 +1080,17 @@ class SearchDetDetector:
         print(f"   📁 Positive: {len(pos_imgs)}	📁 Negative: {len(neg_imgs)}")
 
         # 1) SAM маски
+        print("9️⃣ Шаг 2: _generate_sam_masks() - генерация масок через SAM/FastSAM")
         masks = self._generate_sam_masks(image_np)
+        print("🔟 Шаг 3: _filter_perfect_rectangles() - фильтр идеальных прямоугольников")
         masks = self._filter_perfect_rectangles(masks)
+        print("1️⃣1️⃣ Шаг 4: _drop_or_clip_border_masks() - обработка границ")
         masks = self._drop_or_clip_border_masks(masks, image_np)
+        print("1️⃣2️⃣ Шаг 5: _filter_nested_masks() - фильтр вложенных масок")
         masks = self._filter_nested_masks(masks)
+        print("1️⃣3️⃣ Шаг 6: _merge_overlapping_masks() - объединение перекрывающихся масок")
         masks = self._merge_overlapping_masks(masks, iou_threshold=0.7)
+        print("1️⃣4️⃣ Шаг 7: _filter_by_area_only() - фильтр по площади")
         # Фильтр по площади включен: учитывает --min-area-frac и --max-area-frac
         masks = self._filter_by_area_only(masks, image_np)
         if not masks:
@@ -1066,12 +1098,14 @@ class SearchDetDetector:
             return {"found_elements": [], "masks": []}
 
         # 2) эмбеддинги
+        print("1️⃣5️⃣ Шаг 8: _extract_mask_embeddings() - извлечение эмбеддингов масок")
         print("🧠 ЭТАП 2: Эмбеддинги масок и запросов...")
         mask_vecs, idx_map = self._extract_mask_embeddings(image_np, masks)
         if mask_vecs.shape[0] == 0:
             print("   ❌ Не удалось получить эмбеддинги масок.")
             return {"found_elements": [], "masks": []}
         print(f"   📊 Масок с валидными векторами: {mask_vecs.shape[0]}")
+        print("1️⃣6️⃣ Шаг 9: _build_queries() - построение эмбеддингов примеров")
         q_pos, q_neg = self._build_queries(pos_imgs, neg_imgs)
 
         # 3) скоринг
