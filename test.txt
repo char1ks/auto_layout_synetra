@@ -1,0 +1,1 @@
+!python hybrid_searchdet_pipeline.py   --mask-backend fastsam   --image 1.jpg --negative examples/negative/ --positive examples/positive --pps-multi "48" --sam-min-region 10000
