@@ -36,6 +36,9 @@ class SearchDetDetector:
         if not SEARCHDET_AVAILABLE:
             raise RuntimeError("SearchDet не найден")
 
+        # Сохраняем все kwargs для гибкости
+        self.params = kwargs
+
         # Устанавливаем переменную окружения для оптимального feature map
         os.environ['SEARCHDET_FEAT_SHORT_SIDE'] = '384'
         print("🔧 Установлено SEARCHDET_FEAT_SHORT_SIDE=384")
@@ -55,11 +58,11 @@ class SearchDetDetector:
         print("🔧 Принудительно установлен layer3")
         
         # Сохраняем параметры с дефолтами
-        self.mask_backend = kwargs.get('mask_backend', 'fastsam')
+        self.mask_backend = self.params.get('mask_backend', 'fastsam')
         
         # Инициализируем компоненты
         self.mask_generator = MaskGenerator(self)
-        self.mask_filter = MaskFilter(self)
+        self.mask_filter = MaskFilter(self, self.params)
         self.embedding_extractor = EmbeddingExtractor(self)
         self.score_calculator = ScoreCalculator(self)
         self.result_saver = ResultSaver()

@@ -175,6 +175,121 @@ class MaskGenerator:
         return masks
     
     def _generate_sam_masks(self, image_np):
-        """Генерация масок через SAM-HQ (заглушка)."""
-        print("⚠️ SAM-HQ генерация масок пока не реализована в модульной версии")
-        return []
+        """Генерация масок через SAM-HQ."""
+        import time
+        
+        # Инициализируем модель если нужно
+        if self._sam_generator is None:
+            print("🎯 Инициализация SAM-HQ...")
+            self._sam_generator = self._init_sam_hq()
+        
+        print(f"   на {image_np.shape[1]}x{image_np.shape[0]}")
+        
+        t_start = time.time()
+        
+        # Генерируем маски
+        masks = self._sam_generator.generate(image_np)
+        
+        t_gen = time.time() - t_start
+        
+        print(f"🔍 SAM-HQ сгенерировал {len(masks)} масок за {t_gen:.3f} сек")
+        print(f"🎯 Сгенерировано {len(masks)} масок-кандидатов")
+        
+        return masks
+    
+    def _init_sam_hq(self):
+        """Инициализация SAM-HQ модели."""
+        try:
+            # Импорты SAM-HQ
+            from segment_anything_hq import sam_model_registry, SamAutomaticMaskGenerator
+        except ImportError:
+            try:
+                from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+                print("   ⚠️ Используем обычную SAM вместо SAM-HQ")
+            except ImportError:
+                raise RuntimeError("Не найден ни SAM-HQ, ни обычная SAM. Установите segment-anything-hq или segment-anything")
+        
+        # Ищем checkpoint
+        sam_checkpoint = self._find_sam_checkpoint()
+        
+        if not sam_checkpoint:
+            raise RuntimeError("Не найден checkpoint SAM-HQ. Запустите с --backend fastsam или установите SAM-HQ")
+        
+        print(f"   📦 Загружаем SAM из: {sam_checkpoint}")
+        
+        # Загружаем модель
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model_type = "vit_l"  # или "vit_h", "vit_b"
+        
+        sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+        sam.to(device=device)
+        
+        # Создаем генератор масок
+        mask_generator = SamAutomaticMaskGenerator(
+            model=sam,
+            points_per_side=32,
+            points_per_batch=64,
+            pred_iou_thresh=0.8,
+            stability_score_thresh=0.9,
+            crop_n_layers=1,
+            crop_n_points_downscale_factor=2,
+            min_mask_region_area=100,
+            box_nms_thresh=0.5,
+            crop_nms_thresh=0.5,
+            crop_overlap_ratio=512 / 1500,
+        )
+        
+        print(f"   ✅ SAM-HQ готов (device={device})")
+        return mask_generator
+    
+    def _find_sam_checkpoint(self):
+        """Ищет checkpoint SAM-HQ."""
+        import os
+        from pathlib import Path
+        
+        # Возможные пути к checkpoint
+        possible_paths = [
+            "sam-hq/pretrained_checkpoint/sam_hq_vit_l.pth",
+            "models/sam_hq_vit_l.pth", 
+            "sam_hq_vit_l.pth",
+            # Также пути для обычной SAM
+            "models/sam_vit_l_0b3195.pth",
+            "sam_vit_l_0b3195.pth"
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path) and os.path.getsize(path) > 100_000_000:  # Больше 100MB
+                return path
+        
+        # Попробуем автоскачивание SAM-HQ
+        return self._download_sam_hq()
+    
+    def _download_sam_hq(self):
+        """Автоскачивание SAM-HQ модели."""
+        import urllib.request
+        from pathlib import Path
+        
+        sam_dir = Path("sam-hq/pretrained_checkpoint")
+        sam_checkpoint = sam_dir / "sam_hq_vit_l.pth"
+        
+        if sam_checkpoint.exists() and sam_checkpoint.stat().st_size > 100_000_000:
+            return str(sam_checkpoint)
+        
+        print("   📥 Скачиваем SAM-HQ модель...")
+        sam_dir.mkdir(parents=True, exist_ok=True)
+        
+        url = "https://huggingface.co/lkeab/hq-sam/resolve/main/sam_hq_vit_l.pth"
+        
+        try:
+            urllib.request.urlretrieve(url, sam_checkpoint)
+            if sam_checkpoint.stat().st_size > 100_000_000:
+                print("   ✅ SAM-HQ скачана успешно")
+                return str(sam_checkpoint)
+            else:
+                print("   ❌ Файл скачался неполностью")
+                sam_checkpoint.unlink()  # Удаляем поврежденный файл
+        except Exception as e:
+            print(f"   ❌ Ошибка скачивания: {e}")
+        
+        return None

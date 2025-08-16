@@ -5,44 +5,112 @@
 """
 
 import numpy as np
+from typing import List, Dict, Any
 
 
 class MaskFilter:
-    """Фильтрация масок по различным критериям."""
+    """Класс для фильтрации масок."""
     
-    def __init__(self, detector):
+    def __init__(self, detector, params=None):
+        if params is None:
+            params = {}
+            
         self.detector = detector
+        
+        # Загружаем параметры фильтров с дефолтами
+        self.min_area_frac = params.get('min_area_frac', 0.03)  # 3.0%
+        self.max_area_frac = params.get('max_area_frac', 0.90)  # 90.0%
+        self.perfect_rectangle_iou = params.get('perfect_rectangle_iou', 0.99)
+        self.containment_iou = params.get('containment_iou', 0.95)
+        self.border_ban = params.get('border_ban', True)
+        self.border_width = params.get('border_width', 2)
     
-    def apply_all_filters(self, masks, image_np):
+    def apply_all_filters(self, masks: List[Dict[str, Any]], image_np: np.ndarray) -> List[Dict[str, Any]]:
         """Применяет все фильтры последовательно."""
         if not masks:
             return masks
             
         print("🔄 ЭТАП 3: Фильтрация масок")
-        print("-" * 60)
+        print("="*60)
         
-        # 1. Фильтр идеальных прямоугольников
+        # Фильтр 1: Идеальные прямоугольники
         masks = self._filter_perfect_rectangles(masks)
+        print(f"🔳 Фильтр идеальных прямоугольников ({self.perfect_rectangle_iou}): {len(masks)} → {len(masks)}")
         
-        # 2. Фильтр границ
-        masks = self._filter_border_masks(masks, image_np)
+        # Фильтр 2: Границы изображения
+        masks, dropped_count, clipped_count = self._handle_border_masks(masks, image_np.shape)
+        print(f"🖼️ Обработка границ (запрет, {self.border_width}px): {len(masks)} → {len(masks)} (dropped={dropped_count}, clipped={clipped_count})")
+        initial_mask_count = len(masks)
         
-        # 3. Фильтр вложенных масок
+        # Фильтр 3: Вложенные маски
         masks = self._filter_nested_masks(masks)
+        print(f"🔗 Фильтр вложенных масок ({self.containment_iou} IoU): {initial_mask_count} → {len(masks)}")
+        initial_mask_count = len(masks)
         
-        # 4. Объединение перекрывающихся
+        # Фильтр 4: Объединение перекрывающихся масок
         masks = self._merge_overlapping_masks(masks)
+        print(f"🔗 Объединение перекрывающихся масок: {initial_mask_count} → {len(masks)}")
+        initial_mask_count = len(masks)
         
-        # 5. Фильтр по площади
-        masks = self._filter_by_area(masks, image_np)
+        # Фильтр 5: Размер маски
+        masks, small_count, big_count = self._filter_by_size(masks, image_np.shape)
         
         return masks
     
-    def _filter_perfect_rectangles(self, masks):
-        """Фильтр идеальных прямоугольников."""
-        threshold = getattr(self.detector, 'perfect_rectangle_iou_threshold', 0.99)
+    def _filter_by_size(self, masks: List[Dict[str, Any]], image_shape: tuple) -> (List[Dict[str, Any]], int, int):
+        """Фильтрует маски по их площади."""
+        h, w = image_shape[:2]
+        total_pixels = h * w
+        
+        min_area_abs = self.min_area_frac * total_pixels
+        max_area_abs = self.max_area_frac * total_pixels
         
         filtered_masks = []
+        small_count = 0
+        big_count = 0
+        
+        for mask_dict in masks:
+            area = mask_dict.get('area', 0)
+            if area < min_area_abs:
+                small_count += 1
+            elif area > max_area_abs:
+                big_count += 1
+            else:
+                filtered_masks.append(mask_dict)
+                
+        return filtered_masks, small_count, big_count
+
+    def _handle_border_masks(self, masks: List[Dict[str, Any]], image_shape: tuple) -> (List[Dict[str, Any]], int, int):
+        """Обрабатывает маски, касающиеся границ изображения."""
+        if not self.border_ban:
+            return masks, 0, 0
+
+        h, w = image_shape[:2]
+        filtered_masks = []
+        dropped_count = 0
+        clipped_count = 0
+
+        for mask_dict in masks:
+            segmentation = mask_dict['segmentation']
+            bbox = mask_dict['bbox']
+            x1, y1, x2, y2 = bbox
+
+            # Проверяем, касается ли маска границ
+            on_border = (x1 <= self.border_width or y1 <= self.border_width or
+                         x2 >= w - self.border_width or y2 >= h - self.border_width)
+
+            if on_border:
+                dropped_count += 1
+            else:
+                filtered_masks.append(mask_dict)
+        
+        return filtered_masks, dropped_count, clipped_count
+
+    def _filter_perfect_rectangles(self, masks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Фильтрует маски, которые являются почти идеальными прямоугольниками."""
+        filtered_masks = []
+        threshold = getattr(self.detector, 'perfect_rectangle_iou_threshold', 0.99)
+        
         for mask_dict in masks:
             mask = mask_dict["segmentation"]
             bbox = mask_dict["bbox"]
@@ -101,50 +169,45 @@ class MaskFilter:
     
     def _filter_nested_masks(self, masks):
         """Фильтр вложенных масок."""
-        threshold = getattr(self.detector, 'containment_iou_threshold', 0.95)
+        filtered_masks = []
         
-        if len(masks) <= 1:
-            return masks
+        for mask_dict in masks:
+            filtered_masks.append(mask_dict)
         
-        # Вычисляем IoU между всеми парами
-        keep = set(range(len(masks)))
+        filtered_masks.sort(key=lambda m: m['area'], reverse=True)
         
-        for i in range(len(masks)):
-            if i not in keep:
+        to_remove = set()
+        
+        for i in range(len(filtered_masks)):
+            if i in to_remove:
                 continue
-            for j in range(i + 1, len(masks)):
-                if j not in keep:
+            
+            mask_i = filtered_masks[i]
+            seg_i = mask_i['segmentation']
+            area_i = mask_i['area']
+            
+            for j in range(i + 1, len(filtered_masks)):
+                if j in to_remove:
                     continue
                 
-                mask_i = masks[i]["segmentation"]
-                mask_j = masks[j]["segmentation"]
+                mask_j = filtered_masks[j]
+                seg_j = mask_j['segmentation']
+                area_j = mask_j['area']
                 
-                intersection = np.logical_and(mask_i, mask_j).sum()
-                area_i = mask_i.sum()
-                area_j = mask_j.sum()
+                # Используем "Containment" IoU: intersection / area_of_smaller_mask
+                intersection = np.logical_and(seg_i, seg_j).sum()
                 
-                if area_i == 0 or area_j == 0:
-                    continue
+                # area_j - площадь меньшей маски, т.к. мы отсортировали по убыванию
+                containment = intersection / area_j if area_j > 0 else 0
                 
-                # Проверяем, если одна маска содержится в другой
-                iou_i_in_j = intersection / area_i
-                iou_j_in_i = intersection / area_j
-                
-                if iou_i_in_j >= threshold:
-                    # i содержится в j, удаляем меньшую (i)
-                    keep.discard(i)
-                elif iou_j_in_i >= threshold:
-                    # j содержится в i, удаляем меньшую (j)
-                    keep.discard(j)
+                if containment >= self.containment_iou:
+                    to_remove.add(j) # Удаляем меньшую, вложенную маску
         
-        filtered_masks = [masks[i] for i in sorted(keep)]
-        
-        print(f"🔗 Фильтр вложенных масок ({threshold} IoU): {len(masks)} → {len(filtered_masks)}")
-        
-        return filtered_masks
+        final_masks = [mask for i, mask in enumerate(filtered_masks) if i not in to_remove]
+        return final_masks
     
-    def _merge_overlapping_masks(self, masks, iou_threshold=0.7):
-        """Объединение перекрывающихся масок."""
+    def _merge_overlapping_masks(self, masks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Объединяет сильно перекрывающиеся маски."""
         if len(masks) <= 1:
             print(f"🔗 Слияние масок: {len(masks)} → {len(masks)}")
             return masks
@@ -152,32 +215,3 @@ class MaskFilter:
         # Простая заглушка - пока не объединяем
         print(f"🔗 Объединение перекрывающихся масок: {len(masks)} → {len(masks)}")
         return masks
-    
-    def _filter_by_area(self, masks, image_np):
-        """Фильтр по площади."""
-        h, w = image_np.shape[:2]
-        total_pixels = h * w
-        
-        min_area_frac = getattr(self.detector, 'min_area_frac', 0.03)
-        max_area_frac = getattr(self.detector, 'max_area_frac', 0.90)
-        
-        min_area_abs = min_area_frac * total_pixels
-        max_area_abs = max_area_frac * total_pixels
-        
-        filtered_masks = []
-        small_count = 0
-        big_count = 0
-        
-        for mask_dict in masks:
-            area = mask_dict["area"]
-            
-            if area < min_area_abs:
-                small_count += 1
-            elif area > max_area_abs:
-                big_count += 1
-            else:
-                filtered_masks.append(mask_dict)
-        
-        print(f"📏 Фильтр размера ({min_area_frac*100:.1f}% - {max_area_frac*100:.1f}%): {len(masks)} → {len(filtered_masks)} (small={small_count}, big={big_count})")
-        
-        return filtered_masks

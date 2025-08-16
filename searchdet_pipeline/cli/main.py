@@ -130,7 +130,15 @@ def _add_detect_arguments(parser: argparse.ArgumentParser):
                        help='Бэкенд для генерации масок')
     parser.add_argument('--confidence', type=float, help='Минимальный порог уверенности (0-1)')
     parser.add_argument('--max-masks', type=int, help='Максимальное количество детекций')
+    parser.add_argument('--min-area', type=float, help='Минимальная площадь маски в процентах (0-100)')
+    parser.add_argument('--max-area', type=float, help='Максимальная площадь маски в процентах (0-100)')
+    parser.add_argument('--nested-iou', type=float, help='IoU порог для фильтра вложенных масок (0-1)')
     
+    # Параметры скоринга
+    parser.add_argument('--score-margin', type=float, help='Зазор между positive и negative скором')
+    parser.add_argument('--score-ratio', type=float, help='Соотношение positive/negative скора')
+    parser.add_argument('--score-confidence', type=float, help='Минимальная уверенность для скоринга')
+
     # Пути к моделям
     parser.add_argument('--sam-checkpoint', help='Путь к checkpoint SAM-HQ')
     parser.add_argument('--sam2-checkpoint', help='Путь к checkpoint SAM2')
@@ -283,6 +291,22 @@ def _execute_detect(args) -> int:
             detector_params['min_confidence'] = args.confidence
         if hasattr(args, 'max_masks') and args.max_masks is not None:
             detector_params['max_masks'] = args.max_masks
+            
+        # Параметры фильтров
+        if hasattr(args, 'min_area') and args.min_area is not None:
+            detector_params['min_area_frac'] = args.min_area / 100.0
+        if hasattr(args, 'max_area') and args.max_area is not None:
+            detector_params['max_area_frac'] = args.max_area / 100.0
+        if hasattr(args, 'nested_iou') and args.nested_iou is not None:
+            detector_params['containment_iou'] = args.nested_iou
+        
+        # Параметры скоринга
+        if hasattr(args, 'score_margin') and args.score_margin is not None:
+            detector_params['score_margin'] = args.score_margin
+        if hasattr(args, 'score_ratio') and args.score_ratio is not None:
+            detector_params['score_ratio'] = args.score_ratio
+        if hasattr(args, 'score_confidence') and args.score_confidence is not None:
+            detector_params['score_confidence'] = args.score_confidence
         
         print("5️⃣ Создание: detector = SearchDetDetector(**params)")
         # Создаём детектор
@@ -525,6 +549,14 @@ def _apply_cli_args_to_config(config, args):
     
     if hasattr(args, 'max_masks') and args.max_masks is not None:
         config_dict['post_processing']['max_masks'] = args.max_masks
+    
+    # Параметры скоринга
+    if hasattr(args, 'score_margin') and args.score_margin is not None:
+        config_dict['scoring']['score_margin'] = args.score_margin
+    if hasattr(args, 'score_ratio') and args.score_ratio is not None:
+        config_dict['scoring']['score_ratio'] = args.score_ratio
+    if hasattr(args, 'score_confidence') and args.score_confidence is not None:
+        config_dict['scoring']['score_confidence'] = args.score_confidence
     
     # Пути к моделям
     if hasattr(args, 'sam_checkpoint') and args.sam_checkpoint:
