@@ -431,16 +431,38 @@ class EmbeddingExtractor:
             class_pos: dict[str, np.ndarray] — по каждому классу массив [N_cls, D]
             q_neg: np.ndarray — массив отрицательных эмбеддингов [N_neg, D]
         """
+        # Используем ту же модель что и для масок для совместимости размерностей
+        if not SEARCHDET_AVAILABLE:
+            print("⚠️ SearchDet недоступен для извлечения эмбеддингов примеров")
+            return {}, np.array([]).reshape(0, 512)
+        
+        # Получаем модели SearchDet (те же что используются для масок)
+        resnet, layer, transform, sam = (
+            self.detector.searchdet_resnet,
+            self.detector.searchdet_layer, 
+            self.detector.searchdet_transform,
+            self.detector.searchdet_sam
+        )
+        
         # Сначала отрицательные
         neg_list = []
         for i, img in enumerate(neg_imgs or []):
             try:
-                vec = self._get_dino_global(np.array(img))
+                # Используем get_vector с теми же параметрами что и для масок
+                vec = get_vector(img, resnet, layer, transform)
+                if hasattr(vec, 'numpy'):
+                    vec = vec.numpy()
                 if vec is not None:
                     neg_list.append(vec)
             except Exception as e:
                 print(f"   ⚠️ Ошибка с negative {i}: {e}")
-        q_neg = np.array(neg_list) if neg_list else np.array([]).reshape(0, 1024)
+        
+        # Определяем размерность на основе первого успешного вектора
+        embedding_dim = 512  # по умолчанию
+        if neg_list:
+            embedding_dim = neg_list[0].shape[0] if len(neg_list[0].shape) > 0 else 512
+        
+        q_neg = np.array(neg_list) if neg_list else np.array([]).reshape(0, embedding_dim)
         if q_neg.shape[0] > 0:
             q_neg = q_neg / (np.linalg.norm(q_neg, axis=1, keepdims=True) + 1e-8)
         
@@ -451,12 +473,15 @@ class EmbeddingExtractor:
             pos_list = []
             for i, img in enumerate(imgs or []):
                 try:
-                    vec = self._get_dino_global(np.array(img))
+                    # Используем get_vector с теми же параметрами что и для масок
+                    vec = get_vector(img, resnet, layer, transform)
+                    if hasattr(vec, 'numpy'):
+                        vec = vec.numpy()
                     if vec is not None:
                         pos_list.append(vec)
                 except Exception as e:
                     print(f"   ⚠️ Ошибка с positive '{cls}' #{i}: {e}")
-            q_pos = np.array(pos_list) if pos_list else np.array([]).reshape(0, 1024)
+            q_pos = np.array(pos_list) if pos_list else np.array([]).reshape(0, embedding_dim)
             if q_pos.shape[0] > 0:
                 q_pos = q_pos / (np.linalg.norm(q_pos, axis=1, keepdims=True) + 1e-8)
             class_pos[cls] = q_pos.astype(np.float32)

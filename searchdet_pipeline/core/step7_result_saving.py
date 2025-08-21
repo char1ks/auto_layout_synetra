@@ -168,9 +168,16 @@ class ResultSaver:
         # Конвертируем в BGR для OpenCV
         result = cv2.cvtColor(image, cv2.COLOR_RGB2BGR).copy()
         
+        # Создаём словарь цветов для классов
+        class_colors = {}
+        unique_classes = list(set(mask.get('class', 'unknown') for mask in masks))
+        for i, cls in enumerate(unique_classes):
+            class_colors[cls] = self.colors[i % len(self.colors)]
+        
         for i, mask in enumerate(masks):
-            # Используем красный цвет для всех масок (BGR формат)
-            color = (0, 0, 255)  # Красный цвет в BGR
+            # Получаем цвет для класса
+            cls = mask.get('class', 'unknown')
+            color = class_colors[cls]
             segmentation = mask['segmentation']
             bbox = mask['bbox']
             confidence = mask['confidence']
@@ -195,10 +202,19 @@ class ResultSaver:
             x, y, w, h = bbox
             cv2.rectangle(result, (x, y), (x + w, y + h), color, 2)
             
-            # Добавляем текст с confidence
-            text = f"{confidence:.2f}"
+            # Добавляем текст с классом и confidence
+            text = f"{cls}: {confidence:.2f}"
+            (text_w, text_h), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            
+            # Рисуем подложку для текста
+            text_bg_rect = (x, y - 5 - text_h, text_w, text_h + 5)
+            sub_img = result[text_bg_rect[1]:text_bg_rect[1]+text_bg_rect[3], text_bg_rect[0]:text_bg_rect[0]+text_bg_rect[2]]
+            black_rect = np.zeros(sub_img.shape, dtype=np.uint8)
+            res = cv2.addWeighted(sub_img, 0.5, black_rect, 0.5, 1.0)
+            result[text_bg_rect[1]:text_bg_rect[1]+text_bg_rect[3], text_bg_rect[0]:text_bg_rect[0]+text_bg_rect[2]] = res
+
             cv2.putText(result, text, (x, y - 5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         return result
     
@@ -215,11 +231,22 @@ class ResultSaver:
             Изображение с контурами в BGR формате
         """
         result = cv2.cvtColor(image, cv2.COLOR_RGB2BGR).copy()
+        overlay = result.copy()
+        
+        # Создаём словарь цветов для классов
+        class_colors = {}
+        unique_classes = list(set(mask.get('class', 'unknown') for mask in masks))
+        for i, cls in enumerate(unique_classes):
+            class_colors[cls] = self.colors[i % len(self.colors)]
         
         for i, mask in enumerate(masks):
-            # Используем красный цвет для всех контуров (BGR формат)
-            color = (0, 0, 255)  # Красный цвет в BGR
+            # Получаем цвет для класса
+            cls = mask.get('class', 'unknown')
+            color = class_colors[cls]
             segmentation = mask['segmentation']
+            
+            # Добавляем полупрозрачную заливку
+            overlay[segmentation] = color
             
             # Находим и рисуем контуры
             contours, _ = cv2.findContours(
@@ -228,6 +255,19 @@ class ResultSaver:
                 cv2.CHAIN_APPROX_SIMPLE
             )
             cv2.drawContours(result, contours, -1, color, 3)
+            
+            # Добавляем подпись с классом
+            if contours:
+                # Находим центр контура для размещения текста
+                M = cv2.moments(contours[0])
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    cv2.putText(result, cls, (cx-20, cy), cv2.FONT_HERSHEY_SIMPLEX, 
+                               0.7, (255, 255, 255), 2)
+        
+        # Смешиваем оригинал с заливкой
+        cv2.addWeighted(overlay, 0.3, result, 0.7, 0, result)
         
         return result
     
@@ -246,8 +286,15 @@ class ResultSaver:
         h, w = image_shape[:2]
         semantic_mask = np.zeros((h, w, 3), dtype=np.uint8)
         
+        # Создаём словарь цветов для классов
+        class_colors = {}
+        unique_classes = list(set(mask.get('class', 'unknown') for mask in masks))
+        for i, cls in enumerate(unique_classes):
+            class_colors[cls] = self.colors[i % len(self.colors)]
+        
         for i, mask in enumerate(masks):
-            color = self.colors[i % len(self.colors)]
+            cls = mask.get('class', 'unknown')
+            color = class_colors[cls]
             segmentation = mask['segmentation']
             semantic_mask[segmentation] = color
         
@@ -447,7 +494,7 @@ class ResultSaver:
         
         return annotations
     
-    def _generate_colors(self, num_colors: int = 100) -> List[tuple]:
+    def _generate_colors(self, num_colors: int = 20) -> List[tuple]:
         """
         Генерирует список различимых цветов для визуализации.
         
@@ -460,10 +507,12 @@ class ResultSaver:
         colors = []
         
         # Используем HSV для равномерного распределения цветов
+        # Увеличиваем шаг по hue для большей контрастности
+        hue_step = 180 / num_colors
         for i in range(num_colors):
-            hue = int(180 * i / num_colors)
+            hue = int(i * hue_step)
             saturation = 255
-            value = 255
+            value = 220 # Слегка уменьшим яркость для лучшего вида
             
             # Конвертируем HSV в BGR
             hsv_color = np.uint8([[[hue, saturation, value]]])

@@ -7,6 +7,6 @@
   --score-confidence 0.72 --score-margin -0.02 --score-ratio 0.98 \
   --consensus-k 1 --consensus-thr 0.58 \
   --nms-iou 0.60 --sam-long-side 1800 \
-  --fastsam-imgsz 1024 --fastsam-conf 0.35 --fastsam-iou 0.88 \
+  --fastsam-imgsz 1024 --fastsam-conf 0.35 --fastsam-iou 0.9 \
   --ban-border-masks --border-width 2 \
   --output output/ --verbose

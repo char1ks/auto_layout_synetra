@@ -1,0 +1,167 @@
+Да — у тебя сработал «притягивающий» позитив: вектора слишком похожи на класс `apple`, поэтому маска не «умеет отказаться». Нужно добавить **open-set отказ** (abstain): если объект ни на один класс не похож достаточно уверенно, мы НЕ классифицируем его.
+
+Ниже — точные шаги и готовые вставки кода.
+
+---
+
+# 1) Добавляем правила «не классифицировать» в `score_multiclass`
+
+В `searchdet_pipeline/core/scoring.py` **обнови** `ScoreCalculator` так, чтобы в мультиклассе маска принималась только если одновременно выполняются три условия:
+
+* `best_pos >= min_pos_score` — абсолютная уверенность по лучшему классу;
+* `best_pos - neg_score >= decision_threshold` — отрыв от негатива (фон/чужие классы);
+* `best_pos - second_best_pos >= class_separation` — отрыв от второго класса (важно для «яблоко vs банан» и твоего металла).
+
+Если хоть одно не выполняется — **`accepted=False`** и класс не присваивается.
+
+### Патч
+
+Найди в `ScoreCalculator.__init__` и добавь хранение `params` + новые дефолты:
+
+```python
+class ScoreCalculator:
+    def __init__(self, detector, params=None):
+        if params is None:
+            params = {}
+        self.detector = detector
+        self.params = params  # <— важно!
+
+        # существующие поля у тебя уже есть
+        self.margin = params.get('score_margin', -0.10)
+        self.confidence = params.get('score_confidence', 0.60)
+
+        # новые пороги для open-set
+        self.min_pos_score = params.get('min_pos_score', 0.70)          # абсолютный минимум
+        self.decision_threshold = params.get('decision_threshold', 0.10) # отрыв от негатива
+        self.class_separation = params.get('class_separation', 0.08)     # отрыв от 2-го класса
+        self.allow_unknown = params.get('allow_unknown', True)           # разрешить «unknown»
+```
+
+Теперь **замени** тело `score_multiclass` (или отредактируй его аналогично):
+
+```python
+def score_multiclass(self, mask_vecs, class_pos, q_neg):
+    N = mask_vecs.shape[0]
+    if N == 0:
+        return []
+
+    # 1) Негативы
+    if q_neg is None or q_neg.shape[0] == 0:
+        sims_neg = np.zeros((N, 0), dtype=np.float32)
+        neg_scores = np.zeros(N, dtype=np.float32)   # «фон» = 0
+    else:
+        sims_neg = mask_vecs @ q_neg.T
+        neg_scores = self._aggregate_negative(sims_neg)
+
+    # 2) Позитивы по классам → матрица [N, C]
+    classes = [c for c in (class_pos or {}).keys() if class_pos[c].shape[0] > 0]
+    if not classes:
+        return [{'accepted': False, 'class': None, 'pos_score': 0.0, 'neg_score': float(neg_scores[i]), 'confidence': 0.0} for i in range(N)]
+
+    pos_matrix = np.zeros((N, len(classes)), dtype=np.float32)
+    for j, cls in enumerate(classes):
+        q_pos = class_pos[cls]
+        sims_pos = mask_vecs @ q_pos.T
+        pos_matrix[:, j] = self._aggregate_positive(sims_pos)
+
+    # лучший и второй лучший класс
+    best_idx = np.argmax(pos_matrix, axis=1)
+    best_pos = pos_matrix[np.arange(N), best_idx]
+
+    # второй лучший (для class_separation)
+    tmp = pos_matrix.copy()
+    tmp[np.arange(N), best_idx] = -1e9
+    second_best = np.max(tmp, axis=1)
+
+    decisions = []
+    for i in range(N):
+        cls = classes[best_idx[i]]
+        pos_s = float(best_pos[i])
+        neg_s = float(neg_scores[i])
+        gap_neg = pos_s - neg_s
+        gap_cls = pos_s - float(second_best[i])
+
+        accepted = (
+            pos_s >= float(self.min_pos_score) and
+            gap_neg >= float(self.decision_threshold) and
+            gap_cls >= float(self.class_separation)
+        )
+
+        if self.allow_unknown and not accepted:
+            out_cls = None
+            conf = 0.0
+        else:
+            out_cls = cls
+            conf = np.clip(pos_s, 0.0, 1.0)
+
+        decisions.append({
+            'accepted': bool(accepted),
+            'class': out_cls,
+            'pos_score': pos_s,
+            'neg_score': neg_s,
+            'confidence': float(conf),
+            'gap_neg': float(gap_neg),
+            'gap_cls': float(gap_cls),
+        })
+    return decisions
+```
+
+> Результат: если предмет «ни на что не похож», он **получит `class=None` и будет отброшен** на этапе формирования результата.
+
+---
+
+# 2) (опционально) не сохранять «unknown» в файлы
+
+В `core/detector.py` ты уже берёшь `decisions` и добавляешь только `accepted`. Это достаточно. Если хочешь явно не сохранять маски с `class=None` даже при `accepted=True` (на будущее), оставь как есть — сейчас `accepted=False` для unknown, они не попадут в saver.
+
+---
+
+# 3) (опционально) жёстче разделять классы на скоринге
+
+Если видишь, что `apple` и «металл» часто путаются, можно чуть повысить дефолты:
+
+* `min_pos_score` → `0.75`
+* `decision_threshold` → `0.12`
+* `class_separation` → `0.10`
+
+Добавь их в `params` при создании `ScoreCalculator` (или пробрось через твой CLI):
+
+```
+--score-confidence 0.75      # маппим на min_pos_score
+--score-margin 0.12          # маппим на decision_threshold
+--class-separation 0.10      # новый флаг, если прокинешь в params
+```
+
+Если CLI пока не прокидывает `class_separation` и `allow_unknown`, просто полагайся на **дефолты из кода** выше.
+
+---
+
+# 4) (сильно помогает) нормальные негативы
+
+Положи в `examples/negative/`:
+
+* 10–30 фонов (стол, полки, руки и т.п.),
+* то, **что не является** ни `apple`, ни `banana`, но визуально близко (красные пластиковые детали, круглые формы).
+  Это сильно повышает `neg_score` и облегчает отказ.
+
+---
+
+# 5) (если ещё будет липнуть) усили варианты фич
+
+* Запусти на более низком слое (`--layer layer2` уже сделал — ок).
+* В `embeddings.py` переключи агрегацию маски на **mean+max** (увеличивает различимость):
+
+  * вместо чистого average добавь `vec = concat(mean, max)` и затем L2-нормируй.
+
+---
+
+## Проверка на твоём `metal.jpg`
+
+После правок из п.1:
+
+* у тебя для металла было: `apple=0.945, banana=0.910`, **gap\_cls=0.035 — ниже нового `class_separation=0.08`** ⇒ **отказ (unknown)**;
+* также `gap_neg ≈ 0.081`; при `decision_threshold=0.10` — тоже отказ.
+
+Т.е. детекция **не пройдёт** и класс **не присвоится**, чего мы и хотим.
+
+Если хочешь — могу прислать минутный патч, который добавит флаг `--class-separation` в CLI и прокинет его в `ScoreCalculator.params`.

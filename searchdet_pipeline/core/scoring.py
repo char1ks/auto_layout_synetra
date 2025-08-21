@@ -15,7 +15,7 @@ class ScoreCalculator:
             params = {}
             
         self.detector = detector
-        
+        self.params = params 
         # Загружаем параметры скоринга
         self.margin = params.get('score_margin', -0.10)
         self.ratio = params.get('score_ratio', 0.80)
@@ -25,6 +25,12 @@ class ScoreCalculator:
         # Консенсус
         self.consensus_k = params.get('consensus_k', 3)
         self.consensus_thr = params.get('consensus_thr', 0.60)
+
+        # новые пороги для open-set
+        self.min_pos_score = params.get('min_pos_score', 0.70)          # абсолютный минимум
+        self.decision_threshold = params.get('decision_threshold', 0.10) # отрыв от негатива
+        self.class_separation = params.get('class_separation', 0.08)     # отрыв от 2-го класса
+        self.allow_unknown = params.get('allow_unknown', True)
     
     def score_and_decide(self, mask_vecs, q_pos, q_neg):
         """Вычисляет скоры и принимает решения."""
@@ -152,33 +158,91 @@ class ScoreCalculator:
             sims_neg = np.zeros((N, 0), dtype=np.float32)
             neg_scores = np.zeros(N, dtype=np.float32)
         else:
-            sims_neg = mask_vecs @ q_neg.T  # косинус если вектора уже L2-нормированы
+            sims_neg = self._cosine_matrix(mask_vecs, q_neg)  # правильное косинусное сходство
             neg_scores = self._aggregate_negative(sims_neg)
         
-        # По классам
-        best_cls = [None]*N
-        best_pos = np.zeros(N, dtype=np.float32)
+        # По классам - собираем все скоры сначала
+        class_scores = {}  # {class_name: np.array of scores}
+        print(f"🔍 ЭТАП 3: Сопоставление с positive/negative по классам...")
         for cls, q_pos in (class_pos or {}).items():
             if q_pos is None or q_pos.shape[0] == 0:
                 continue
-            sims_pos = mask_vecs @ q_pos.T
+            sims_pos = self._cosine_matrix(mask_vecs, q_pos)  # правильное косинусное сходство
             pos_scores = self._aggregate_positive(sims_pos)
-            # Обновляем лучший класс по pos_score
-            better = pos_scores > best_pos
-            best_pos = np.where(better, pos_scores, best_pos)
-            for i in range(N):
-                if better[i]:
-                    best_cls[i] = cls
+            class_scores[cls] = pos_scores
+            print(f"   Класс '{cls}': скоры={[f'{s:.3f}' for s in pos_scores]}")
         
-        # Итоговые решения
+        # Теперь для каждой маски выбираем класс с максимальным скором
+        best_cls = [None]*N
+        best_pos = np.zeros(N, dtype=np.float32)
+        
+        for i in range(N):
+            best_score = -1.0
+            best_class = None
+            
+            # Находим класс с максимальным скором для маски i
+            for cls, scores in class_scores.items():
+                if scores[i] > best_score:
+                    best_score = scores[i]
+                    best_class = cls
+            
+            best_pos[i] = best_score
+            best_cls[i] = best_class
+            
+            # Отладочная информация с проверкой
+            scores_info = ", ".join([f"{cls}={scores[i]:.3f}" for cls, scores in class_scores.items()])
+            
+            # Дополнительная проверка: найдем реальный максимум
+            actual_max_score = max([scores[i] for scores in class_scores.values()])
+            actual_max_class = None
+            for cls, scores in class_scores.items():
+                if scores[i] == actual_max_score:
+                    actual_max_class = cls
+                    break
+            
+            print(f"     Маска {i}: [{scores_info}] -> выбран {best_class} ({best_score:.3f})")
+            if best_class != actual_max_class:
+                print(f"     ⚠️  ОШИБКА: должен быть выбран {actual_max_class} ({actual_max_score:.3f})!")
+                # Исправляем
+                best_pos[i] = actual_max_score
+                best_cls[i] = actual_max_class
+        
+        # Отладочная информация
+        print(f"📊 Скоры мультикласса: pos_avg={np.mean(best_pos):.3f}, neg_avg={np.mean(neg_scores):.3f}")
+        print(f"📊 Диапазоны: pos=[{np.min(best_pos):.3f}, {np.max(best_pos):.3f}], neg=[{np.min(neg_scores):.3f}, {np.max(neg_scores):.3f}]")
+        
+        # Итоговые решения с адаптивными порогами
         decisions = []
-        threshold = float(self.params.get('decision_threshold', 0.15))  # gap между pos и neg
-        min_pos = float(self.params.get('min_pos_score', 0.55))
+        # Понижаем пороги для случаев с низким различием
+        min_pos = float(self.params.get('min_pos_score', 0.40))  # понижен с 0.50
+        threshold = float(self.params.get('decision_threshold', -0.10))  # понижен для большей гибкости
+        
+        # Адаптивная логика: если все скоры близки, используем относительное сравнение
+        pos_range = np.max(best_pos) - np.min(best_pos)
+        neg_range = np.max(neg_scores) - np.min(neg_scores)
+        adaptive_mode = pos_range < 0.1 and neg_range < 0.1  # если диапазон мал
+        
+        print(f"🎯 Пороги: min_pos={min_pos:.3f}, threshold={threshold:.3f}, adaptive_mode={adaptive_mode}")
+        
+        accepted_count = 0
         for i in range(N):
             pos_s = float(best_pos[i])
             neg_s = float(neg_scores[i])
             conf = pos_s - neg_s
-            accepted = (pos_s >= min_pos) and (conf >= threshold) and (best_cls[i] is not None)
+            
+            if adaptive_mode:
+                # В адаптивном режиме принимаем лучшие маски относительно других
+                pos_rank = np.sum(best_pos <= pos_s) / len(best_pos)  # ранг от 0 до 1
+                accepted = (pos_rank >= 0.5) and (best_cls[i] is not None) and (pos_s > neg_s)
+                print(f"   Маска {i}: класс={best_cls[i]}, pos={pos_s:.3f}, neg={neg_s:.3f}, diff={conf:+.3f}, rank={pos_rank:.2f}, принято={accepted}")
+            else:
+                # Стандартная логика
+                accepted = (pos_s >= min_pos) and (conf >= threshold) and (best_cls[i] is not None)
+                print(f"   Маска {i}: класс={best_cls[i]}, pos={pos_s:.3f}, neg={neg_s:.3f}, diff={conf:+.3f}, принято={accepted}")
+            
+            if accepted:
+                accepted_count += 1
+            
             decisions.append({
                 'accepted': bool(accepted),
                 'class': best_cls[i],
@@ -186,4 +250,6 @@ class ScoreCalculator:
                 'neg_score': neg_s,
                 'confidence': float(np.clip(pos_s, 0.0, 1.0))  # совместимо с текущим UI
             })
+        
+        print(f"🎯 Принято {accepted_count} из {N} масок")
         return decisions
