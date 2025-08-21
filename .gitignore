@@ -1,0 +1,147 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+.env/
+
+# PyCharm
+.idea/
+*.iws
+*.iml
+*.ipr
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Machine Learning Models & Data (все модели скачиваются автоматически)
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# Директории с моделями (создаются автоматически)
+models/
+weights/
+checkpoints/
+data/
+datasets/
+
+# LLaVA (клонируется автоматически)
+LLaVA/
+llava_models/
+clip_models/
+
+# FastSAM модели (скачиваются автоматически)
+FastSAM/
+FastSAM-*.pt
+
+# HuggingFace cache (модели скачиваются в кэш)
+.cache/
+transformers_cache/
+huggingface/
+
+# Output files
+output/
+results/
+logs/
+runs/
+wandb/
+tensorboard/
+
+# Images and Videos (except test samples)
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.mp4
+*.avi
+*.mov
+*.mkv
+# Keep example images
+!001.png
+!input/test_*.jpg
+!input/test_*.png
+
+# System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Windows
+*.lnk
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.out
+*.err
+
+# CUDA cache
+.nv/
+
+# HuggingFace cache
+.cache/
+transformers_cache/
+huggingface/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Package files
+requirements_lock.txt
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json 
