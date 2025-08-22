@@ -10,6 +10,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 import hashlib
 import pickle
 from segment_anything_hq import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
+import timm
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
@@ -162,14 +163,28 @@ def initialize_models():
     total_init_start = time.time()
     print("🚀 Инициализация SearchDet моделей...")
     
-    # Load ResNet model
-    resnet_start = time.time()
-    print("📦 Загружаем ResNet101...")
-    resnet_model = models.resnet101(pretrained=True)
-    layer = resnet_model._modules.get('avgpool')
-    resnet_model.eval()
-    resnet_time = time.time() - resnet_start
-    print(f"   ⏱️ ResNet101 загружен за: {resnet_time:.3f} сек")
+    # Load DINOv2 model by default
+    dino_start = time.time()
+    print("🧠 Загружаем DINOv2 модель...")
+    try:
+        # Используем DINOv2 base модель по умолчанию
+        dino_model = timm.create_model('vit_base_patch14_dinov2.lvd142m', pretrained=True)
+        dino_model.eval()
+        layer = None  # DINOv2 не использует слои как ResNet
+        dino_time = time.time() - dino_start
+        print(f"   ⏱️ DINOv2 модель загружена за: {dino_time:.3f} сек")
+        model = dino_model
+    except Exception as e:
+        print(f"⚠️ Не удалось загрузить DINOv2, используем ResNet как fallback: {e}")
+        # Fallback to ResNet
+        resnet_start = time.time()
+        print("📦 Загружаем ResNet101...")
+        resnet_model = models.resnet101(pretrained=True)
+        layer = resnet_model._modules.get('avgpool')
+        resnet_model.eval()
+        resnet_time = time.time() - resnet_start
+        print(f"   ⏱️ ResNet101 загружен за: {resnet_time:.3f} сек")
+        model = resnet_model
 
     # Define transformation pipeline
     feat_short_side = int(os.getenv('SEARCHDET_FEAT_SHORT_SIDE', '384'))
@@ -239,45 +254,63 @@ def initialize_models():
     print(f"   ⏱️ SAM-HQ загружена за: {sam_time:.3f} сек")
     print(f"🎉 Общее время инициализации моделей: {total_init_time:.3f} сек")
 
-    return resnet_model, layer, transform, sam
+    return model, layer, transform, sam
 
 
-# Function to extract features from an image using ResNet
+# Function to extract features from an image using DINOv2 or ResNet
 def get_vector(image, model, layer, transform):
     t_img = transform(image).unsqueeze(0)
     
-    # 🔧 Динамически определяем размерность на основе фактического выхода
-    temp_embedding = None
-
-    def copy_data(m, i, o):
-        nonlocal temp_embedding
-        # Берем feature map и делаем Global Average Pooling как в быстром методе
-        if len(o.shape) == 4:  # [B, C, H, W]
-            pooled = torch.nn.functional.adaptive_avg_pool2d(o, (1, 1))
-            temp_embedding = pooled.flatten()
-        else:
-            temp_embedding = o.flatten()
-
-    # Уважаем переданный layer: строка ('layer2', 'layer3', ...) или модуль
-    target_layer = None
-    if isinstance(layer, str) and hasattr(model, layer):
-        blk = getattr(model, layer)
-        target_layer = blk[-1] if isinstance(blk, torch.nn.Sequential) else blk
-    elif isinstance(layer, torch.nn.Module):
-        target_layer = layer
+    # Проверяем, является ли модель DINOv2
+    model_name = model.__class__.__name__.lower()
+    if 'vit' in model_name or hasattr(model, 'forward_features'):
+        # DINOv2 модель - используем прямой вызов
+        with torch.no_grad():
+            if hasattr(model, 'forward_features'):
+                # Для timm DINOv2 моделей
+                features = model.forward_features(t_img)
+                if hasattr(features, 'shape') and len(features.shape) == 3:
+                    # [B, N, D] -> берем CLS токен [B, D]
+                    temp_embedding = features[:, 0, :].flatten()
+                else:
+                    temp_embedding = features.flatten()
+            else:
+                # Стандартный forward
+                output = model(t_img)
+                temp_embedding = output.flatten()
     else:
-        # Fallback: старые эвристики
-        if hasattr(model, 'layer3'):
-            target_layer = model.layer3[-1]
-        elif hasattr(model, 'layer4'):
-            target_layer = model.layer4[-1]
-        else:
+        # ResNet модель - используем hook на слой
+        temp_embedding = None
+
+        def copy_data(m, i, o):
+            nonlocal temp_embedding
+            # Берем feature map и делаем Global Average Pooling как в быстром методе
+            if len(o.shape) == 4:  # [B, C, H, W]
+                pooled = torch.nn.functional.adaptive_avg_pool2d(o, (1, 1))
+                temp_embedding = pooled.flatten()
+            else:
+                temp_embedding = o.flatten()
+
+        # Уважаем переданный layer: строка ('layer2', 'layer3', ...) или модуль
+        target_layer = None
+        if isinstance(layer, str) and hasattr(model, layer):
+            blk = getattr(model, layer)
+            target_layer = blk[-1] if isinstance(blk, torch.nn.Sequential) else blk
+        elif isinstance(layer, torch.nn.Module):
             target_layer = layer
-    
-    h = target_layer.register_forward_hook(copy_data)
-    with torch.no_grad():
-        model(t_img)
-    h.remove()
+        else:
+            # Fallback: старые эвристики
+            if hasattr(model, 'layer3'):
+                target_layer = model.layer3[-1]
+            elif hasattr(model, 'layer4'):
+                target_layer = model.layer4[-1]
+            else:
+                target_layer = layer
+        
+        h = target_layer.register_forward_hook(copy_data)
+        with torch.no_grad():
+            model(t_img)
+        h.remove()
     
     if temp_embedding is None:
         # Fallback - создаем вектор стандартной размерности

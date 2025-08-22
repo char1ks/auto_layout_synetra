@@ -43,24 +43,31 @@ class SearchDetDetector:
         self.sam_encoder = self.params.get('sam_encoder', 'vit_l')
         self.sam_model = self.params.get('sam_model', None)
         
-        # Устанавливаем переменную окружения для оптимального feature map
-        feat_short = str(self.params.get('feat_short_side', 384))
-        os.environ['SEARCHDET_FEAT_SHORT_SIDE'] = feat_short
-        print(f"🔧 Установлено SEARCHDET_FEAT_SHORT_SIDE={feat_short}")
+        # Выбор бэкенда эмбеддингов - по умолчанию DINOv2
+        self.backbone = self.params.get('backbone', 'dinov2_b')
+        
+        # Устанавливаем переменную окружения для оптимального feature map только для не-DINOv2
+        if not self.backbone.startswith('dinov2'):
+            feat_short = str(self.params.get('feat_short_side', 384))
+            os.environ['SEARCHDET_FEAT_SHORT_SIDE'] = feat_short
+            print(f"🔧 Установлено SEARCHDET_FEAT_SHORT_SIDE={feat_short}")
+        else:
+            print(f"🔧 DINOv2 бэкенд: используется собственный размер модели")
         print(f"🔧 Выбран SAM энкодер: {self.sam_encoder}")
 
         self.searchdet_resnet, self.searchdet_layer, self.searchdet_transform, self.searchdet_sam = init_searchdet()
-        # Выбор бэкенда эмбеддингов
-        self.backbone = self.params.get('backbone', 'resnet101')
         
-        # Переопределяем трансформацию
-        import torchvision.transforms as transforms
-        feat_short_side = int(os.getenv('SEARCHDET_FEAT_SHORT_SIDE', '384'))
-        self.searchdet_transform = transforms.Compose([
-            transforms.Resize(feat_short_side),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
+        # Переопределяем трансформацию только для не-DINOv2
+        if not self.backbone.startswith('dinov2'):
+            import torchvision.transforms as transforms
+            feat_short_side = int(os.getenv('SEARCHDET_FEAT_SHORT_SIDE', '384'))
+            self.searchdet_transform = transforms.Compose([
+                transforms.Resize(feat_short_side),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+        else:
+            print(f"🔧 DINOv2: трансформация будет определена в EmbeddingExtractor")
         
         self.searchdet_layer = self.params.get('layer', 'layer3')
         print(f"🔧 Используется слой для эмбеддингов: {self.searchdet_layer}")
@@ -167,10 +174,16 @@ class SearchDetDetector:
         result_masks = []
         candidates = []
         H, W = image_np.shape[:2]
+        print(f"\n🔍 Processing {len(decisions)} decisions...")
         for i, dec in enumerate(decisions):
+            print(f"  - Decision {i}: accepted={dec.get('accepted')}, class='{dec.get('class')}', confidence={dec.get('confidence', 0.0):.3f}")
             if not dec.get('accepted'):
+                print(f"    -> SKIPPED (not accepted)")
                 continue
+
             original_idx = idx_map[i]
+            print(f"    -> ACCEPTED. Original mask index: {original_idx}")
+            
             mask_dict = masks[original_idx].copy()
             confidence = float(np.clip(dec.get('confidence', 0.0), 0.0, 1.0))
             mask_dict['confidence'] = confidence
@@ -183,15 +196,25 @@ class SearchDetDetector:
                 bbox_xyxy = [int(x1), int(y1), int(x1 + w), int(y1 + h)]
             else:
                 bbox_xyxy = [int(bx[0]), int(bx[1]), int(bx[2]), int(bx[3])]
+            # Стабильный ярлык класса (строка); если нет — "__unknown__"
+            cls_label = dec.get('class')
+            try:
+                cls_label = str(cls_label) if cls_label is not None else "__unknown__"
+            except Exception:
+                cls_label = "__unknown__"
+            
+            print(f"    -> Appending candidate: class='{cls_label}', confidence={confidence:.3f}")
             candidates.append({
                 'mask': mask_dict['segmentation'].astype(bool),
                 'bbox_xyxy': bbox_xyxy,
                 'confidence': confidence,
                 'area': int(mask_dict['area']),
-                'class': mask_dict.get('class')
+                'class': cls_label,
             })
         # NMS по боксам
-        kept = self._nms(candidates)
+        from collections import Counter
+        print("NMS candidates by class:", Counter([c.get('class') for c in candidates]))
+        kept = self._nms(candidates, class_aware=True)
         for e in kept:
             seg = e['mask']
             x1, y1, x2, y2 = e['bbox_xyxy']
@@ -245,35 +268,70 @@ class SearchDetDetector:
             "saved_files": saved_files
         }
 
-    def _iou_xyxy(self, a, b):
-        ax1, ay1, ax2, ay2 = a
-        bx1, by1, bx2, by2 = b
-        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-        iw, ih = max(0, ix2 - ix1 + 1), max(0, iy2 - iy1 + 1)
-        inter = iw * ih
-        aarea = (ax2 - ax1 + 1) * (ay2 - ay1 + 1)
-        barea = (bx2 - bx1 + 1) * (by2 - by1 + 1)
-        union = aarea + barea - inter
-        return inter / union if union > 0 else 0.0
+    def _mask_iou(self, mask_a, mask_b):
+        """Рассчитывает IoU для двух бинарных масок."""
+        intersection = np.logical_and(mask_a, mask_b).sum()
+        union = np.logical_or(mask_a, mask_b).sum()
+        return intersection / union if union > 0 else 0.0
 
-    def _nms(self, elements):
-        if len(elements) <= 1:
-            return elements
-        order = sorted(range(len(elements)), key=lambda i: elements[i]['confidence'], reverse=True)
-        keep, taken = [], set()
-        for i in order:
-            if i in taken:
-                continue
-            keep.append(elements[i])
-            bi = elements[i]['bbox_xyxy']
-            for j in order:
-                if j == i or j in taken:
-                    continue
-                bj = elements[j]['bbox_xyxy']
-                if self._iou_xyxy(bi, bj) >= self.nms_iou:
-                    taken.add(j)
-        return keep
+    def _nms(self, elements, class_aware=True, class_thresholds=None): 
+        """ 
+        Class-aware NMS по маскам. 
+        - elements: список словарей c ключами: {'mask': bool[H,W], 'bbox_xyxy': [x1,y1,x2,y2], 'confidence': float, 'class': <label>} 
+        - class_aware: если True, подавление выполняется ТОЛЬКО внутри одного класса 
+        - class_thresholds: опционально словарь {class_label: iou_thr}; иначе self.nms_iou 
+        Возвращает: список отобранных элементов той же структуры. 
+        """ 
+        if not elements: 
+            return [] 
+
+        from collections import defaultdict 
+
+        def _class_key(v): 
+            # делаем стабильный ключ класса (строка), чтобы не смешивать None/числа/объекты 
+            if v is None: 
+                return "__unknown__" 
+            # numpy-скаляры и пр. 
+            try: 
+                return str(v) 
+            except Exception: 
+                return repr(v) 
+
+        # Группировка по классу (или всё вместе, если class_aware=False) 
+        groups = defaultdict(list) 
+        if class_aware: 
+            for el in elements: 
+                groups[_class_key(el.get('class'))].append(el) 
+        else: 
+            groups["__all__"] = list(elements) 
+
+        kept_all = [] 
+        for cls_key, group in groups.items(): 
+            if not group: 
+                continue 
+
+            # Сортировка по confidence по убыванию 
+            group.sort(key=lambda e: float(e.get('confidence', 0.0)), reverse=True) 
+
+            # Порог IoU для этого класса (если задан) 
+            iou_thr = (class_thresholds or {}).get(cls_key, self.nms_iou) 
+
+            kept_cls = [] 
+            while group: 
+                cur = group.pop(0) 
+                kept_cls.append(cur) 
+                cur_mask = cur['mask'] 
+
+                remaining = [] 
+                for other in group: 
+                    # подавляем только с теми, кто СИЛЬНО перекрывается в маске 
+                    if self._mask_iou(cur_mask, other['mask']) < iou_thr: 
+                        remaining.append(other) 
+                group = remaining 
+
+            kept_all.extend(kept_cls) 
+
+        return kept_all
 
     def _load_example_images(self, dir_path):
         """Загружает изображения из папки."""

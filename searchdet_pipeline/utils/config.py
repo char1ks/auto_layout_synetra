@@ -75,6 +75,7 @@ class Config:
     # Технические настройки
     auto_install: bool = True
     device: str = "auto"  # auto, cpu, cuda, mps
+    backbone: str = "dinov2_b"  # dinov2_b, dinov2_s, dinov2_l, dinov2_g, resnet101
     
     @classmethod
     def from_dict(cls, config_dict: dict) -> 'Config':

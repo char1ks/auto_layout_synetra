@@ -177,6 +177,9 @@ class ResultSaver:
         for i, mask in enumerate(masks):
             # Получаем цвет для класса
             cls = mask.get('class', 'unknown')
+            # Обрабатываем случай, когда класс может быть None
+            if cls is None:
+                cls = 'unknown'
             color = class_colors[cls]
             segmentation = mask['segmentation']
             bbox = mask['bbox']
@@ -206,14 +209,25 @@ class ResultSaver:
             text = f"{cls}: {confidence:.2f}"
             (text_w, text_h), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             
-            # Рисуем подложку для текста
-            text_bg_rect = (x, y - 5 - text_h, text_w, text_h + 5)
-            sub_img = result[text_bg_rect[1]:text_bg_rect[1]+text_bg_rect[3], text_bg_rect[0]:text_bg_rect[0]+text_bg_rect[2]]
-            black_rect = np.zeros(sub_img.shape, dtype=np.uint8)
-            res = cv2.addWeighted(sub_img, 0.5, black_rect, 0.5, 1.0)
-            result[text_bg_rect[1]:text_bg_rect[1]+text_bg_rect[3], text_bg_rect[0]:text_bg_rect[0]+text_bg_rect[2]] = res
+            # Рисуем подложку для текста, проверяя границы
+            y_text = max(text_h + 5, y)  # Убедимся, что текст не выходит за верхнюю границу
+            text_bg_rect = (x, y_text - text_h - 5, text_w, text_h + 5)
+            
+            # Проверяем, что координаты не отрицательные
+            if text_bg_rect[1] >= 0 and text_bg_rect[0] >= 0 and text_bg_rect[2] > 0 and text_bg_rect[3] > 0:
+                # Проверяем, что не выходим за границы изображения
+                max_h, max_w = result.shape[:2]
+                if (text_bg_rect[1] + text_bg_rect[3] <= max_h and 
+                    text_bg_rect[0] + text_bg_rect[2] <= max_w):
+                    sub_img = result[text_bg_rect[1]:text_bg_rect[1]+text_bg_rect[3], 
+                                     text_bg_rect[0]:text_bg_rect[0]+text_bg_rect[2]]
+                    black_rect = np.zeros(sub_img.shape, dtype=np.uint8)
+                    res = cv2.addWeighted(sub_img, 0.5, black_rect, 0.5, 1.0)
+                    result[text_bg_rect[1]:text_bg_rect[1]+text_bg_rect[3], 
+                           text_bg_rect[0]:text_bg_rect[0]+text_bg_rect[2]] = res
 
-            cv2.putText(result, text, (x, y - 5), 
+            # Рисуем текст
+            cv2.putText(result, text, (x, max(y, text_h + 5) - 5), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         return result

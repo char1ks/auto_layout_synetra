@@ -141,7 +141,7 @@ def _add_detect_arguments(parser: argparse.ArgumentParser):
 
     # Пути к моделям и параметры эмбеддингов
     parser.add_argument('--backbone', choices=['resnet101','dinov2_s','dinov2_b','dinov2_l','dinov2_g'],
-                       help='Бэкенд эмбеддингов: ResNet101 (по умолчанию) или DINOv2 варианты')
+                       help='Бэкенд эмбеддингов: DINOv2 base (по умолчанию) или другие варианты')
     parser.add_argument('--layer', help='Слой для извлечения эмбеддингов (например, layer3)', default='layer3')
     parser.add_argument('--feat-short-side', type=int, help='Короткая сторона входа фич (например, 384/512/576)')
     parser.add_argument('--sam-checkpoint', help='Путь к checkpoint SAM-HQ')
