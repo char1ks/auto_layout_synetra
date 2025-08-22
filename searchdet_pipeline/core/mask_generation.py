@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Генерация масок через различные бэкенды (SAM-HQ, FastSAM, SAM2).
-"""
-
 import os
 import sys
 import subprocess
@@ -14,12 +10,11 @@ import urllib.request
 
 
 def _pip_install(requirement: str) -> bool:
-    """Возвращает True, если установка прошла успешно."""
     try:
         cmd = f"{sys.executable} -m pip install -U {requirement}"
         print(f"   ⬇️ pip: {cmd}")
         res = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, text=True)
-        print(res.stdout[-1000:])  # последние строки лога
+        print(res.stdout[-1000:])
         return res.returncode == 0
     except Exception as e:
         print(f"   ⚠️ pip ошибка: {e}")
@@ -27,9 +22,8 @@ def _pip_install(requirement: str) -> bool:
 
 
 def _ensure_ultralytics(auto_install: bool = True):
-    """Гарантирует, что импорт ultralytics возможен."""
     try:
-        from ultralytics import FastSAM  # noqa: F401
+        from ultralytics import FastSAM
         return True
     except Exception as e:
         print(f"   ℹ️ ultralytics не найден: {e}")
@@ -40,7 +34,7 @@ def _ensure_ultralytics(auto_install: bool = True):
             print("   ❌ Не удалось установить ultralytics.")
             return False
         try:
-            from ultralytics import FastSAM  # noqa: F401
+            from ultralytics import FastSAM
             return True
         except Exception as e2:
             print(f"   ❌ Импорт ultralytics всё ещё не работает: {e2}")
@@ -48,7 +42,6 @@ def _ensure_ultralytics(auto_install: bool = True):
 
 
 def _load_fastsam_model(model_path: str | None):
-    """Возвращает объект FastSAM."""
     if not _ensure_ultralytics(auto_install=True):
         raise RuntimeError("Не удалось подготовить ultralytics/FastSAM.")
 
@@ -57,15 +50,12 @@ def _load_fastsam_model(model_path: str | None):
     except Exception:
         from ultralytics.models.fastsam import FastSAM
 
-    # Создадим папку models/
     Path("models").mkdir(parents=True, exist_ok=True)
 
-    # Если указан путь и файл существует — грузим по нему
     if model_path and os.path.exists(model_path):
         print(f"   ✅ FastSAM веса найдены локально: {model_path}")
         return FastSAM(model_path)
 
-    # Иначе пробуем автозагрузку
     for name in [model_path, "FastSAM-x.pt", "FastSAM-s.pt"]:
         if not name:
             continue
@@ -79,15 +69,12 @@ def _load_fastsam_model(model_path: str | None):
 
 
 class MaskGenerator:
-    """Генератор масок через различные бэкенды."""
-    
     def __init__(self, detector):
         self.detector = detector
         self._fastsam_model = None
         self._sam_generator = None
         
     def generate(self, image_np):
-        """Генерирует маски для изображения."""
         print(f"🚀 ЭТАП 1: {self.detector.mask_backend.upper()} автогенерация масок")
         
         if self.detector.mask_backend == "fastsam":
@@ -98,10 +85,8 @@ class MaskGenerator:
             raise ValueError(f"Неподдерживаемый бэкенд: {self.detector.mask_backend}")
     
     def _generate_fastsam_masks(self, image_np):
-        """Генерация масок через FastSAM."""
         import torch, cv2, time
         
-        # Инициализируем модель если нужно
         if self._fastsam_model is None:
             print("⬇️ Автодокачка FastSAM...")
             self._fastsam_model = _load_fastsam_model(getattr(self.detector, 'fastsam_model', None))
@@ -120,7 +105,6 @@ class MaskGenerator:
             run_img = cv2.resize(image_np, (int(W0 * scale), int(H0 * scale)), interpolation=cv2.INTER_LINEAR)
         h, w = run_img.shape[:2]
         
-        # Параметры FastSAM
         imgsz = getattr(self.detector, 'fastsam_imgsz', 1024)
         conf = getattr(self.detector, 'fastsam_conf', 0.4)
         iou = getattr(self.detector, 'fastsam_iou', 0.9)
@@ -129,7 +113,6 @@ class MaskGenerator:
         print(f"   на {w}x{h} (scale={scale:.3f}, imgsz={imgsz})")
         t_start = time.time()
         
-        # Запускаем FastSAM
         results = self._fastsam_model(
             source=run_img,
             imgsz=imgsz,
@@ -158,14 +141,13 @@ class MaskGenerator:
         out = []
         for seg in masks_np:
             seg_u8 = (seg > 0).astype(np.uint8)
-            # Возвращаем к исходному размеру при необходимости
             if scale != 1.0:
                 seg_u8 = cv2.resize(seg_u8, (W0, H0), interpolation=cv2.INTER_NEAREST)
             H, W = seg_u8.shape[:2]
             ys, xs = np.where(seg_u8 > 0)
             if ys.size and xs.size:
                 x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
-                bbox = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]  # XYWH
+                bbox = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
             else:
                 bbox = [0, 0, 0, 0]
             out.append({
@@ -181,10 +163,8 @@ class MaskGenerator:
         return out
     
     def _generate_sam_masks(self, image_np):
-        """Генерация масок через SAM-HQ."""
         import time
         
-        # Инициализируем модель если нужно
         if self._sam_generator is None:
             print("🎯 Инициализация SAM-HQ...")
             self._sam_generator = self._init_sam_hq()
@@ -193,7 +173,6 @@ class MaskGenerator:
         
         t_start = time.time()
         
-        # Генерируем маски
         masks = self._sam_generator.generate(image_np)
         
         t_gen = time.time() - t_start
@@ -204,9 +183,7 @@ class MaskGenerator:
         return masks
     
     def _init_sam_hq(self):
-        """Инициализация SAM-HQ модели."""
         try:
-            # Импорты SAM-HQ
             from segment_anything_hq import sam_model_registry, SamAutomaticMaskGenerator
         except ImportError:
             try:
@@ -215,8 +192,6 @@ class MaskGenerator:
             except ImportError:
                 raise RuntimeError("Не найден ни SAM-HQ, ни обычная SAM. Установите segment-anything-hq или segment-anything")
         
-        # Ищем checkpoint
-        # Сначала проверяем явно указанный путь
         sam_checkpoint = getattr(self.detector, 'sam_model', None)
         if not sam_checkpoint:
             sam_checkpoint = self._find_sam_checkpoint()
@@ -226,16 +201,13 @@ class MaskGenerator:
         
         print(f"   📦 Загружаем SAM из: {sam_checkpoint}")
         
-        # Загружаем модель
         import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        # Позволяем выбрать энкодер через detector.sam_encoder (vit_b/vit_l/vit_h)
         model_type = getattr(self.detector, 'sam_encoder', 'vit_l') or 'vit_l'
         
         sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
         sam.to(device=device)
         
-        # Создаем генератор масок
         mask_generator = SamAutomaticMaskGenerator(
             model=sam,
             points_per_side=32,
@@ -254,21 +226,17 @@ class MaskGenerator:
         return mask_generator
     
     def _find_sam_checkpoint(self):
-        """Ищет checkpoint SAM-HQ."""
         import os
         from pathlib import Path
         
-        # Определяем модель из параметров детектора
         model_type = getattr(self.detector, 'sam_encoder', 'vit_l')
         
-        # Возможные пути к checkpoint для указанной модели
         possible_paths = [
             f"sam-hq/pretrained_checkpoint/sam_hq_{model_type}.pth",
             f"models/sam_hq_{model_type}.pth", 
             f"sam_hq_{model_type}.pth",
         ]
         
-        # Если не указан конкретный тип, проверяем все варианты
         if not hasattr(self.detector, 'sam_encoder'):
             possible_paths.extend([
                 "sam-hq/pretrained_checkpoint/sam_hq_vit_l.pth",
@@ -280,25 +248,21 @@ class MaskGenerator:
                 "sam-hq/pretrained_checkpoint/sam_hq_vit_b.pth",
                 "models/sam_hq_vit_b.pth", 
                 "sam_hq_vit_b.pth",
-                # Также пути для обычной SAM
                 "models/sam_vit_l_0b3195.pth",
                 "sam_vit_l_0b3195.pth"
             ])
         
         for path in possible_paths:
-            if os.path.exists(path) and os.path.getsize(path) > 100_000_000:  # Больше 100MB
+            if os.path.exists(path) and os.path.getsize(path) > 100_000_000:
                 print(f"✅ SAM-HQ модель уже существует: {path}")
                 return path
         
-        # Попробуем автоскачивание SAM-HQ
         return self._download_sam_hq()
     
     def _download_sam_hq(self):
-        """Автоскачивание SAM-HQ модели."""
         import urllib.request
         from pathlib import Path
         
-        # Определяем модель из параметров детектора
         model_type = getattr(self.detector, 'sam_encoder', 'vit_l')
         
         sam_dir = Path("sam-hq/pretrained_checkpoint")
@@ -310,7 +274,6 @@ class MaskGenerator:
         print(f"   📥 SAM-HQ модель не найдена, скачиваем {model_type}...")
         sam_dir.mkdir(parents=True, exist_ok=True)
         
-        # URL для разных моделей
         urls = {
             'vit_b': "https://huggingface.co/lkeab/hq-sam/resolve/main/sam_hq_vit_b.pth",
             'vit_l': "https://huggingface.co/lkeab/hq-sam/resolve/main/sam_hq_vit_l.pth", 
@@ -324,7 +287,6 @@ class MaskGenerator:
         url = urls[model_type]
         print(f"🔄 Скачиваем SAM-HQ модель из {url}")
         
-        # Размеры файлов для проверки
         expected_sizes = {'vit_b': 375_000_000, 'vit_l': 1_200_000_000, 'vit_h': 2_400_000_000}
         print(f"⚠️ Это займет несколько минут (~{expected_sizes[model_type]/1_000_000_000:.1f}GB)...")
         
@@ -335,14 +297,14 @@ class MaskGenerator:
                     print(f"\r📥 Прогресс: {percent:.1f}%", end='', flush=True)
             
             urllib.request.urlretrieve(url, sam_checkpoint, reporthook=progress_hook)
-            print()  # Новая строка после прогресса
+            print()
             
-            if sam_checkpoint.stat().st_size > expected_sizes[model_type] * 0.8:  # 80% от ожидаемого размера
+            if sam_checkpoint.stat().st_size > expected_sizes[model_type] * 0.8:
                 print(f"   ✅ SAM-HQ модель скачана: {sam_checkpoint}")
                 return str(sam_checkpoint)
             else:
                 print("   ❌ Файл скачался неполностью")
-                sam_checkpoint.unlink()  # Удаляем поврежденный файл
+                sam_checkpoint.unlink()
         except Exception as e:
             print(f"   ❌ Ошибка скачивания: {e}")
         

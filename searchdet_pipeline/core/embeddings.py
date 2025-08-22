@@ -9,8 +9,6 @@ import cv2
 from PIL import Image
 import torch
 import torchvision.transforms as transforms
-
-# SearchDet импорты
 try:
     from mask_withsearch import get_vector, adjust_embedding, extract_features_from_masks
     SEARCHDET_AVAILABLE = True
@@ -18,10 +16,7 @@ except Exception as e:
     print(f"⚠️ SearchDet недоступен: {e}")
     SEARCHDET_AVAILABLE = False
 
-
 class EmbeddingExtractor:
-    """Извлечение эмбеддингов через SearchDet."""
-    
     def __init__(self, detector):
         self.detector = detector
         self.backbone = getattr(detector, 'backbone', 'dinov2_b')
@@ -60,7 +55,6 @@ class EmbeddingExtractor:
         print(f"🚀 БЫСТРОЕ извлечение эмбеддингов для {len(mask_arrays)} масок (Masked Pooling)...")
         
         try:
-            # Пробуем быстрый метод
             embeddings = self._extract_fast(image_np, mask_arrays)
             if embeddings is not None:
                 print(f"⚡ БЫСТРО: {len(mask_arrays)} масок обработано")
@@ -75,13 +69,11 @@ class EmbeddingExtractor:
         except Exception as e:
             print(f"⚠️ Быстрый метод не сработал ({e}), используем старый")
         
-        # Медленный метод как fallback
         print(f"🧠 МЕДЛЕННОЕ извлечение эмбеддингов для {len(mask_arrays)} масок...")
         try:
             embeddings = self._extract_slow(pil_image, mask_arrays)
             if embeddings is not None:
                 print(f"✅ Старый метод: обработано {len(mask_arrays)} масок")
-                # --- Нормализация форм возврата к (N, D) float32 ---
                 embeddings = np.asarray(embeddings)
                 if embeddings.ndim == 1:
                     embeddings = embeddings.reshape(1, -1)
@@ -96,11 +88,8 @@ class EmbeddingExtractor:
         return np.zeros((0, 1024), dtype=np.float32), []
     
     def _extract_fast(self, image_np, mask_arrays):
-        """Быстрое извлечение через extract_features_from_masks."""
-        # Если выбран DINOv2, используем DINO путь
         if self.backbone.startswith('dinov2'):
             return self._extract_with_dino(image_np, mask_arrays)
-        # Получаем модели SearchDet
         resnet, layer, transform, sam = (
             self.detector.searchdet_resnet,
             self.detector.searchdet_layer, 
@@ -319,7 +308,6 @@ class EmbeddingExtractor:
             return self._get_dino_global(np.array(pil_image))
 
         try:
-            # Используем get_vector из SearchDet с правильными аргументами
             vec = get_vector(pil_image, model, layer, transform)
             if isinstance(vec, np.ndarray):
                 return vec
@@ -338,7 +326,6 @@ class EmbeddingExtractor:
             except:
                 return None
 
-    # ----------------------- DINOv2 utils -----------------------
     def _ensure_dino(self):
         if self._dino_model is not None:
             return
@@ -357,7 +344,6 @@ class EmbeddingExtractor:
             self._dino_model = timm.create_model(model_name, pretrained=True)
             self._dino_model.eval()
             
-            # --- Более надёжное получение параметров DINO ---
             data_config = self._dino_model.default_cfg
             self.dino_img_size = data_config['input_size'][-1]
             
@@ -365,10 +351,7 @@ class EmbeddingExtractor:
                 patch_size = self._dino_model.patch_embed.patch_size[0]
                 self.dino_grid_size = (self.dino_img_size // patch_size, self.dino_img_size // patch_size)
             except Exception:
-                # Fallback для старых версий timm
                 self.dino_grid_size = (37, 37)
-
-            # --- Исправленный SquarePad и конвейер препроцессинга ---
             class SquarePad:
                 def __call__(self, image):
                     w, h = image.size
@@ -400,8 +383,6 @@ class EmbeddingExtractor:
         with torch.no_grad():
             pil = Image.fromarray(image_np)
             x = self._dino_preprocess(pil).unsqueeze(0)
-
-            # --- Универсальное извлечение DINO-вектора ---
             feats = self._dino_model.forward_features(x)
             
             # Обработка выхода: может быть dict или tensor
@@ -479,18 +460,11 @@ class EmbeddingExtractor:
                 continue
 
             mask_tensor = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).unsqueeze(0)
-            # Интерполяция маски до размера сетки патчей
             resized_mask = F.interpolate(mask_tensor, size=(gh, gw), mode='bilinear', align_corners=False)
             resized_mask = resized_mask.squeeze().view(-1)
-
-            # Находим индексы патчей, которые попадают в маску
             foreground_indices = torch.where(resized_mask > 0.1)[0]
-
-            # Если ни один патч не попал, берем тот, у которого максимальное перекрытие
             if len(foreground_indices) == 0:
                 foreground_indices = torch.tensor([torch.argmax(resized_mask)])
-
-            # Усредняем векторы патчей, попавших в маску
             mask_embedding = patch_tokens[foreground_indices].mean(dim=0)
 
             v = mask_embedding.cpu().float().numpy()
@@ -518,7 +492,6 @@ class EmbeddingExtractor:
         if self._dino_model is None:
             return None
         import torch
-
         embeddings = []
         with torch.no_grad():
             for mask in mask_arrays:
@@ -548,15 +521,10 @@ class EmbeddingExtractor:
 
 
     def build_queries_multiclass(self, pos_by_class, neg_imgs):
-        """Возвращает:
-          class_pos: {class_name: np.ndarray [M_cls, D]}
-          q_neg: np.ndarray [K, D]
-        """
-        # DINOv2-путь
         if str(self.backbone).startswith('dinov2'):
             self._ensure_dino()
             D = 1024
-            # negatives
+
             neg_list = []
             for i, img in enumerate(neg_imgs or []):
                 try:
@@ -567,8 +535,6 @@ class EmbeddingExtractor:
                 except Exception as e:
                     print(f"   ⚠️ Ошибка с negative {i}: {e}")
             q_neg = np.stack(neg_list, axis=0) if neg_list else np.zeros((0, D), dtype=np.float32)
-
-            # positives by class
             class_pos = {}
             if pos_by_class is None:
                 pos_by_class = {}
@@ -587,9 +553,6 @@ class EmbeddingExtractor:
                 print(f"   📊 Класс '{cls}': {Q.shape[0]} примеров")
             print(f"   📊 Negative всего: {q_neg.shape[0]}")
             return class_pos, q_neg.astype(np.float32)
-
-        # --- иначе ResNet/SearchDet-путь (без изменений логики, но с жёстким выравниванием форм) ---
-        # Получаем модели SearchDet
         resnet, layer, transform, sam = (
             self.detector.searchdet_resnet,
             self.detector.searchdet_layer,

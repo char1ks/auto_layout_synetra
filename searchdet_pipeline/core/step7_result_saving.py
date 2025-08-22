@@ -1,10 +1,3 @@
-"""
-Этап 7: СОХРАНЕНИЕ РЕЗУЛЬТАТОВ
-
-Основная задача: Сохранить все артефакты анализа в удобном для человека и машины виде:
-визуализации, маски и JSON аннотации.
-"""
-
 import cv2
 import json
 import numpy as np
@@ -16,34 +9,15 @@ from ..utils.helpers import save_json, create_output_dir
 
 
 class ResultSaver:
-    """Класс для сохранения результатов детекции."""
-    
+
     def __init__(self, overlay_alpha: float = 0.5):
-        """
-        Инициализация сейвера результатов.
-        
-        Args:
-            overlay_alpha: Прозрачность наложения масок на изображение
-        """
+
         self.overlay_alpha = overlay_alpha
         self.colors = self._generate_colors()
     
     def save_all_results(self, image: np.ndarray, final_masks: List[Dict[str, Any]],
                         output_dir: str, image_name: str,
                         pipeline_config: Optional[Dict] = None) -> Dict[str, str]:
-        """
-        Сохраняет все результаты детекции.
-        
-        Args:
-            image: Исходное изображение в RGB формате
-            final_masks: Список финальных масок
-            output_dir: Базовая директория для сохранения
-            image_name: Имя изображения
-            pipeline_config: Конфигурация пайплайна для сохранения в метаданных
-            
-        Returns:
-            Словарь с путями к сохранённым файлам
-        """
         print("\n🔄 ЭТАП 7: СОХРАНЕНИЕ РЕЗУЛЬТАТОВ")
         print("=" * 60)
         
@@ -79,18 +53,6 @@ class ResultSaver:
     
     def _save_empty_results(self, image: np.ndarray, result_dir: Path, 
                            image_name: str, pipeline_config: Optional[Dict]) -> Dict[str, str]:
-        """
-        Сохраняет результаты когда нет детекций.
-        
-        Args:
-            image: Исходное изображение
-            result_dir: Директория для сохранения
-            image_name: Имя изображения
-            pipeline_config: Конфигурация пайплайна
-            
-        Returns:
-            Словарь с сохранёнными файлами
-        """
         saved_files = {}
         
         # Сохраняем исходное изображение
@@ -111,17 +73,6 @@ class ResultSaver:
     
     def _save_visualizations(self, image: np.ndarray, masks: List[Dict[str, Any]], 
                            result_dir: Path) -> Dict[str, str]:
-        """
-        7.1. Сохранение визуализаций.
-        
-        Args:
-            image: Исходное изображение
-            masks: Список масок для визуализации
-            result_dir: Директория для сохранения
-            
-        Returns:
-            Словарь с путями к визуализациям
-        """
         print("   🎨 Создание визуализаций...")
         
         saved_files = {}
@@ -155,16 +106,6 @@ class ResultSaver:
     
     def _create_overlay_visualization(self, image: np.ndarray, 
                                     masks: List[Dict[str, Any]]) -> np.ndarray:
-        """
-        Создаёт визуализацию с полупрозрачными масками, контурами и bbox.
-        
-        Args:
-            image: Исходное изображение в RGB
-            masks: Список масок
-            
-        Returns:
-            Изображение с наложением в BGR формате
-        """
         # Конвертируем в BGR для OpenCV
         result = cv2.cvtColor(image, cv2.COLOR_RGB2BGR).copy()
         
@@ -234,16 +175,6 @@ class ResultSaver:
     
     def _create_contours_visualization(self, image: np.ndarray,
                                      masks: List[Dict[str, Any]]) -> np.ndarray:
-        """
-        Создаёт визуализацию только с контурами объектов.
-        
-        Args:
-            image: Исходное изображение в RGB
-            masks: Список масок
-            
-        Returns:
-            Изображение с контурами в BGR формате
-        """
         result = cv2.cvtColor(image, cv2.COLOR_RGB2BGR).copy()
         overlay = result.copy()
         
@@ -287,16 +218,6 @@ class ResultSaver:
     
     def _create_semantic_visualization(self, image_shape: tuple,
                                      masks: List[Dict[str, Any]]) -> np.ndarray:
-        """
-        Создаёт семантическую маску где каждый объект раскрашен уникальным цветом.
-        
-        Args:
-            image_shape: Размеры изображения (H, W, C)
-            masks: Список масок
-            
-        Returns:
-            Семантическая маска в BGR формате
-        """
         h, w = image_shape[:2]
         semantic_mask = np.zeros((h, w, 3), dtype=np.uint8)
         
@@ -316,16 +237,6 @@ class ResultSaver:
     
     def _save_individual_masks(self, masks: List[Dict[str, Any]], 
                              result_dir: Path) -> Dict[str, str]:
-        """
-        7.2. Сохранение отдельных масок.
-        
-        Args:
-            masks: Список масок
-            result_dir: Директория для сохранения
-            
-        Returns:
-            Словарь с путями к маскам
-        """
         print("   💾 Сохранение отдельных масок...")
         
         saved_files = {}
@@ -351,17 +262,6 @@ class ResultSaver:
     
     def _save_total_mask(self, masks: List[Dict[str, Any]], image_shape: tuple,
                         result_dir: Path) -> Dict[str, str]:
-        """
-        7.3. Сохранение общей маски (объединение всех детекций).
-        
-        Args:
-            masks: Список масок
-            image_shape: Размеры изображения
-            result_dir: Директория для сохранения
-            
-        Returns:
-            Словарь с путём к общей маске
-        """
         print("   🔗 Создание общей маски...")
         
         h, w = image_shape[:2]
@@ -382,19 +282,7 @@ class ResultSaver:
     def _save_annotations(self, image: np.ndarray, masks: List[Dict[str, Any]],
                          result_dir: Path, image_name: str,
                          pipeline_config: Optional[Dict]) -> Dict[str, str]:
-        """
-        7.4. Сохранение JSON аннотаций.
-        
-        Args:
-            image: Исходное изображение
-            masks: Список масок
-            result_dir: Директория для сохранения  
-            image_name: Имя изображения
-            pipeline_config: Конфигурация пайплайна
-            
-        Returns:
-            Словарь с путём к аннотациям
-        """
+
         print("   📋 Создание JSON аннотаций...")
         
         annotations = self._build_annotations(image, masks, image_name, pipeline_config)
@@ -407,18 +295,7 @@ class ResultSaver:
     
     def _build_annotations(self, image: np.ndarray, masks: List[Dict[str, Any]],
                           image_name: str, pipeline_config: Optional[Dict]) -> Dict[str, Any]:
-        """
-        Формирует детальный JSON-отчёт с метаданными и аннотациями.
-        
-        Args:
-            image: Исходное изображение
-            masks: Список масок
-            image_name: Имя изображения
-            pipeline_config: Конфигурация пайплайна
-            
-        Returns:
-            Словарь с полными аннотациями
-        """
+
         h, w = image.shape[:2]
         
         # Базовая информация
@@ -509,15 +386,6 @@ class ResultSaver:
         return annotations
     
     def _generate_colors(self, num_colors: int = 20) -> List[tuple]:
-        """
-        Генерирует список различимых цветов для визуализации.
-        
-        Args:
-            num_colors: Количество цветов для генерации
-            
-        Returns:
-            Список цветов в формате BGR
-        """
         colors = []
         
         # Используем HSV для равномерного распределения цветов
@@ -538,17 +406,7 @@ class ResultSaver:
     def create_summary_report(self, saved_files: Dict[str, str], 
                             processing_time: float,
                             final_masks: List[Dict[str, Any]]) -> str:
-        """
-        Создаёт текстовую сводку результатов.
-        
-        Args:
-            saved_files: Словарь сохранённых файлов
-            processing_time: Время обработки в секундах
-            final_masks: Список финальных масок
-            
-        Returns:
-            Текстовая сводка
-        """
+
         summary_lines = [
             "🎯 СВОДКА РЕЗУЛЬТАТОВ ДЕТЕКЦИИ",
             "=" * 50,
