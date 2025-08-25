@@ -138,7 +138,6 @@ def _add_detect_arguments(parser: argparse.ArgumentParser):
     parser.add_argument('--score-margin', type=float, help='Зазор между positive и negative скором')
     parser.add_argument('--score-ratio', type=float, help='Соотношение positive/negative скора')
     parser.add_argument('--score-confidence', type=float, help='Минимальная уверенность для скоринга')
-
     # Пути к моделям и параметры эмбеддингов
     parser.add_argument('--backbone', choices=['resnet101','dinov2_s','dinov2_b','dinov2_l','dinov2_g'],
                        help='Бэкенд эмбеддингов: DINOv2 base (по умолчанию) или другие варианты')
@@ -163,6 +162,12 @@ def _add_detect_arguments(parser: argparse.ArgumentParser):
     parser.add_argument('--fastsam-retina', dest='fastsam_retina', action='store_true', help='Включить ретина-маски в FastSAM')
     parser.add_argument('--no-fastsam-retina', dest='fastsam_retina', action='store_false', help='Выключить ретина-маски в FastSAM')
     parser.set_defaults(fastsam_retina=True)
+    
+    # 🚀 Оптимизация эмбеддингов
+    parser.add_argument('--max-embedding-size', type=int, default=1024, 
+                       help='Максимальный размер изображения для извлечения эмбеддингов (по умолчанию: 1024)')
+    parser.add_argument('--dino-half-precision', action='store_true', 
+                       help='Использовать половинную точность (float16) для DINO модели для ускорения')
 
     # Фильтр границ
     parser.add_argument('--ban-border-masks', dest='ban_border_masks', action='store_true', help='Удалять маски, касающиеся рамки')
@@ -364,6 +369,12 @@ def _execute_detect(args) -> int:
             detector_params['fastsam_conf'] = args.fastsam_conf
         if hasattr(args, 'fastsam_iou') and args.fastsam_iou is not None:
             detector_params['fastsam_iou'] = args.fastsam_iou
+            
+        # 🚀 Параметры оптимизации эмбеддингов
+        if hasattr(args, 'max_embedding_size') and args.max_embedding_size is not None:
+            detector_params['max_embedding_size'] = args.max_embedding_size
+        if hasattr(args, 'dino_half_precision') and args.dino_half_precision:
+            detector_params['dino_half_precision'] = True
         if hasattr(args, 'fastsam_retina'):
             detector_params['fastsam_retina'] = args.fastsam_retina
 
@@ -639,6 +650,17 @@ def _apply_cli_args_to_config(config, args):
     # Настройка сохранения
     if hasattr(args, 'no_save') and args.no_save:
         config_dict['save_all'] = False
+    
+    # 🚀 Оптимизация эмбеддингов
+    if hasattr(args, 'max_embedding_size') and args.max_embedding_size is not None:
+        if 'embeddings' not in config_dict:
+            config_dict['embeddings'] = {}
+        config_dict['embeddings']['max_size'] = args.max_embedding_size
+    
+    if hasattr(args, 'dino_half_precision') and args.dino_half_precision:
+        if 'embeddings' not in config_dict:
+            config_dict['embeddings'] = {}
+        config_dict['embeddings']['dino_half_precision'] = True
     
     return Config.from_dict(config_dict)
 

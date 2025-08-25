@@ -164,16 +164,53 @@ class MaskGenerator:
     
     def _generate_sam_masks(self, image_np):
         import time
+        import cv2
+        import numpy as np
         
         if self._sam_generator is None:
             print("🎯 Инициализация SAM-HQ...")
             self._sam_generator = self._init_sam_hq()
         
-        print(f"   на {image_np.shape[1]}x{image_np.shape[0]}")
+        # Добавляем масштабирование изображения для ускорения SAM-HQ
+        H0, W0 = image_np.shape[:2]
+        run_img = image_np
+        scale = 1.0
+        sam_long_side = getattr(self.detector, 'sam_long_side', None)
+        if sam_long_side and max(H0, W0) > sam_long_side:
+            if H0 >= W0:
+                scale = sam_long_side / float(H0)
+            else:
+                scale = sam_long_side / float(W0)
+            run_img = cv2.resize(image_np, (int(W0 * scale), int(H0 * scale)), interpolation=cv2.INTER_LINEAR)
+            print(f"   🔧 Масштабирование: {W0}x{H0} → {run_img.shape[1]}x{run_img.shape[0]} (scale={scale:.3f})")
+        
+        print(f"   на {run_img.shape[1]}x{run_img.shape[0]}")
         
         t_start = time.time()
         
-        masks = self._sam_generator.generate(image_np)
+        masks = self._sam_generator.generate(run_img)
+        
+        # Если изображение было масштабировано, нужно восстановить маски к оригинальному размеру
+        if scale != 1.0:
+            print(f"   🔄 Восстановление масок к оригинальному размеру {W0}x{H0}...")
+            for mask in masks:
+                # Масштабируем сегментацию обратно
+                seg = mask['segmentation']
+                seg_resized = cv2.resize(seg.astype(np.uint8), (W0, H0), interpolation=cv2.INTER_NEAREST)
+                mask['segmentation'] = seg_resized.astype(bool)
+                
+                # Пересчитываем bbox и area для оригинального размера
+                ys, xs = np.where(seg_resized)
+                if ys.size and xs.size:
+                    x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
+                    mask['bbox'] = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
+                    mask['area'] = int(seg_resized.sum())
+                else:
+                    mask['bbox'] = [0, 0, 0, 0]
+                    mask['area'] = 0
+                
+                # Обновляем crop_box
+                mask['crop_box'] = [0, 0, W0, H0]
         
         t_gen = time.time() - t_start
         

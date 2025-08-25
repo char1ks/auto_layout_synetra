@@ -57,7 +57,13 @@ class SearchDetDetector:
         self.consensus_k = int(self.params.get('consensus_k', 3))
         self.consensus_thr = float(self.params.get('consensus_thr', 0.60))
         self.nms_iou = float(self.params.get('nms_iou', 0.60))
-        self.sam_long_side = int(self.params.get('sam_long_side', 1800)) if self.params.get('sam_long_side') is not None else 1800
+        # 🚀 Параметры оптимизации эмбеддингов
+        self.max_embedding_size = self.params.get('max_embedding_size', 1024)
+        self.dino_half_precision = self.params.get('dino_half_precision', False)
+
+        # 🚀 Параметры генерации масок
+        default_sam_long = min(1800, self.max_embedding_size)
+        self.sam_long_side = int(self.params.get('sam_long_side', default_sam_long))
         self.fastsam_imgsz = int(self.params.get('fastsam_imgsz', 1024))
         self.fastsam_conf = float(self.params.get('fastsam_conf', 0.4))
         self.fastsam_iou = float(self.params.get('fastsam_iou', 0.9))
