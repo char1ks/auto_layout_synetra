@@ -1,0 +1,12 @@
+!python -m searchdet_pipeline.cli.main detect all6.png \
+  --positive examples/positive/ \
+  --negative examples/negative/ \
+  --backend fastsam \
+  --layer layer4 \
+  --min-area 0.3 --max-area 95 --nested-iou 0.85 \
+  --score-confidence 0.72 --score-margin -0.02 --score-ratio 0.98 \
+  --consensus-k 1 --consensus-thr 0.58 \
+  --nms-iou 0.60 --sam-long-side 1800 \
+  --fastsam-imgsz 1024 --fastsam-conf 0.35 --fastsam-iou 0.9 \
+  --ban-border-masks --border-width 2 \
+  --output output/ --verbose   --backbone dinov2_b
