@@ -27,6 +27,14 @@ class FilteringConfig:
     iou_threshold: float = 0.8
     min_area_frac: float = 0.0001
     max_area_frac: float = 0.8
+    
+    # Параметры умного фильтра прямоугольников
+    smart_rectangle_filter: bool = True  # Включить умный анализ прямоугольных форм
+    rectangle_bbox_iou_threshold: float = 0.85  # Минимальный IoU с bbox для четких прямоугольников
+    rectangle_straight_line_ratio: float = 0.7  # Минимальная доля прямых линий в контуре
+    rectangle_area_ratio_threshold: float = 0.9  # Минимальное отношение площади маски к контуру
+    rectangle_angle_tolerance: float = 15.0  # Допустимое отклонение углов от 90 градусов
+    rectangle_side_ratio_threshold: float = 0.8  # Минимальное отношение противоположных сторон
 
 
 @dataclass

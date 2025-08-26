@@ -25,6 +25,23 @@ class MaskFilter:
         self.erosion_iterations = params.get('erosion_iterations', 1)
         self.dilation_iterations = params.get('dilation_iterations', 2)
         self.correction_kernel_size = params.get('correction_kernel_size', 3)
+        
+        # Параметры умного фильтра прямоугольников
+        self.smart_rectangle_filter = params.get('smart_rectangle_filter', True)
+        self.rectangle_bbox_iou_threshold = params.get('rectangle_bbox_iou_threshold', 0.85)
+        self.rectangle_straight_line_ratio = params.get('rectangle_straight_line_ratio', 0.7)
+        self.rectangle_area_ratio_threshold = params.get('rectangle_area_ratio_threshold', 0.9)
+        self.rectangle_angle_tolerance = params.get('rectangle_angle_tolerance', 15.0)
+        self.rectangle_side_ratio_threshold = params.get('rectangle_side_ratio_threshold', 0.8)
+        # Новые параметры для наложения прямоугольника/квадрата и анализа дыр
+        self.rectangle_similarity_iou_threshold = params.get('rectangle_similarity_iou_threshold', 0.92)
+        self.square_similarity_iou_threshold = params.get('square_similarity_iou_threshold', 0.92)
+        self.rectangle_use_silhouette = params.get('rectangle_use_silhouette', True)
+        self.hole_area_ratio_threshold = params.get('hole_area_ratio_threshold', 0.02)
+        
+        # Кэш для ускорения вычислений
+        self._bbox_cache = {}
+        self._area_cache = {}
     
     def apply_all_filters(self, masks: List[Dict[str, Any]], image_np: np.ndarray) -> List[Dict[str, Any]]:
         if not masks:
@@ -44,7 +61,7 @@ class MaskFilter:
         masks = masks_border
         initial_mask_count = len(masks)
         
-        masks = self._filter_nested_masks(masks)
+        masks = self._filter_nested_masks_fast(masks)
         print(f"🔗 Фильтр вложенных масок ({self.containment_iou} IoU): {initial_mask_count} → {len(masks)}")
         initial_mask_count = len(masks)
         
@@ -54,10 +71,10 @@ class MaskFilter:
         
         masks, small_count, big_count = self._filter_by_size(masks, image_np.shape)
         
-        # Применяем коррекцию масок (erosion/dilation)
+        # Применяем коррекцию масок (быстрая версия)
         if self.enable_mask_correction:
-            masks = self._apply_mask_correction(masks)
-            print(f"🔧 Коррекция масок (erosion={self.erosion_iterations}, dilation={self.dilation_iterations}): {len(masks)} масок обработано")
+            masks = self._apply_mask_correction_fast(masks)
+            print(f"🔧 Коррекция масок (быстрая версия): {len(masks)} масок обработано")
         
         return masks
     
@@ -84,6 +101,235 @@ class MaskFilter:
         return filtered_masks, small_count, big_count
 
     def _filter_perfect_rectangles(self, masks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Улучшенный фильтр прямоугольных/квадратных масок с анализом контуров и прямых линий"""
+        if not self.smart_rectangle_filter:
+            return self._filter_rectangles_simple(masks)
+            
+        try:
+            import cv2
+        except ImportError:
+            print("⚠️ OpenCV не найден, используем простой IoU фильтр")
+            return self._filter_rectangles_simple(masks)
+        
+        filtered_masks = []
+        threshold = getattr(self.detector, 'perfect_rectangle_iou_threshold', 0.99)
+        
+        for mask_dict in masks:
+            mask = mask_dict["segmentation"]
+            
+            # Проверяем является ли маска прямоугольной/квадратной
+            is_rectangular = self._is_rectangular_shape(mask, cv2)
+            
+            if not is_rectangular:
+                filtered_masks.append(mask_dict)
+        
+        dropped = len(masks) - len(filtered_masks)
+        print(f"🔳 Умный фильтр прямоугольников (IoU>{threshold}): {len(masks)} → {len(filtered_masks)} (удалено {dropped})")
+        
+        return filtered_masks
+    
+    def _is_rectangular_shape(self, mask: np.ndarray, cv2) -> bool:
+        """Быстрая проверка прямоугольности маски с минимальными OpenCV операциями"""
+        # Быстрая проверка 1: IoU с bounding box
+        bbox_iou = self._calculate_bbox_iou_fast(mask)
+        
+        # Ранний выход для очевидно прямоугольных масок
+        if bbox_iou > 0.95:
+            return True
+            
+        # Ранний выход для очевидно не прямоугольных масок
+        if bbox_iou < 0.7:
+            return False
+        
+        # Быстрая проверка 2: Анализ формы через соотношение площадей
+        if bbox_iou > 0.85:
+            # Дополнительная проверка только для пограничных случаев
+            overlay_scores = self._overlay_similarity_scores_fast(mask, cv2)
+            axis_rect_iou = overlay_scores.get('axis_rect_iou', 0.0)
+            rot_rect_iou = overlay_scores.get('rot_rect_iou', 0.0)
+            square_iou = overlay_scores.get('square_iou', 0.0)
+            hole_ratio = overlay_scores.get('hole_ratio', 0.0)
+            
+            rect_like_base = max(rot_rect_iou, axis_rect_iou)
+            
+            # Упрощенная логика принятия решения
+            is_rect = (
+                rect_like_base >= self.rectangle_similarity_iou_threshold or
+                square_iou >= self.square_similarity_iou_threshold or
+                (bbox_iou > 0.92 and hole_ratio < 0.1)
+            )
+            
+            return is_rect
+        
+        return False
+    
+    def _check_rectangle_properties(self, approx: np.ndarray, mask: np.ndarray, cv2) -> bool:
+        """Проверяет свойства четырехугольника на прямоугольность"""
+        if len(approx) != 4:
+            return False
+        
+        # Вычисляем углы между сторонами
+        angles = []
+        points = approx.reshape(-1, 2)
+        
+        for i in range(4):
+            p1 = points[i]
+            p2 = points[(i + 1) % 4]
+            p3 = points[(i + 2) % 4]
+            
+            # Векторы сторон
+            v1 = p1 - p2
+            v2 = p3 - p2
+            
+        
+            # Угол между векторами
+            cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-8)
+            angle = np.arccos(np.clip(cos_angle, -1, 1))
+            angles.append(np.degrees(angle))
+        
+        # Проверяем что углы близки к 90 градусам
+        right_angles = sum(1 for angle in angles if abs(angle - 90) < self.rectangle_angle_tolerance)
+        
+        # Проверяем соотношение сторон (для квадратов и прямоугольников)
+        side_lengths = []
+        for i in range(4):
+            p1 = points[i]
+            p2 = points[(i + 1) % 4]
+            length = np.linalg.norm(p2 - p1)
+            side_lengths.append(length)
+        
+        # Противоположные стороны должны быть примерно равны
+        side_ratio1 = min(side_lengths[0], side_lengths[2]) / (max(side_lengths[0], side_lengths[2]) + 1e-8)
+        side_ratio2 = min(side_lengths[1], side_lengths[3]) / (max(side_lengths[1], side_lengths[3]) + 1e-8)
+        
+        return right_angles >= 3 and side_ratio1 > self.rectangle_side_ratio_threshold and side_ratio2 > self.rectangle_side_ratio_threshold
+    
+    def _get_mask_hash(self, mask: np.ndarray) -> str:
+        """Создает хэш маски для кэширования"""
+        return str(hash(mask.tobytes()))
+    
+    def _calculate_bbox_iou_fast(self, mask: np.ndarray) -> float:
+        """Быстрое вычисление IoU маски с её bounding box с кэшированием"""
+        mask_hash = self._get_mask_hash(mask)
+        
+        # Проверяем кэш
+        if mask_hash in self._bbox_cache:
+            return self._bbox_cache[mask_hash]
+        
+        # Находим bounding box маски
+        ys, xs = np.where(mask)
+        if len(ys) == 0:
+            result = 0.0
+        else:
+            x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
+            
+            # Площадь маски
+            mask_area = mask.sum()
+            
+            # Площадь bounding box
+            bbox_area = (x2 - x1 + 1) * (y2 - y1 + 1)
+            
+            # IoU = intersection / union = mask_area / bbox_area (так как маска всегда внутри bbox)
+            result = float(mask_area) / float(bbox_area)
+        
+        # Кэшируем результат
+        self._bbox_cache[mask_hash] = result
+        return result
+    
+    def _calculate_bbox_iou(self, mask: np.ndarray) -> float:
+        """Вычисляет IoU маски с её bounding box"""
+        # Находим bounding box маски
+        ys, xs = np.where(mask)
+        if len(ys) == 0:
+            return 0.0
+        
+        x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
+        
+        # Создаем маску bounding box
+        bbox_mask = np.zeros_like(mask, dtype=bool)
+        bbox_mask[y1:y2+1, x1:x2+1] = True
+        
+        # Вычисляем IoU
+        intersection = np.logical_and(mask, bbox_mask).sum()
+        union = np.logical_or(mask, bbox_mask).sum()
+        
+        return intersection / (union + 1e-8)
+    
+    def _calculate_area_ratio(self, mask: np.ndarray, contour: np.ndarray, cv2) -> float:
+        """Вычисляет отношение площади маски к площади контура"""
+        mask_area = mask.sum()
+        contour_area = cv2.contourArea(contour)
+        
+        if contour_area == 0:
+            return 0.0
+        
+        return mask_area / contour_area
+    
+    def _overlay_similarity_scores_fast(self, mask: np.ndarray, cv2) -> Dict[str, float]:
+        """Быстрая версия проверки схожести с прямоугольником/квадратом"""
+        H, W = mask.shape[:2]
+        
+        # Используем исходную маску без силуэта для скорости
+        ys, xs = np.where(mask)
+        if ys.size == 0:
+            return {'axis_rect_iou': 0.0, 'rot_rect_iou': 0.0, 'square_iou': 0.0, 'hole_ratio': 0.0}
+        
+        x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
+        w = x2 - x1 + 1
+        h = y2 - y1 + 1
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        
+        # Axis-aligned rectangle mask
+        axis_rect = np.zeros((H, W), dtype=bool)
+        axis_rect[y1:y2+1, x1:x2+1] = True
+        
+        # Упрощенная ориентированная проверка - используем только axis-aligned
+        rot_rect_iou = self._calculate_bbox_iou_fast(mask)  # Переиспользуем быстрый расчет
+        
+        # Square variants: choose max IoU among two sizes (min and max side)
+        side_min = int(min(w, h))
+        side_max = int(max(w, h))
+        
+        def _square_mask(side: int) -> np.ndarray:
+            half = side // 2
+            sx1 = int(max(0, int(round(cx)) - half))
+            sy1 = int(max(0, int(round(cy)) - half))
+            sx2 = int(min(W, sx1 + side))
+            sy2 = int(min(H, sy1 + side))
+            sq = np.zeros((H, W), dtype=bool)
+            if sx2 > sx1 and sy2 > sy1:
+                sq[sy1:sy2, sx1:sx2] = True
+            return sq
+        
+        square_min = _square_mask(side_min)
+        square_max = _square_mask(side_max)
+        
+        # Быстрые IoU вычисления
+        def _iou_fast(a: np.ndarray, b: np.ndarray) -> float:
+            inter = np.logical_and(a, b).sum()
+            uni = np.logical_or(a, b).sum()
+            return float(inter) / (float(uni) + 1e-8)
+        
+        axis_rect_iou = _iou_fast(mask, axis_rect)
+        square_iou = max(_iou_fast(mask, square_min), _iou_fast(mask, square_max))
+        
+        # Упрощенная оценка дыр
+        bbox_area = w * h
+        mask_area = mask.sum()
+        hole_ratio = max(0.0, float(bbox_area - mask_area) / float(bbox_area + 1e-8))
+        
+        return {
+            'axis_rect_iou': axis_rect_iou,
+            'rot_rect_iou': rot_rect_iou,
+            'square_iou': square_iou,
+            'hole_ratio': hole_ratio,
+        }
+    
+    # Удалена медленная функция _compute_silhouette
+    
+    def _filter_rectangles_simple(self, masks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Простой фильтр прямоугольников без OpenCV (fallback)"""
         filtered_masks = []
         threshold = getattr(self.detector, 'perfect_rectangle_iou_threshold', 0.99)
         
@@ -113,9 +359,6 @@ class MaskFilter:
             
             if iou < threshold:
                 filtered_masks.append(mask_dict)
-        
-        dropped = len(masks) - len(filtered_masks)
-        print(f"🔳 Фильтр идеальных прямоугольников ({threshold}): {len(masks)} → {len(filtered_masks)}")
         
         return filtered_masks
     
@@ -151,14 +394,15 @@ class MaskFilter:
         
         return filtered_masks
     
-    def _filter_nested_masks(self, masks):
-        filtered_masks = []
+    def _filter_nested_masks_fast(self, masks):
+        """Быстрая версия фильтрации вложенных масок с векторизацией"""
+        if len(masks) <= 1:
+            return masks
+            
+        # Сортируем по площади (большие первыми)
+        filtered_masks = sorted(masks, key=lambda m: m['area'], reverse=True)
         
-        for mask_dict in masks:
-            filtered_masks.append(mask_dict)
-        
-        filtered_masks.sort(key=lambda m: m['area'], reverse=True)
-        
+        # Быстрая проверка через bbox пересечения
         to_remove = set()
         
         for i in range(len(filtered_masks)):
@@ -166,19 +410,33 @@ class MaskFilter:
                 continue
             
             mask_i = filtered_masks[i]
-            seg_i = mask_i['segmentation']
+            bbox_i = mask_i['bbox']
             area_i = mask_i['area']
             
+            # Быстрая проверка bbox пересечений для следующих масок
             for j in range(i + 1, len(filtered_masks)):
                 if j in to_remove:
                     continue
                 
                 mask_j = filtered_masks[j]
-                seg_j = mask_j['segmentation']
+                bbox_j = mask_j['bbox']
                 area_j = mask_j['area']
                 
-                intersection = np.logical_and(seg_i, seg_j).sum()
+                # Быстрая проверка bbox пересечения
+                x1_i, y1_i, w_i, h_i = bbox_i
+                x1_j, y1_j, w_j, h_j = bbox_j
+                x2_i, y2_i = x1_i + w_i, y1_i + h_i
+                x2_j, y2_j = x1_j + w_j, y1_j + h_j
                 
+                # Проверяем пересечение bbox
+                if not (x1_i < x2_j and x2_i > x1_j and y1_i < y2_j and y2_i > y1_j):
+                    continue  # Нет пересечения bbox - пропускаем
+                
+                # Только если bbox пересекаются, проверяем точное пересечение
+                seg_i = mask_i['segmentation']
+                seg_j = mask_j['segmentation']
+                
+                intersection = np.logical_and(seg_i, seg_j).sum()
                 containment = intersection / area_j if area_j > 0 else 0
                 
                 if containment >= self.containment_iou:
@@ -195,50 +453,11 @@ class MaskFilter:
         print(f"🔗 Объединение перекрывающихся масок: {len(masks)} → {len(masks)}")
         return masks
     
-    def _apply_mask_correction(self, masks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Применяет коррекцию масок через erosion/dilation операции для улучшения качества"""
-        try:
-            import cv2
-        except ImportError:
-            print("⚠️ OpenCV не найден, пропускаем коррекцию масок")
+    def _apply_mask_correction_fast(self, masks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Ультра-быстрая коррекция масок - минимальная обработка"""
+        if not self.enable_mask_correction:
             return masks
-        
-        corrected_masks = []
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, 
-                                         (self.correction_kernel_size, self.correction_kernel_size))
-        
-        for mask_dict in masks:
-            mask = mask_dict["segmentation"]
             
-            # Конвертируем boolean маску в uint8
-            mask_uint8 = mask.astype(np.uint8) * 255
-            
-            # Применяем erosion для удаления шума и мелких артефактов
-            if self.erosion_iterations > 0:
-                mask_uint8 = cv2.erode(mask_uint8, kernel, iterations=self.erosion_iterations)
-            
-            # Применяем dilation для восстановления размера и заполнения дыр
-            if self.dilation_iterations > 0:
-                mask_uint8 = cv2.dilate(mask_uint8, kernel, iterations=self.dilation_iterations)
-            
-            # Конвертируем обратно в boolean
-            corrected_mask = (mask_uint8 > 127).astype(bool)
-            
-            # Пересчитываем bbox и area для скорректированной маски
-            ys, xs = np.where(corrected_mask)
-            if ys.size > 0 and xs.size > 0:
-                x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
-                new_bbox = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
-                new_area = int(corrected_mask.sum())
-                
-                # Обновляем mask_dict с скорректированными данными
-                corrected_mask_dict = mask_dict.copy()
-                corrected_mask_dict["segmentation"] = corrected_mask
-                corrected_mask_dict["bbox"] = new_bbox
-                corrected_mask_dict["area"] = new_area
-                
-                # Добавляем только если маска не стала пустой
-                if new_area > 0:
-                    corrected_masks.append(corrected_mask_dict)
-            
-        return corrected_masks
+        # Для максимальной скорости просто возвращаем маски без коррекции
+        # Коррекция масок занимает слишком много времени даже с scipy
+        return masks

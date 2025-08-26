@@ -66,7 +66,7 @@ class ScoreCalculator:
             if params is None:
                 params = {}
             self.config = ScoringConfig(
-                min_pos_score=float(params.get('min_pos_score', 0.65)),
+                min_pos_score=float(params.get('min_pos_score', 0.62)),
                 decision_threshold=float(params.get('decision_threshold', 0.06)),
                 class_separation=float(params.get('class_separation', 0.04)),
                 neg_cap=float(params.get('neg_cap', 0.90)),

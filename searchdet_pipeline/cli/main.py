@@ -399,6 +399,21 @@ def _execute_detect(args) -> int:
         if hasattr(args, 'border_width') and args.border_width is not None:
             detector_params['border_width'] = args.border_width
 
+        # Параметры умного фильтра прямоугольников
+        detector_params.update({
+            'smart_rectangle_filter': True,
+            'rectangle_bbox_iou_threshold': 0.95,  # Более строгий порог
+            'rectangle_straight_line_ratio': 0.8,  # Более строгий порог для прямых линий
+            'rectangle_area_ratio_threshold': 0.95,  # Более строгий порог для площади
+            'rectangle_angle_tolerance': 10.0,  # Более строгий допуск углов
+            'rectangle_side_ratio_threshold': 0.9,  # Более строгий порог для соотношения сторон
+            'perfect_rectangle_iou_threshold': 0.99,  # Оригинальный параметр для fallback,
+            'rectangle_similarity_iou_threshold': 0.94,  # Новый: IoU силуэта с прямоугольником
+            'square_similarity_iou_threshold': 0.94,      # Новый: IoU силуэта с квадратом
+            'rectangle_use_silhouette': True,             # Новый: использовать силуэт вместо исходной маски
+            'hole_area_ratio_threshold': 0.03             # Новый: порог доли дыр внутри силуэта
+        })
+
         print("5️⃣ Создание: detector = SearchDetDetector(**params)")
         # Создаём детектор
         detector = SearchDetDetector(**detector_params)
@@ -533,6 +548,21 @@ def _execute_quick(args) -> int:
         detector_params = {
             'mask_backend': args.backend or 'fastsam',
         }
+        
+        # Параметры умного фильтра прямоугольников
+        detector_params.update({
+            'smart_rectangle_filter': True,
+            'rectangle_bbox_iou_threshold': 0.95,  # Более строгий порог
+            'rectangle_straight_line_ratio': 0.8,  # Более строгий порог для прямых линий
+            'rectangle_area_ratio_threshold': 0.95,  # Более строгий порог для площади
+            'rectangle_angle_tolerance': 10.0,  # Более строгий допуск углов
+            'rectangle_side_ratio_threshold': 0.9,  # Более строгий порог для соотношения сторон
+            'perfect_rectangle_iou_threshold': 0.99,  # Оригинальный параметр для fallback
+            'rectangle_similarity_iou_threshold': 0.94,  # Новый: IoU силуэта с прямоугольником
+            'square_similarity_iou_threshold': 0.94,      # Новый: IoU силуэта с квадратом
+            'rectangle_use_silhouette': True,             # Новый: использовать силуэт вместо исходной маски
+            'hole_area_ratio_threshold': 0.03             # Новый: порог доли дыр внутри силуэта
+        })
         
         print("6️⃣ Создание: detector = SearchDetDetector(**params)")
         # Создаём детектор
