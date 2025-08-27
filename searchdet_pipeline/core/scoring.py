@@ -66,11 +66,13 @@ class ScoreCalculator:
             if params is None:
                 params = {}
             self.config = ScoringConfig(
-                min_pos_score=float(params.get('min_pos_score', 0.62)),
+                min_pos_score=float(params.get('min_pos_score', 0.3)),
                 decision_threshold=float(params.get('decision_threshold', 0.06)),
                 class_separation=float(params.get('class_separation', 0.04)),
                 neg_cap=float(params.get('neg_cap', 0.90)),
                 topk=int(params.get('topk', 5)),
+                pos_trim=float(params.get('pos_trim', 0.2)),
+                neg_quantile=float(params.get('neg_quantile', 0.80)),
                 consensus_k=int(params.get('consensus_k', 0)),
                 consensus_thr=float(params.get('consensus_thr', 0.45)),
                 adaptive_ratio=float(params.get('adaptive_ratio', 0.85)),
@@ -106,24 +108,27 @@ class ScoreCalculator:
         if sims_pos.size == 0 or sims_pos.shape[1] == 0:
             return np.zeros((sims_pos.shape[0] if sims_pos.ndim > 0 else 0,), dtype=np.float32)
 
-        maxv = sims_pos.max(axis=1)
-        k = min(self.topk, sims_pos.shape[1]) if sims_pos.shape[1] > 0 else 1
-        if k > 1:
-            part = np.partition(sims_pos, -k, axis=1)[:, -k:]
-            topk_mean = part.mean(axis=1)
-        else:
-            topk_mean = maxv
+        K = sims_pos.shape[1]
+        k = max(1, min(getattr(self, 'topk', 5), K))
+        topk = np.partition(sims_pos, -k, axis=1)[:, -k:]
+        # лёгкая обрезка краёв (20%), чтобы выбросы не «тянули» наверх
+        t = int(round(k * 0.1))  # 10 % или 0 для полного снятия
+        if t > 0 and (k - 2 * t) > 0:
+            topk = np.sort(topk, axis=1)[:, t:-t]
 
-        agg = 0.7 * maxv + 0.3 * topk_mean
-        pos01 = np.clip((agg + 1.0) * 0.5, 0.0, 1.0)
-        return pos01.astype(np.float32)
+        pos_cos = topk.mean(axis=1).astype(np.float32)
+        pos01 = np.clip((pos_cos + 1.0) * 0.5, 0.0, 1.0)
+        return pos01
+
 
     def _aggregate_negative(self, sims_neg: np.ndarray) -> np.ndarray:
         if sims_neg.size == 0 or sims_neg.shape[1] == 0:
             return np.zeros((sims_neg.shape[0] if sims_neg.ndim > 0 else 0,), dtype=np.float32)
-        neg_sim = np.max(sims_neg, axis=1)
-        neg01 = np.clip((neg_sim + 1.0) * 0.5, 0.0, 1.0)
-        return neg01.astype(np.float32)
+        q = getattr(self, 'neg_quantile', 0.95)  # можно выставить self.neg_quantile в конфиге
+        neg_cos = np.quantile(sims_neg, q, axis=1).astype(np.float32)  # «почти худший», но не max
+        neg01 = np.clip((neg_cos + 1.0) * 0.5, 0.0, 1.0)
+        return neg01
+
 
     def _consensus_count(self, sims_pos_cls: np.ndarray) -> np.ndarray:
         if sims_pos_cls.size == 0:
@@ -137,31 +142,6 @@ class ScoreCalculator:
         class_pos: Dict[str, np.ndarray],
         q_neg: np.ndarray
     ) -> List[Dict[str, Any]]:
-        # X: эмбеддинги масок, [N, D]
-        X = np.asarray(mask_vecs, dtype=np.float32)
-        X /= (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
-
-        # class_pos: dict[str] -> [K, D]
-        protos = []
-        labels = []
-        for cls, Q in class_pos.items():
-            if Q.size == 0:
-                p = np.zeros((X.shape[1],), dtype=np.float32)
-            else:
-                Q = Q.astype(np.float32)
-                Q /= (np.linalg.norm(Q, axis=1, keepdims=True) + 1e-8)
-                p = Q.mean(axis=0)
-                p /= (np.linalg.norm(p) + 1e-8)
-            protos.append(p); labels.append(cls)
-
-        P = np.stack(protos, axis=0) if protos else np.zeros((0, X.shape[1]), dtype=np.float32)
-
-        # Косинусы [N, C] без бродкаста ошибок
-        S = X @ P.T  # (матрица косинусных сходств)
-        
-        # Убедись, что ты не используешь «один и тот же вектор» дважды:
-        assert not np.allclose(X, P[:1]), "Mask embeddings совпали с прототипом — где-то присваивание не то"
-        
         mask_vecs = _to_matrix(mask_vecs)
         D = mask_vecs.shape[1] if mask_vecs.size else 0
         class_pos = {cls: _to_matrix(Q, D) for cls, Q in (class_pos or {}).items()}
@@ -171,11 +151,35 @@ class ScoreCalculator:
         if N == 0:
             return []
 
+        # -- ФИЛЬТР НЕГАТИВОВ, ПОДОЗРИТЕЛЬНО ПОХОЖИХ НА ПОЗИТИВЫ --
+        if q_neg.size and len(class_pos):
+            P_list = [Q.mean(axis=0) for Q in class_pos.values() if Q.shape[0] > 0]
+            if len(P_list):
+                P = np.stack(P_list, axis=0).astype(np.float32)
+                P /= (np.linalg.norm(P, axis=1, keepdims=True) + 1e-8)
+                qn = q_neg.astype(np.float32)
+                qn /= (np.linalg.norm(qn, axis=1, keepdims=True) + 1e-8)
+                sim_np = qn @ P.T
+                thr = 0.60  # порог близости негатива к любому классу
+                keep = (np.max(sim_np, axis=1) <= thr)
+                dropped = int(np.sum(~keep))
+                if dropped > 0 and self.verbose:
+                    print(f"   🧹 Убрано {dropped} негативов как слишком похожие на позитивы (thr={thr:.2f})")
+                q_neg = q_neg[keep]
+
+        # --- Расчёт негативных скорингов ---
         if q_neg.shape[0] == 0:
             sims_neg = np.zeros((N, 0), dtype=np.float32)
             neg_scores = np.zeros(N, dtype=np.float32)
         else:
             sims_neg = _cosine_matrix(mask_vecs, q_neg)
+            # Диагностика «взлётов» NEG
+            if self.verbose and sims_neg.size:
+                top_idx = np.argmax(sims_neg, axis=1)
+                top_val = sims_neg[np.arange(N), top_idx]
+                bad = np.where(top_val > 0.6)[0]
+                for ii in bad[:5]:
+                    print(f"   🧪 Маска {ii}: max NEG cos={top_val[ii]:.3f} на негативе idx={int(top_idx[ii])}")
             neg_scores = self._aggregate_negative(sims_neg)
         if self.neg_cap is not None:
             neg_scores = np.minimum(neg_scores, float(self.neg_cap))
@@ -188,6 +192,7 @@ class ScoreCalculator:
         for cls, Q in (class_pos or {}).items():
             if Q.shape[0] == 0:
                 continue
+            # Считаем косинусы по ВСЕМ позитивным прототипам без усреднения
             sims_pos = _cosine_matrix(mask_vecs, Q)
             pos_scores = self._aggregate_positive(sims_pos)
             class_scores[cls] = pos_scores
@@ -207,6 +212,11 @@ class ScoreCalculator:
         pos_matrix = np.stack([class_scores[c] for c in classes], axis=1)
         best_idx = np.argmax(pos_matrix, axis=1)
         best_pos = pos_matrix[np.arange(N), best_idx]
+
+        diff_all = best_pos - neg_scores
+        neg_mask = diff_all < 0
+        m0 = float(np.median(diff_all[neg_mask])) if np.any(neg_mask) else 0.0
+        tau = max(0.35, float(np.std(diff_all)) * 0.5 + 1e-6)
 
         pos_matrix_sorted = np.sort(pos_matrix, axis=1)[:, ::-1]
         second_best = pos_matrix_sorted[:, 1] if pos_matrix_sorted.shape[1] > 1 else np.zeros(N, dtype=np.float32)
@@ -276,12 +286,13 @@ class ScoreCalculator:
                     print(f"   Маска {i}: класс={cls_i}, pos={pos_s:.3f}, neg={neg_s:.3f}, "
                           f"diff={diff:+.3f}, sep={class_sep:+.3f}, {cons_info}, принято={accepted}")
 
+            calib = 1.0 / (1.0 + np.exp(-((diff - m0) / tau)))
             decisions.append({
                 'accepted': bool(accepted),
                 'class': cls_i if accepted else (None if not self.allow_unknown else cls_i),
                 'pos_score': pos_s,
                 'neg_score': neg_s,
-                'confidence': float(np.clip(pos_s, 0.0, 1.0)),
+                'confidence': float(calib),
             })
             accepted_count += int(bool(accepted))
 

@@ -40,11 +40,15 @@ class FilteringConfig:
 @dataclass
 class ScoringConfig:
     # Основные пороги (ужесточены для фильтрации ложных масок)
-    min_pos_score: float = 0.65  # было 0.60 - повышен для более строгой фильтрации
+    min_pos_score: float = 0.65  # снижен с 0.65 для менее строгой фильтрации
     decision_threshold: float = 0.06  # было 0.04 - увеличен минимальный diff между pos и neg
     class_separation: float = 0.04  # было 0.02 - увеличен для лучшего разделения классов
     neg_cap: float = 0.90  # было 0.95 - снижен для отсечения масок с высоким neg_score
     topk: int = 5
+    
+    # Параметры агрегации
+    pos_trim: float = 0.2  # обрезка краев для позитивной агрегации (20%)
+    neg_quantile: float = 0.80  # квантиль для негативной агрегации (снижен с 0.95)
     
     # Консенсус параметры
     consensus_k: int = 0

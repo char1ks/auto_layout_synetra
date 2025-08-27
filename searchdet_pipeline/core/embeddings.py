@@ -18,6 +18,8 @@ except Exception as e:
     SEARCHDET_AVAILABLE = False
 
 import torch.nn as nn
+import time
+
 
 class EmbeddingExtractor:
     def __init__(self, detector):
@@ -35,8 +37,9 @@ class EmbeddingExtractor:
         # DINOv3 ConvNeXt-B поля
         # Используем предзагруженную модель из детектора если доступна
         self._dinov3_model = getattr(detector, 'dinov3_model', None)
-        self._dinov3_preprocess = getattr(detector, 'dinov3_preprocess', None)
-        self.dinov3_ckpt = getattr(detector, 'dinov3_ckpt', None)
+        self._dinov3_preprocess = None
+        self.dinov3_checkpoint_path = getattr(detector, 'dinov3_checkpoint_path', None)
+        
         # Устройство для DINOv3 (CPU/GPU)
         self._dinov3_device = getattr(detector, 'dinov3_device', None)
     
@@ -112,10 +115,9 @@ class EmbeddingExtractor:
     
     def _extract_fast(self, image_np, mask_arrays):
         import time
-        
+        import os
         # === DINOv3 ConvNeXt-B: специальная ветка ===
         if self.backbone.startswith('dinov3'):
-            print(f"🚀 DINOv3/ConvNeXt-B: извлечение эмбеддингов для {len(mask_arrays)} масок")
             return self._extract_with_dinov3_convnext(image_np, mask_arrays)
         
         if self.backbone.startswith('dinov2'):
@@ -497,201 +499,95 @@ class EmbeddingExtractor:
                 vec = vec / vec_norm
             return vec.astype(np.float32)
 
-    def _extract_with_dino(self, image_np, mask_arrays):
-        import time
-        import torch
+    def _extract_with_dino(self, image_np, valid_masks):
         import torch.nn.functional as F
-        import cv2
-        
-        extract_start = time.time()
-        print(f"🚀 БЫСТРОЕ DINO извлечение эмбеддингов для {len(mask_arrays)} масок...")
         
         self._ensure_dino()
         if self._dino_model is None:
-            return None
+            return np.zeros((0, 1024), dtype=np.float32)
 
-        # 🚀 ОПТИМИЗАЦИЯ: Масштабирование изображения для ускорения
-        H0, W0 = image_np.shape[:2]
-        scale = 1.0
-        
-        if max(H0, W0) > self.max_embedding_size:
-            if H0 >= W0:
-                scale = self.max_embedding_size / float(H0)
-            else:
-                scale = self.max_embedding_size / float(W0)
-            scaled_image = cv2.resize(image_np, (int(W0 * scale), int(H0 * scale)), interpolation=cv2.INTER_LINEAR)
-            print(f"   🔧 Масштабирование DINO: {W0}x{H0} → {scaled_image.shape[1]}x{scaled_image.shape[0]} (scale={scale:.3f}, max_size={self.max_embedding_size})")
-        else:
-            scaled_image = image_np
+        image_pil = Image.fromarray(image_np)
+        image_hash = hash(image_pil.tobytes())
 
-        # 🚀 КЭШИРОВАНИЕ: Проверяем кэш для избежания повторных вычислений
-        import hashlib
-        image_hash = hashlib.md5(scaled_image.tobytes()).hexdigest()
-        
+        # === Кэширование ===
         if image_hash in self._dino_cache:
-            patch_tokens, cached_grid_size = self._dino_cache[image_hash]
-            print(f"   ⚡ DINO кэш попадание! Пропускаем forward pass")
-            # Проверяем совместимость grid размера
-            if cached_grid_size != self.dino_grid_size:
-                print(f"   ⚠️ Grid размер изменился: {cached_grid_size} → {self.dino_grid_size}, пересчитываем")
-                del self._dino_cache[image_hash]
-            else:
-                # Используем кэшированные токены
-                pass
-        
-        if image_hash not in self._dino_cache:
-            # Обрабатываем изображение через DINO
-            pil_image = Image.fromarray(scaled_image)
-            x = self._dino_preprocess(pil_image).unsqueeze(0)
-            
-            # 🚀 Применяем половинную точность к входным данным если нужно
-            if self.dino_half_precision:
-                x = x.half()
-            
-            dino_start = time.time()
-            with torch.no_grad():
-                feats = self._dino_model.forward_features(x)
-            dino_time = time.time() - dino_start
-            print(f"   ⚡ DINO forward: {dino_time:.3f}с (precision: {'float16' if self.dino_half_precision else 'float32'})")
-            
-            # --- Универсальное извлечение патч-токенов ---
-            patch_tokens = None
-            if isinstance(feats, dict) and 'x_norm_patchtokens' in feats:
-                patch_tokens = feats['x_norm_patchtokens'][0]
-            elif torch.is_tensor(feats) and feats.ndim == 3 and feats.shape[1] > 1:
-                # Если feats - тензор (B, N, D), отбрасываем CLS токен
-                patch_tokens = feats[0, 1:]
-            
-            if patch_tokens is None:
-                print("⚠️ DINO model did not return patch tokens. Falling back to old method.")
-                return self._extract_with_dino_fallback(image_np, mask_arrays)
-
-            # Проверка соответствия количества токенов и размера grid
-            expected_tokens = self.dino_grid_size[0] * self.dino_grid_size[1]
-            if patch_tokens.shape[0] != expected_tokens:
-                print(f"⚠️ Mismatch in token count: expected {expected_tokens}, got {patch_tokens.shape[0]}. Fallback.")
-                return self._extract_with_dino_fallback(image_np, mask_arrays)
-            
-            # 🚀 Сохраняем в кэш
-            self._dino_cache[image_hash] = (patch_tokens.clone(), self.dino_grid_size)
-            print(f"   💾 DINO результат сохранен в кэш (размер кэша: {len(self._dino_cache)})")
+            patch_tokens, grid_size = self._dino_cache[image_hash]
+            gh, gw = grid_size
         else:
-             patch_tokens, _ = self._dino_cache[image_hash]
+            with torch.no_grad():
+                # 🚀 Используем кастомный forward_features
+                features_dict = self._dino_model.forward_features(self._dino_preprocess(image_pil).unsqueeze(0).to(self._dino_device))
+                patch_tokens = features_dict['x_norm_patchtokens'].squeeze(0) # (T, D)
+                
+                # Нормализуем патч-токены перед кэшированием
+                if isinstance(patch_tokens, torch.Tensor):
+                    patch_tokens = F.normalize(patch_tokens.float(), p=2, dim=-1)
+                else:
+                    patch_tokens = torch.from_numpy(patch_tokens).float()
+                    patch_tokens = F.normalize(patch_tokens, p=2, dim=-1)
 
-        # 🚀 СУПЕР-БАТЧЕВАЯ обработка всех масок
-        embeddings = []
-        gh, gw = self.dino_grid_size
+                gh, gw = features_dict['hw']
+                self.dino_grid_size = (gh, gw)
+                self._dino_cache[image_hash] = (patch_tokens.clone(), self.dino_grid_size)
+
+        # === Батчевая обработка масок ===
+        mask_tensors = [torch.from_numpy(m.astype(np.float32)).unsqueeze(0).unsqueeze(0) for m in valid_masks]
+        batch_masks = torch.cat(mask_tensors, dim=0).to(self._dino_device)
         
-        # Предварительно масштабируем все маски к размеру scaled_image
-        scaled_masks = []
-        for mask in mask_arrays:
-            if scale != 1.0:
-                # Масштабируем маску к размеру scaled_image
-                scaled_mask = cv2.resize(mask.astype(np.uint8), (scaled_image.shape[1], scaled_image.shape[0]), interpolation=cv2.INTER_NEAREST)
-                scaled_mask = scaled_mask.astype(bool)
+        # БЫЛО: 'bilinear', что размывает маску. СТАЛО: 'nearest'
+        resized_batch = F.interpolate(batch_masks, size=(gh, gw), mode='nearest')
+        mask_bool = (resized_batch.squeeze(1) > 0.5) # [N, gh, gw]
+
+        embeddings = []
+        for batch_idx in range(len(valid_masks)):
+            
+            foreground_indices = torch.where(mask_bool[batch_idx].flatten())[0]
+            if len(foreground_indices) == 0:
+                # Защита на случай тонких масок — берём максимум по вероятности пикселя
+                flat = resized_batch.squeeze(1)[batch_idx].flatten()
+                foreground_indices = torch.tensor([int(torch.argmax(flat))], device=flat.device)
+
+            if len(foreground_indices) > 0:
+                mask_patch_tokens = patch_tokens[foreground_indices]
+                embedding = mask_patch_tokens.mean(dim=0)
             else:
-                scaled_mask = mask
-            scaled_masks.append(scaled_mask)
-        
-        # 🚀 ОПТИМИЗАЦИЯ: Батчевая интерполяция всех масок сразу
-        batch_start = time.time()
-        valid_masks = []
-        valid_indices = []
-        
-        # Собираем все непустые маски в один батч
-        for i, mask in enumerate(scaled_masks):
-            if mask.sum() > 0:
-                valid_masks.append(mask.astype(np.float32))
-                valid_indices.append(i)
-        
-        if valid_masks:
-            # Конвертируем в батч тензор (N, 1, H, W)
-            batch_masks = torch.from_numpy(np.stack(valid_masks)).unsqueeze(1)
-            
-            # Батчевая интерполяция всех масок сразу
-            resized_batch = F.interpolate(batch_masks, size=(gh, gw), mode='bilinear', align_corners=False)
-            resized_batch = resized_batch.squeeze(1).view(len(valid_masks), -1)  # (N, gh*gw)
-            
-            batch_time = time.time() - batch_start
-            print(f"   ⚡ Батчевая интерполяция {len(valid_masks)} масок: {batch_time:.3f}с")
-            
-            # Извлекаем эмбеддинги для всех валидных масок
-            for batch_idx, original_idx in enumerate(valid_indices):
-                mask_tensor = resized_batch[batch_idx]
-                
-                foreground_indices = torch.where(mask_tensor > 0.1)[0]
-                if len(foreground_indices) == 0:
-                    foreground_indices = torch.tensor([torch.argmax(mask_tensor)])
-                mask_embedding = patch_tokens[foreground_indices].mean(dim=0)
+                # Fallback: если маска пуста, используем CLS токен (глобальный)
+                embedding = patch_tokens.mean(dim=0) # Усредняем все патчи как fallback
 
-                v = mask_embedding.cpu().float().numpy()
-                
-                # L2 нормализация
-                v_norm = np.linalg.norm(v)
-                if v_norm > 1e-8:
-                    v = v / v_norm
-                
-                # Приводим к 1024 при необходимости
-                if v.shape[0] != 1024:
-                    out = np.zeros(1024, dtype=np.float32)
-                    take = min(1024, v.shape[0])
-                    out[:take] = v[:take]
-                    v = out
+            # Финальная L2 нормализация
+            embedding = F.normalize(embedding.float(), p=2, dim=0)
+            embeddings.append(embedding.cpu().numpy())
 
-                # Вставляем эмбеддинг в правильную позицию
-                while len(embeddings) <= original_idx:
-                    embeddings.append(None)
-                embeddings[original_idx] = v.astype(np.float32)
-        
-        # Заполняем пустые маски нулевыми векторами
-        for i in range(len(scaled_masks)):
-            if i >= len(embeddings) or embeddings[i] is None:
-                while len(embeddings) <= i:
-                    embeddings.append(None)
-                embeddings[i] = np.zeros(patch_tokens.shape[-1], dtype=np.float32)
+        return np.array(embeddings).astype(np.float32)
 
-        extract_time = time.time() - extract_start
-        old_time_estimate = len(mask_arrays) * 0.2  # Примерное время старого метода
-        speedup = old_time_estimate / extract_time if extract_time > 0 else 1
-        print(f"   ⚡ БЫСТРО DINO: {extract_time:.3f} сек ({extract_time/len(mask_arrays)*1000:.1f} мс/маска) - ускорение ~{speedup:.1f}x")
+    # Modify negative embeddings to use central region instead of global average
+    def _get_dinov3_central(self, image_np):
+        """Получает центральный эмбеддинг для изображения."""
+        if self._dinov3_model is None:
+            raise ValueError("DINOv3 модель не инициализирована")
+    
+        # Преобразование изображения в PIL перед обработкой
+        if isinstance(image_np, np.ndarray):
+            image_pil = Image.fromarray(image_np)
+        else:
+            raise TypeError(f"Unexpected type {type(image_np)}")
+    
+        # Преобразование изображения
+        x = self._dinov3_preprocess(image_pil).unsqueeze(0).to(self._dinov3_device)
+    
+        # Получение фичей
+        feats = self._dinov3_model.forward_features(x)
+    
+        # Центральный регион
+        h, w = feats.shape[-2:]
+        center_h, center_w = h // 2, w // 2
+        central_feats = feats[:, :, center_h - 1:center_h + 2, center_w - 1:center_w + 2]
+    
+        # Агрегация
+        central_embedding = central_feats.mean(dim=[-2, -1])
+        return central_embedding.py()
 
-        if embeddings:
-            return np.stack(embeddings, axis=0).astype(np.float32)
-        return None
-
-    def _extract_with_dino_fallback(self, image_np, mask_arrays):
-        self._ensure_dino()
-        if self._dino_model is None:
-            return None
-        import torch
-        embeddings = []
-        with torch.no_grad():
-            for mask in mask_arrays:
-                ys, xs = np.where(mask)
-                if ys.size == 0 or xs.size == 0:
-                    embeddings.append(np.zeros(1024, dtype=np.float32))
-                    continue
-                
-                y1, y2 = ys.min(), ys.max()
-                x1, x2 = xs.min(), xs.max()
-                
-                # Вырезаем кроп с маской
-                crop_np = image_np[y1:y2+1, x1:x2+1].copy()
-                m = mask[y1:y2+1, x1:x2+1]
-                if m.dtype != bool:
-                    m = m.astype(bool)
-                crop_np[~m] = 0
-                
-                # Получаем глобальный вектор для кропа, используя обновленный метод
-                vec = self._get_dino_global(crop_np)
-                
-                embeddings.append(vec)
-
-        if embeddings:
-            return np.stack(embeddings, axis=0).astype(np.float32)
-        return None
-
-
+    # Update build_queries_multiclass to use central embedding for negatives
     def build_queries_multiclass(self, pos_by_class, neg_imgs):
         if str(self.backbone).startswith('dinov3'):
             self._ensure_dinov3_convnext()
@@ -700,7 +596,7 @@ class EmbeddingExtractor:
             # NEGATIVE
             neg_list = []
             for img in (neg_imgs or []):
-                v = self._get_dinov3_global(np.array(img))   # см. ниже
+                v = self._get_dinov3_central(np.array(img))  # Use central embedding
                 v = v.astype(np.float32); v /= (np.linalg.norm(v)+1e-8)
                 neg_list.append(v)
             q_neg = np.stack(neg_list, axis=0) if neg_list else np.zeros((0,D), np.float32)
@@ -715,6 +611,26 @@ class EmbeddingExtractor:
                     vecs.append(v)
                 Q = np.stack(vecs, axis=0) if vecs else np.zeros((0,D), np.float32)
                 class_pos[cls] = Q
+
+            # --- Фильтр негативов, похожих на позитивы ---
+            pos_stack = []
+            for cls2, Q2 in (class_pos or {}).items():
+                if Q2 is not None and Q2.size:
+                    pos_stack.append(Q2.astype(np.float32))
+            if len(pos_stack):
+                import os
+                P = np.vstack(pos_stack)
+                P /= (np.linalg.norm(P, axis=1, keepdims=True) + 1e-8)
+                if q_neg.shape[0] > 0:
+                    qn = q_neg.astype(np.float32)
+                    qn /= (np.linalg.norm(qn, axis=1, keepdims=True) + 1e-8)
+                    sims_np = qn @ P.T
+                    thr = float(os.getenv('SEARCHDET_NEG_FILTER_THR', '0.60'))
+                    keep = (np.max(sims_np, axis=1) <= thr)
+                    dropped = int((~keep).sum())
+                    if dropped:
+                        print(f"   🧹 Убрано {dropped} негативов (слишком похожи на позитивы; thr={thr:.2f})")
+                    q_neg = q_neg[keep]
 
             return class_pos, q_neg
         
@@ -764,18 +680,20 @@ class EmbeddingExtractor:
             model = resnet
             device = 'cuda'
 
-        # Сначала отрицательные
+        # Сначала отрицательные - используем МНОЖЕСТВЕННЫЕ СЛУЧАЙНЫЕ ОБЛАСТИ вместо глобального эмбеддинга
         neg_list = []
         embedding_dim = None
         for i, img in enumerate(neg_imgs or []):
             try:
-                vec = self._get_image_embedding(img, model, layer, transform)
-                if vec is None:
-                    continue
-                vec = np.asarray(vec, dtype=np.float32).reshape(-1)
-                if embedding_dim is None: embedding_dim = vec.shape[0]
-                vec /= (np.linalg.norm(vec) + 1e-8)
-                neg_list.append(vec)
+                # Генерируем несколько случайных областей из negative изображения
+                neg_regions = self._extract_random_regions_from_image(img, num_regions=5)
+                for region_vec in neg_regions:
+                    if region_vec is None:
+                        continue
+                    vec = np.asarray(region_vec, dtype=np.float32).reshape(-1)
+                    if embedding_dim is None: embedding_dim = vec.shape[0]
+                    vec /= (np.linalg.norm(vec) + 1e-8)
+                    neg_list.append(vec)
             except Exception as e:
                 print(f"   ⚠️ Ошибка с negative {i}: {e}")
         
@@ -795,18 +713,20 @@ class EmbeddingExtractor:
 
         q_neg = np.stack(neg_list, axis=0) if neg_list else np.zeros((0, embedding_dim), dtype=np.float32)
 
-        # Теперь позитивные по классам
+        # Теперь позитивные по классам - используем ЦЕНТРАЛЬНЫЕ ОБЛАСТИ вместо глобального эмбеддинга
         class_pos = {}
         for cls, imgs in (pos_by_class or {}).items():
             pos_list = []
             for i, img in enumerate(imgs or []):
                 try:
-                    vec = self._get_image_embedding(img, model, layer, transform)
-                    if vec is None:
-                        continue
-                    vec = np.asarray(vec, dtype=np.float32).reshape(-1)
-                    vec /= (np.linalg.norm(vec) + 1e-8)
-                    pos_list.append(vec)
+                    # Для positive примеров используем центральную область (предполагаем что объект в центре)
+                    pos_regions = self._extract_central_region_from_image(img)
+                    for region_vec in pos_regions:
+                        if region_vec is None:
+                            continue
+                        vec = np.asarray(region_vec, dtype=np.float32).reshape(-1)
+                        vec /= (np.linalg.norm(vec) + 1e-8)
+                        pos_list.append(vec)
                 except Exception as e:
                     print(f"   ⚠️ Ошибка с positive '{cls}' #{i}: {e}")
             
@@ -816,6 +736,103 @@ class EmbeddingExtractor:
 
         print(f"   📊 Negative всего: {q_neg.shape[0]}")
         return class_pos, q_neg
+
+    def _extract_random_regions_from_image(self, pil_image, num_regions=5):
+        """Извлекает эмбеддинги из случайных областей изображения для более справедливого сравнения с масками."""
+        import random
+        import numpy as np
+        
+        # Конвертируем PIL в numpy
+        image_np = np.array(pil_image)
+        h, w = image_np.shape[:2]
+        
+        # Размер случайной области (примерно как средняя маска)
+        region_size = min(h, w) // 4  # Четверть от минимального размера
+        region_size = max(32, region_size)  # Минимум 32 пикселя
+        
+        regions = []
+        for _ in range(num_regions):
+            # Случайные координаты для области
+            x = random.randint(0, max(0, w - region_size))
+            y = random.randint(0, max(0, h - region_size))
+            
+            # Создаем маску для этой области
+            mask = np.zeros((h, w), dtype=bool)
+            mask[y:y+region_size, x:x+region_size] = True
+            
+            try:
+                # Извлекаем эмбеддинг для этой области как для обычной маски
+                if self.backbone.startswith('dinov3'):
+                    region_emb = self._extract_with_dinov3_convnext(image_np, [mask])
+                elif self.backbone.startswith('dinov2'):
+                    region_emb = self._extract_with_dino(image_np, [mask])
+                else:
+                    # Для ResNet используем старый метод с маской
+                    region_emb = self._extract_slow(pil_image, [mask])
+                
+                if region_emb is not None and len(region_emb) > 0:
+                    regions.append(region_emb[0])  # Берем первый (и единственный) эмбеддинг
+            except Exception as e:
+                print(f"   ⚠️ Ошибка извлечения региона: {e}")
+                continue
+        
+        return regions
+
+    def _extract_central_region_from_image(self, pil_image):
+        """Извлекает эмбеддинг из центральной области изображения для positive примеров."""
+        import numpy as np
+        
+        # Конвертируем PIL в numpy
+        image_np = np.array(pil_image)
+        h, w = image_np.shape[:2]
+        
+        # Размер центральной области (60% от изображения)
+        region_h = int(h * 0.6)
+        region_w = int(w * 0.6)
+        
+        # Центрируем область
+        start_y = (h - region_h) // 2
+        start_x = (w - region_w) // 2
+        
+        # Создаем маску для центральной области
+        mask = np.zeros((h, w), dtype=bool)
+        mask[start_y:start_y+region_h, start_x:start_x+region_w] = True
+        
+        regions = []
+        try:
+            # Извлекаем эмбеддинг для центральной области
+            if self.backbone.startswith('dinov3'):
+                region_emb = self._extract_with_dinov3_convnext(image_np, [mask])
+            elif self.backbone.startswith('dinov2'):
+                region_emb = self._extract_with_dino(image_np, [mask])
+            else:
+                # Для ResNet используем старый метод с маской
+                region_emb = self._extract_slow(pil_image, [mask])
+            
+            if region_emb is not None and len(region_emb) > 0:
+                regions.append(region_emb[0])  # Берем первый (и единственный) эмбеддинг
+        except Exception as e:
+            print(f"   ⚠️ Ошибка извлечения центральной области: {e}")
+            # Fallback к глобальному эмбеддингу если не получилось
+            try:
+                resnet, layer, transform, sam = (
+                    self.detector.searchdet_resnet,
+                    self.detector.searchdet_layer,
+                    self.detector.searchdet_transform,
+                    self.detector.searchdet_sam
+                )
+                if isinstance(resnet, tuple) and len(resnet) >= 2:
+                    model = resnet[0]
+                else:
+                    model = resnet
+                
+                vec = self._get_image_embedding(pil_image, model, layer, transform)
+                if vec is not None:
+                    regions.append(vec)
+            except Exception:
+                pass
+        
+        return regions
 
 
     # =========================
@@ -858,7 +875,7 @@ class EmbeddingExtractor:
 
         img_size = int(os.getenv('SEARCHDET_FEAT_SHORT_SIDE', '224'))
         self._dinov3_preprocess = T.Compose([
-            T.Resize((img_size, img_size), interpolation=InterpolationMode.BICUBIC),
+            T.Resize((img_size, img_size), interpolation=T.InterpolationMode.BICUBIC),
             T.ToTensor(),
             T.Normalize(mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)),
         ])
@@ -869,14 +886,21 @@ class EmbeddingExtractor:
         self._ensure_dinov3_convnext()
         x = self._dinov3_preprocess(PILImage.fromarray(image_np)).unsqueeze(0).to(self._dinov3_device)
         with torch.no_grad():
-            vec_t = self._dinov3_model(x)
-        vec = vec_t.squeeze(0).detach().cpu().float().numpy()  # pooled 1024-D
-        vec /= (np.linalg.norm(vec) + 1e-8)
-        if vec.shape[0] != 1024:
+            feats = self._dinov3_model.forward_features(x)
+            if isinstance(feats, dict):
+                feats = feats.get('x', None) or feats.get('features', None)
+            if feats.ndim == 3:
+                feats = feats.unsqueeze(0)
+            assert feats.ndim == 4, "Ожидали [B,C,Hf,Wf] от forward_features"
+            fmap = feats[0].detach().cpu().float().numpy().transpose(1, 2, 0)  # (Hf, Wf, C)
+            v = fmap.reshape(-1, fmap.shape[-1]).mean(axis=0).astype(np.float32)  # spatial mean
+        v /= (np.linalg.norm(v) + 1e-8)
+        if v.shape[0] != 1024:
             out = np.zeros(1024, dtype=np.float32)
-            out[:min(1024, vec.shape[0])] = vec[:min(1024, vec.shape[0])]
-            vec = out
-        return vec.astype(np.float32)
+            out[:min(1024, v.shape[0])] = v[:min(1024, v.shape[0])]
+            v = out
+        return v.astype(np.float32)
+
 
     def _extract_with_dinov3_convnext(self, image_np, mask_arrays):
         import torch, cv2, numpy as np
@@ -907,8 +931,26 @@ class EmbeddingExtractor:
             # 2) Маску ресайзим к размеру фич-карты и усредняем ТОЛЬКО по активным позициям
             m = cv2.resize(mask.astype(np.uint8), (Wf, Hf), interpolation=cv2.INTER_NEAREST).astype(bool)
             if not m.any():
-                # пустые/шумные маски — fallback: глобальный pooled этой карты
-                v = fmap.reshape(-1, C).mean(axis=0).astype(np.float32)
+                # Маска пуста после ресайза. Найдем центр масс исходной маски
+                # и возьмем вектор из этой точки на карте признаков.
+                if np.any(mask):
+                    moments = cv2.moments(mask.astype(np.uint8))
+                    if moments["m00"] > 0:
+                        orig_x = int(moments["m10"] / moments["m00"])
+                        orig_y = int(moments["m01"] / moments["m00"])
+                    else:
+                        # Fallback for very weird masks where moments are zero.
+                        orig_y_arr, orig_x_arr = np.where(mask)
+                        orig_y, orig_x = int(np.mean(orig_y_arr)), int(np.mean(orig_x_arr))
+
+                    fy = int(orig_y / mask.shape[0] * Hf)
+                    fx = int(orig_x / mask.shape[1] * Wf)
+                    fy = np.clip(fy, 0, Hf - 1)
+                    fx = np.clip(fx, 0, Wf - 1)
+                    v = fmap[fy, fx].copy().astype(np.float32)
+                else:
+                    # Если и исходная маска пуста, то глобальное усреднение
+                    v = fmap.reshape(-1, C).mean(axis=0).astype(np.float32)
             else:
                 v = fmap[m].mean(axis=0).astype(np.float32)
             # 3) Нормализация L2
@@ -926,50 +968,3 @@ class EmbeddingExtractor:
             print("DEBUG mask_emb std:", np.std(embs_array, axis=0)[:8], "||", np.std(embs_array))
             return embs_array
         return np.zeros((0,1024), dtype=np.float32)
-
-
-class DINOv3Embedding(nn.Module):
-    def __init__(self, ckpt_path):
-        super().__init__()
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = ConvNeXt(arch='base', out_indices=-1)
-        state_dict = torch.load(ckpt_path, map_location=self.device)['state_dict']
-        self.model.load_state_dict(state_dict)
-        self.model.eval()
-        self.model.to(self.device)
-
-    def preprocess(self, image):
-        transform = T.Compose([
-            T.Resize(256),
-            T.CenterCrop(224),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-        return transform(image).unsqueeze(0).to(self.device)
-
-    def get_embedding(self, x):
-        with torch.no_grad():
-            embedding = self.model(x)
-        return embedding
-
-
-class ResNet101Embedding(nn.Module):
-    def __init__(self, layer='layer3'):
-        super().__init__()
-        self.model = ResNet(101, 'DINOv2')
-        self.model.eval()
-        self.model.to(self.device)
-
-    def preprocess(self, image):
-        transform = T.Compose([
-            T.Resize(256),
-            T.CenterCrop(224),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-        return transform(image).unsqueeze(0).to(self.device)
-
-    def get_embedding(self, x):
-        with torch.no_grad():
-            embedding = self.model(x)
-        return embedding
