@@ -137,6 +137,31 @@ class ScoreCalculator:
         class_pos: Dict[str, np.ndarray],
         q_neg: np.ndarray
     ) -> List[Dict[str, Any]]:
+        # X: эмбеддинги масок, [N, D]
+        X = np.asarray(mask_vecs, dtype=np.float32)
+        X /= (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
+
+        # class_pos: dict[str] -> [K, D]
+        protos = []
+        labels = []
+        for cls, Q in class_pos.items():
+            if Q.size == 0:
+                p = np.zeros((X.shape[1],), dtype=np.float32)
+            else:
+                Q = Q.astype(np.float32)
+                Q /= (np.linalg.norm(Q, axis=1, keepdims=True) + 1e-8)
+                p = Q.mean(axis=0)
+                p /= (np.linalg.norm(p) + 1e-8)
+            protos.append(p); labels.append(cls)
+
+        P = np.stack(protos, axis=0) if protos else np.zeros((0, X.shape[1]), dtype=np.float32)
+
+        # Косинусы [N, C] без бродкаста ошибок
+        S = X @ P.T  # (матрица косинусных сходств)
+        
+        # Убедись, что ты не используешь «один и тот же вектор» дважды:
+        assert not np.allclose(X, P[:1]), "Mask embeddings совпали с прототипом — где-то присваивание не то"
+        
         mask_vecs = _to_matrix(mask_vecs)
         D = mask_vecs.shape[1] if mask_vecs.size else 0
         class_pos = {cls: _to_matrix(Q, D) for cls, Q in (class_pos or {}).items()}
