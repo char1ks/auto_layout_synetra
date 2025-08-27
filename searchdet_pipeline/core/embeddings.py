@@ -9,12 +9,15 @@ import cv2
 from PIL import Image
 import torch
 import torchvision.transforms as transforms
+import os
 try:
     from mask_withsearch import get_vector, adjust_embedding, extract_features_from_masks
     SEARCHDET_AVAILABLE = True
 except Exception as e:
     print(f"⚠️ SearchDet недоступен: {e}")
     SEARCHDET_AVAILABLE = False
+
+import torch.nn as nn
 
 class EmbeddingExtractor:
     def __init__(self, detector):
@@ -29,6 +32,11 @@ class EmbeddingExtractor:
         self.max_embedding_size = getattr(detector, 'max_embedding_size', 1024)
         # 🚀 Настройка половинной точности для DINO
         self.dino_half_precision = getattr(detector, 'dino_half_precision', False)
+        # DINOv3 ConvNeXt-B поля
+        # Используем предзагруженную модель из детектора если доступна
+        self._dinov3_model = getattr(detector, 'dinov3_model', None)
+        self._dinov3_preprocess = getattr(detector, 'dinov3_preprocess', None)
+        self.dinov3_ckpt = getattr(detector, 'dinov3_ckpt', None)
     
     def extract_mask_embeddings(self, image_np, masks):
         """Извлекает эмбеддинги для масок."""
@@ -103,6 +111,11 @@ class EmbeddingExtractor:
     def _extract_fast(self, image_np, mask_arrays):
         import time
         
+        # === DINOv3 ConvNeXt-B: специальная ветка ===
+        if self.backbone.startswith('dinov3'):
+            print(f"🚀 DINOv3/ConvNeXt-B: извлечение эмбеддингов для {len(mask_arrays)} масок")
+            return self._extract_with_dinov3_convnext(image_np, mask_arrays)
+        
         if self.backbone.startswith('dinov2'):
             return self._extract_with_dino(image_np, mask_arrays)
             
@@ -166,6 +179,9 @@ class EmbeddingExtractor:
         
         extract_start = time.time()
         print(f"🐌 МЕДЛЕННОЕ извлечение эмбеддингов для {len(mask_arrays)} масок...")
+        
+        if self.backbone.startswith('dinov3'):
+            return self._extract_with_dinov3_convnext(np.array(pil_image), mask_arrays)
         
         if self.backbone.startswith('dinov2'):
             return self._extract_with_dino(np.array(pil_image), mask_arrays)
@@ -348,6 +364,9 @@ class EmbeddingExtractor:
         if not SEARCHDET_AVAILABLE:
             # Заглушка
             return np.random.rand(1024).astype(np.float32)
+        
+        if self.backbone.startswith('dinov3'):
+            return self._get_dinov3_global(np.array(pil_image))
         
         if self.backbone.startswith('dinov2'):
             return self._get_dino_global(np.array(pil_image))
@@ -672,6 +691,40 @@ class EmbeddingExtractor:
 
 
     def build_queries_multiclass(self, pos_by_class, neg_imgs):
+        if str(self.backbone).startswith('dinov3'):
+            self._ensure_dinov3_convnext()
+            D = 1024  # ConvNeXt-B embedding dimension
+
+            neg_list = []
+            for i, img in enumerate(neg_imgs or []):
+                try:
+                    v = self._get_dinov3_global(np.array(img))
+                    v = np.asarray(v, dtype=np.float32).reshape(-1)
+                    # Нормализация уже выполнена в _get_dinov3_global
+                    neg_list.append(v.copy())
+                except Exception as e:
+                    print(f"   ⚠️ Ошибка с negative {i}: {e}")
+            q_neg = np.stack(neg_list, axis=0) if neg_list else np.zeros((0, D), dtype=np.float32)
+            
+            class_pos = {}
+            if pos_by_class is None:
+                pos_by_class = {}
+            for cls, imgs in (pos_by_class or {}).items():
+                vecs = []
+                for i, img in enumerate(imgs or []):
+                    try:
+                        v = self._get_dinov3_global(np.array(img))
+                        v = np.asarray(v, dtype=np.float32).reshape(-1)
+                        # Нормализация уже выполнена в _get_dinov3_global
+                        vecs.append(v.copy())
+                    except Exception as e:
+                        print(f"   ⚠️ Ошибка с positive '{cls}' #{i}: {e}")
+                Q = np.stack(vecs, axis=0) if vecs else np.zeros((0, D), dtype=np.float32)
+                class_pos[cls] = Q.astype(np.float32)
+                print(f"   📊 Класс '{cls}': {Q.shape[0]} примеров")
+            print(f"   📊 Negative всего: {q_neg.shape[0]}")
+            return class_pos, q_neg.astype(np.float32)
+        
         if str(self.backbone).startswith('dinov2'):
             self._ensure_dino()
             D = 1024
@@ -772,11 +825,180 @@ class EmbeddingExtractor:
         return class_pos, q_neg
 
 
+    # =========================
+    # DINOv3 ConvNeXt-B support
+    # =========================
+    def _ensure_dinov3_convnext(self):
+        # Если модель уже предзагружена в детекторе, используем её
+        if self._dinov3_model is not None:
+            return
+        
+        # Fallback: ленивая загрузка если предзагрузка не сработала
+        try:
+            import timm
+            import torchvision.transforms as T
+            from torchvision.transforms import InterpolationMode
+            import torch
+
+            print("🔄 Ленивая загрузка DINOv3 ConvNeXt-B (предзагрузка не сработала)")
+            
+            # 1) Модель ConvNeXt-B без классификатора (эмбеддинги)
+            self._dinov3_model = timm.create_model('convnext_base', pretrained=False, num_classes=0)
+            
+            # 2) Загружаем веса DINOv3
+            if self.dinov3_ckpt and os.path.exists(self.dinov3_ckpt):
+                print(f"🔧 Загружаем DINOv3 веса из: {self.dinov3_ckpt}")
+                state_dict = torch.load(self.dinov3_ckpt, map_location='cpu')
+                # Обрабатываем разные форматы checkpoint
+                if 'state_dict' in state_dict:
+                    state_dict = state_dict['state_dict']
+                elif 'model' in state_dict:
+                    state_dict = state_dict['model']
+                self._dinov3_model.load_state_dict(state_dict, strict=False)
+            else:
+                print(f"⚠️ DINOv3 checkpoint не найден: {self.dinov3_ckpt}, используем случайные веса")
+            
+            self._dinov3_model.eval()
+            
+            # 3) Препроцессинг (стандартный ImageNet)
+            self._dinov3_preprocess = T.Compose([
+                T.Resize(256, interpolation=InterpolationMode.BICUBIC),
+                T.CenterCrop(224),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+            
+            print(f"🧩 DINOv3 ConvNeXt-B инициализирован (ленивая загрузка)")
+            
+        except Exception as e:
+            print(f"⚠️ Не удалось инициализировать DINOv3: {e}")
+            self._dinov3_model = None
+
+    def _get_dinov3_global(self, image_np: np.ndarray):
+        """Получает глобальный эмбеддинг изображения через DINOv3 ConvNeXt-B."""
+        self._ensure_dinov3_convnext()
+        if self._dinov3_model is None:
+            return np.random.rand(1024).astype(np.float32)
+        
+        import torch
+        with torch.no_grad():
+            pil = Image.fromarray(image_np)
+            x = self._dinov3_preprocess(pil).unsqueeze(0)
+            
+            # Переводим тензор на то же устройство что и модель
+            if hasattr(self._dinov3_model, 'device'):
+                x = x.to(next(self._dinov3_model.parameters()).device)
+            elif torch.cuda.is_available() and next(self._dinov3_model.parameters()).is_cuda:
+                x = x.cuda()
+            
+            # Получаем эмбеддинг
+            embedding = self._dinov3_model(x)
+            
+            # ConvNeXt возвращает (B, D) для num_classes=0
+            vec = embedding[0].detach().cpu().float().numpy().squeeze()
+            
+            # Приводим к 1024 при необходимости
+            if vec.shape[0] != 1024:
+                out = np.zeros(1024, dtype=np.float32)
+                take = min(1024, vec.shape[0])
+                out[:take] = vec[:take]
+                vec = out
+                
+            # L2 norm
+            vec_norm = np.linalg.norm(vec)
+            if vec_norm > 1e-8:
+                vec = vec / vec_norm
+            return vec.astype(np.float32)
+
+    def _extract_with_dinov3_convnext(self, image_np, mask_arrays):
+        """Извлекает эмбеддинги масок через DINOv3 ConvNeXt-B с masked pooling."""
+        import time
+        import torch
+        import cv2
+        
+        extract_start = time.time()
+        self._ensure_dinov3_convnext()
+        if self._dinov3_model is None:
+            return None
+
+        # Масштабирование изображения для оптимизации
+        H0, W0 = image_np.shape[:2]
+        scale = 1.0
+        
+        if max(H0, W0) > self.max_embedding_size:
+            if H0 >= W0:
+                scale = self.max_embedding_size / float(H0)
+            else:
+                scale = self.max_embedding_size / float(W0)
+            scaled_image = cv2.resize(image_np, (int(W0 * scale), int(H0 * scale)), interpolation=cv2.INTER_LINEAR)
+            print(f"   🔧 Масштабирование DINOv3: {W0}x{H0} → {scaled_image.shape[1]}x{scaled_image.shape[0]} (scale={scale:.3f})")
+        else:
+            scaled_image = image_np
+
+        # Масштабируем маски соответственно
+        scaled_masks = []
+        for mask in mask_arrays:
+            if scale != 1.0:
+                scaled_mask = cv2.resize(mask.astype(np.uint8), 
+                                       (scaled_image.shape[1], scaled_image.shape[0]), 
+                                       interpolation=cv2.INTER_NEAREST).astype(bool)
+            else:
+                scaled_mask = mask
+            scaled_masks.append(scaled_mask)
+
+        embeddings = []
+        with torch.no_grad():
+            for i, mask in enumerate(scaled_masks):
+                try:
+                    # Применяем маску к изображению (зануляем фон)
+                    masked_image = scaled_image.copy()
+                    masked_image[~mask] = 0
+                    
+                    # Получаем эмбеддинг
+                    pil = Image.fromarray(masked_image)
+                    x = self._dinov3_preprocess(pil).unsqueeze(0)
+                    
+                    # Переводим тензор на то же устройство что и модель
+                    if hasattr(self._dinov3_model, 'device'):
+                        x = x.to(next(self._dinov3_model.parameters()).device)
+                    elif torch.cuda.is_available() and next(self._dinov3_model.parameters()).is_cuda:
+                        x = x.cuda()
+                    
+                    embedding = self._dinov3_model(x)
+                    vec = embedding[0].detach().cpu().float().numpy().squeeze()
+                    
+                    # Приводим к 1024
+                    if vec.shape[0] != 1024:
+                        out = np.zeros(1024, dtype=np.float32)
+                        take = min(1024, vec.shape[0])
+                        out[:take] = vec[:take]
+                        vec = out
+                    
+                    # L2-нормализация для согласованности с positive/negative примерами
+                    vec_norm = np.linalg.norm(vec)
+                    if vec_norm > 1e-8:
+                        vec = vec / vec_norm
+                    
+                    embeddings.append(vec.astype(np.float32))
+                    
+                except Exception as e:
+                    print(f"   ⚠️ Ошибка с маской {i}: {e}")
+                    embeddings.append(np.zeros(1024, dtype=np.float32))
+
+        extract_time = time.time() - extract_start
+        print(f"   ⚡ DINOv3 ConvNeXt-B: {extract_time:.3f} сек ({extract_time/len(mask_arrays)*1000:.1f} мс/маска)")
+
+        if embeddings:
+            return np.stack(embeddings, axis=0).astype(np.float32)
+        return None
+
+
 class DINOv3Embedding(nn.Module):
     def __init__(self, ckpt_path):
         super().__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = ConvNeXt(arch='base', out_indices=-1)
-        state_dict = torch.load(ckpt_path)['state_dict']
+        state_dict = torch.load(ckpt_path, map_location=self.device)['state_dict']
         self.model.load_state_dict(state_dict)
         self.model.eval()
         self.model.to(self.device)

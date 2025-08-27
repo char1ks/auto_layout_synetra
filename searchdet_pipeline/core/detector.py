@@ -23,7 +23,7 @@ from .filtering import MaskFilter
 from .embeddings import EmbeddingExtractor
 from .scoring import ScoreCalculator
 from .step7_result_saving import ResultSaver
-from .embeddings import ResNet101Embedding, DINOv2Embedding, DINOv3Embedding
+from .embeddings import ResNet101Embedding, DINOv3Embedding
 from .sam_predictor import SAMPredictor
 from .utils import get_image_size, get_feature_map_size, upsample_feature_map
 
@@ -36,6 +36,7 @@ class SearchDetDetector:
         self.sam_encoder = self.params.get('sam_encoder', 'vit_l')
         self.sam_model = self.params.get('sam_model', None)
         self.backbone = self.params.get('backbone', 'dinov2_b')
+        self.dinov3_ckpt = self.params.get('dinov3_ckpt', None)
         if not self.backbone.startswith('dinov2'):
             feat_short = str(self.params.get('feat_short_side', 384))
             os.environ['SEARCHDET_FEAT_SHORT_SIDE'] = feat_short
@@ -73,12 +74,73 @@ class SearchDetDetector:
         self.fastsam_retina = bool(self.params.get('fastsam_retina', True))
         self.ban_border_masks = bool(self.params.get('border_ban', True))
         self.border_width = int(self.params.get('border_width', 2))
+        # 🚀 Предзагрузка DINOv3 при инициализации (если используется)
+        if self.backbone.startswith('dinov3') and self.dinov3_ckpt:
+            print(f"🔧 Предзагрузка DINOv3 ConvNeXt-B: {self.dinov3_ckpt}")
+            self._preload_dinov3()
+        
         self.mask_generator = MaskGenerator(self)
         self.mask_filter = MaskFilter(self, self.params)
         self.embedding_extractor = EmbeddingExtractor(self)
         self.score_calculator = ScoreCalculator(self, self.params)
         self.result_saver = ResultSaver()
         print("✅ SearchDetDetector инициализирован (автономная модульная версия)")
+    
+    def _preload_dinov3(self):
+        """Предзагрузка DINOv3 ConvNeXt-B модели при инициализации детектора."""
+        try:
+            import torch
+            import timm
+            import torchvision.transforms as T
+            from torchvision.transforms import InterpolationMode
+            
+            print("🔄 Загрузка DINOv3 ConvNeXt-B модели...")
+            
+            # Создаем модель ConvNeXt-B без классификатора (эмбеддинги)
+            self.dinov3_model = timm.create_model('convnext_base', pretrained=False, num_classes=0)
+            
+            # Загружаем веса DINOv3
+            if self.dinov3_ckpt and os.path.exists(self.dinov3_ckpt):
+                print(f"🔧 Загружаем DINOv3 веса из: {self.dinov3_ckpt}")
+                state_dict = torch.load(self.dinov3_ckpt, map_location='cpu')
+                # Обрабатываем разные форматы checkpoint
+                if 'state_dict' in state_dict:
+                    state_dict = state_dict['state_dict']
+                elif 'model' in state_dict:
+                    state_dict = state_dict['model']
+                self.dinov3_model.load_state_dict(state_dict, strict=False)
+            else:
+                print(f"⚠️ DINOv3 checkpoint не найден: {self.dinov3_ckpt}, используем случайные веса")
+            
+            # Создаем препроцессор (стандартный ImageNet)
+            self.dinov3_preprocess = T.Compose([
+                T.Resize(256, interpolation=InterpolationMode.BICUBIC),
+                T.CenterCrop(224),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+            
+            # Переводим в eval режим и на GPU если доступно
+            self.dinov3_model.eval()
+            if torch.cuda.is_available():
+                self.dinov3_model = self.dinov3_model.cuda()
+                print("🚀 DINOv3 модель загружена на GPU")
+            else:
+                print("💻 DINOv3 модель загружена на CPU")
+                
+            # Применяем половинную точность если включено
+            if self.dino_half_precision and torch.cuda.is_available():
+                self.dinov3_model = self.dinov3_model.half()
+                print("⚡ DINOv3 переведена в половинную точность")
+                
+            print("✅ DINOv3 ConvNeXt-B успешно предзагружена")
+            
+        except Exception as e:
+            print(f"❌ Ошибка предзагрузки DINOv3: {e}")
+            # Устанавливаем None чтобы использовать ленивую загрузку
+            self.dinov3_model = None
+            self.dinov3_preprocess = None
+    
     def find_present_elements(self, image_path, positive_dir, negative_dir=None, output_dir="output"):
         """Основная функция поиска объектов."""
         print(f"🔍 Модульный анализ: {image_path}" + "="*60)

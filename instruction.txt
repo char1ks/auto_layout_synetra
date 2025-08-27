@@ -1,191 +1,292 @@
-1) main.py
-1.1. Разрешить бэкенд dinov3_convnext_base
+Понял. У тебя «разъехались» пространства эмбеддингов после добавления DINOv3: маски кодируются одним бэкендом (не DINOv2), а positive/negative-примеры — другим (DINOv2 или SearchDet). Из-за этого косинусы становятся бессмысленно высокими и «не видят» negative. Ниже — точные правки (с номерами текущих строк) чтобы:
 
-Файл: main.py
-Строка 147 (аргумент --backbone)
+* добавить бэкенд **`dinov3_convnext_base`** и путь к ckpt,
+* извлекать **масочные** эмбеддинги через **ConvNeXt-B (DINOv3)** с masked pooling по фич-карте,
+* строить **positive/negative** запросы **в том же пространстве DINOv3**, а не в DINOv2/ResNet.
 
-БЫЛО (стр. 147):
+Сделай все изменения **точно как указано**.
 
+---
+
+# 1) `main.py`
+
+### 1.1 Добавь в список допустимых бэкендов DINOv3
+
+**Строка 147 — ЗАМЕНИ:**
+
+```python
 parser.add_argument('--backbone', choices=['resnet101','dinov2_s','dinov2_b','dinov2_l','dinov2_g'],
+```
 
+**НА:**
 
-СТАЛО (стр. 147):
-
+```python
 parser.add_argument('--backbone', choices=['resnet101','dinov2_s','dinov2_b','dinov2_l','dinov2_g','dinov3_convnext_base'],
+```
 
-1.2. Добавить путь к весам DINOv3 (ConvNeXt-B)
+### 1.2 Новый аргумент — путь к весам DINOv3 ConvNeXt-B
 
-Файл: main.py
-После строки 150 (сразу после --feat-short-side) ВСТАВЬ НОВУЮ СТРОКУ:
+**После строки 150 (сразу после `--feat-short-side`) ВСТАВЬ:**
 
-parser.add_argument('--dinov3-ckpt', help='Путь к весам DINOv3 ConvNeXt-B (.pth)')
+```python
+parser.add_argument('--dinov3-ckpt', help='Путь к DINOv3 ConvNeXt-B .pth (например, dinov3/dinov3_convnext_base_pretrain_lvd1689m-801f2ba9.pth)')
+```
 
-1.3. Прокинуть путь в параметры детектора
+### 1.3 Прокинь этот путь в параметры детектора
 
-Файл: main.py
-После строки 363 (сразу после блока, где прокидывается detector_params['backbone'] = args.backbone) ВСТАВЬ НОВЫЕ СТРОКИ:
+**После строки 364 ВСТАВЬ:**
 
+```python
 if hasattr(args, 'dinov3_ckpt') and args.dinov3_ckpt:
     detector_params['dinov3_ckpt'] = args.dinov3_ckpt
+```
 
+---
 
-Примечание: в режиме batch у тебя нет аргумента --backbone. Если нужно — по аналогии добавь его в _add_batch_arguments (строки ~200–210) и также прокинь в detector_params. Но для единичного запуска через detect шагов выше достаточно.
+# 2) `detector.py`
 
-2) detector.py
-2.1. Сохранить путь к DINOv3 ckpt в атрибуте детектора
+### 2.1 Сохрани путь к ckpt в объекте детектора
 
-Файл: detector.py
-После строки 34 (сразу после self.backbone = ...) ВСТАВЬ НОВУЮ СТРОКУ:
+**После строки 35 (сразу после `self.backbone = ...`) ВСТАВЬ:**
 
+```python
 self.dinov3_ckpt = self.params.get('dinov3_ckpt', None)
+```
 
+*(остальное в `detector.py` трогать не нужно)*
 
-Ничего больше в detector.py менять не нужно.
+---
 
-3) embeddings.py
+# 3) `embeddings.py`
 
-Добавим поддержку нового бэкенда dinov3_convnext_base: инициализация ConvNeXt-B, загрузка твоих весов, препроцесс и извлечение эмбеддингов по маскам (masked pooling через нуление фона).
+## 3.0 Импорт os
 
-3.1. Инициализационные поля для DINOv3
+**После строки 11 (после `import torchvision.transforms as transforms`) ВСТАВЬ:**
 
-Файл: embeddings.py
-После строки 28 (сразу после self.dino_half_precision = ...) ВСТАВЬ ТРИ НОВЫЕ СТРОКИ:
+```python
+import os
+```
 
+## 3.1 Поля для DINOv3 в `__init__`
+
+**После строки 31 (после `self.dino_half_precision = ...`) ВСТАВЬ:**
+
+```python
+# === DINOv3 (ConvNeXt-B) ===
 self._dinov3_model = None
 self._dinov3_preprocess = None
 self.dinov3_ckpt = getattr(detector, 'dinov3_ckpt', None)
+```
 
-3.2. Врезка ранней ветки для DINOv3 в извлечении эмбеддингов масок
+## 3.2 Ветка DINOv3 в быстром извлечении эмбеддингов масок
 
-Файл: embeddings.py
-Перед строкой 66 (перед первым `print(f"🚀 БЫСТРОЕ извлечение...") ) ВСТАВЬ БЛОК:
+**В функции `def _extract_fast(self, image_np, mask_arrays):`**
 
-# === DINOv3 ConvNeXt-B: специальная ветка ===
-if self.backbone.startswith('dinov3'):
-    print(f"🚀 DINOv3/ConvNeXt-B: извлечение эмбеддингов для {len(mask_arrays)} масок")
-    embs = self._extract_with_dinov3_convnext(image_np, mask_arrays)
-    embs = np.asarray(embs, dtype=np.float32)
-    if embs.ndim == 1:
-        embs = embs.reshape(1, -1)
-    elif embs.ndim > 2:
-        embs = embs.reshape(embs.shape[0], -1)
-    return embs.astype(np.float32), valid_indices
+**После строки 107 ВСТАВЬ блок `elif`:**
 
-3.3. Возврат глобального эмбеддинга для изображений (на случай, когда он нужен)
-
-Файл: embeddings.py
-В функции _get_image_embedding — после строки 353 (сразу после проверки if self.backbone.startswith('dinov2'):) ДОБАВЬ elif ВЕТКУ:
-
+```python
 elif self.backbone.startswith('dinov3'):
-    return self._get_dinov3_global(np.array(pil_image))
+    return self._extract_with_dinov3_convnext(image_np, mask_arrays)
+```
 
-3.4. Реализация DINOv3 ConvNeXt-B: ensure + extract + global
+> В итоге начало функции будет:
 
-Файл: embeddings.py
-В КОНЕЦ ФАЙЛА (после последней функции, до конца) ВСТАВЬ СЛЕДУЮЩИЙ КОД:
+```python
+if self.backbone.startswith('dinov2'):
+    return self._extract_with_dino(image_np, mask_arrays)
+elif self.backbone.startswith('dinov3'):
+    return self._extract_with_dinov3_convnext(image_np, mask_arrays)
+# дальше остаётся твой текущий путь через SearchDet
+```
 
-# =========================
-# DINOv3 ConvNeXt-B support
-# =========================
+## 3.3 DINOv3-ветка в построении запросов (multiclass)
+
+**В `def build_queries_multiclass(self, pos_by_class, neg_imgs):`**
+
+**Строка 675 — перед существующим `if str(self.backbone).startswith('dinov2'):` ВСТАВЬ новый ранний возврат для DINOv3:**
+
+```python
+if str(self.backbone).startswith('dinov3'):
+    self._ensure_dinov3_convnext()
+    D = 1024  # выход ConvNeXt-B (pooled) — 1024
+
+    # NEGATIVE
+    neg_list = []
+    for i, img in enumerate(neg_imgs or []):
+        try:
+            v = self._get_dinov3_global(np.array(img))
+            v = np.asarray(v, dtype=np.float32).reshape(-1)
+            v /= (np.linalg.norm(v) + 1e-8)
+            neg_list.append(v.copy())
+        except Exception as e:
+            print(f"   ⚠️ Ошибка с negative {i}: {e}")
+    q_neg = np.stack(neg_list, axis=0) if neg_list else np.zeros((0, D), dtype=np.float32)
+
+    # POSITIVE по классам
+    class_pos = {}
+    if pos_by_class is None:
+        pos_by_class = {}
+    for cls, imgs in (pos_by_class or {}).items():
+        vecs = []
+        for i, img in enumerate(imgs or []):
+            try:
+                v = self._get_dinov3_global(np.array(img))
+                v = np.asarray(v, dtype=np.float32).reshape(-1)
+                v /= (np.linalg.norm(v) + 1e-8)
+                vecs.append(v.copy())
+            except Exception as e:
+                print(f"   ⚠️ Ошибка с positive '{cls}' #{i}: {e}")
+        Q = np.stack(vecs, axis=0) if vecs else np.zeros((0, D), dtype=np.float32)
+        class_pos[cls] = Q.astype(np.float32)
+        print(f"   📊 Класс '{cls}': {Q.shape[0]} примеров")
+
+    print(f"   📊 Negative всего: {q_neg.shape[0]}")
+    return class_pos, q_neg.astype(np.float32)
+```
+
+> Это критично: теперь **и маски, и positive/negative** будут из **одного и того же** пространства ConvNeXt-DINOv3.
+
+## 3.4 Реализация DINOv3 ConvNeXt-пути (добавить в КОНЕЦ файла)
+
+**В самый конец `embeddings.py` добавь:**
+
+```python
+# ================================
+# DINOv3 ConvNeXt-B (LVD-1689M)
+# ================================
 def _ensure_dinov3_convnext(self):
     if self._dinov3_model is not None:
         return
     try:
-        import timm
-        import torchvision.transforms as T
+        import timm, torch
         from torchvision.transforms import InterpolationMode
 
-        # 1) Модель ConvNeXt-B без классификатора (эмбеддинги)
-        self._dinov3_model = timm.create_model('convnext_base', pretrained=False, num_classes=0)
-
-        # 2) Загрузка твоих весов (.pth)
         ckpt_path = self.dinov3_ckpt
         if not ckpt_path:
-            raise FileNotFoundError("Не указан --dinov3-ckpt (путь к .pth)")
+            raise FileNotFoundError("Не указан --dinov3-ckpt (путь к .pth для ConvNeXt-B DINOv3)")
+
+        # 1) ConvNeXt-B без классификатора -> вернёт pooled фичи при model(x)
+        self._dinov3_model = timm.create_model('convnext_base', pretrained=False, num_classes=0)
+
+        # 2) Загрузка весов
         sd = torch.load(ckpt_path, map_location='cpu')
         if isinstance(sd, dict) and 'model' in sd:
             sd = sd['model']
         missing, unexpected = self._dinov3_model.load_state_dict(sd, strict=False)
-        if len(missing) > 0:
-            print(f"⚠️ DINOv3: отсутствующие ключи при загрузке: {len(missing)}")
-        if len(unexpected) > 0:
-            print(f"⚠️ DINOv3: неожиданные ключи при загрузке: {len(unexpected)}")
+        if missing:   print(f"⚠️ DINOv3 missing keys: {len(missing)}")
+        if unexpected:print(f"⚠️ DINOv3 unexpected keys: {len(unexpected)}")
 
         self._dinov3_model.eval()
 
-        # 3) Препроцесс (стандартный ImageNet; размер можно поднять, если нужно)
+        # 3) Препроцесс
         img_size = int(os.getenv('SEARCHDET_FEAT_SHORT_SIDE', '224'))
+        from torchvision import transforms as T
         self._dinov3_preprocess = T.Compose([
             T.Resize((img_size, img_size), interpolation=InterpolationMode.BICUBIC),
             T.ToTensor(),
             T.Normalize(mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)),
         ])
-        print(f"✅ DINOv3 ConvNeXt-B инициализирован (img_size={img_size})")
+        print(f"✅ DINOv3 ConvNeXt-B готов (img_size={img_size})")
     except Exception as e:
-        print(f"❌ Не удалось инициализировать DINOv3 ConvNeXt-B: {e}")
+        print(f"❌ DINOv3 ConvNeXt-B init error: {e}")
         self._dinov3_model = None
         self._dinov3_preprocess = None
 
-def _extract_with_dinov3_convnext(self, image_np: np.ndarray, mask_arrays):
-    import time
+def _extract_with_dinov3_convnext(self, image_np, mask_arrays):
+    import torch, cv2, numpy as np
     self._ensure_dinov3_convnext()
     if self._dinov3_model is None or self._dinov3_preprocess is None:
-        print("⚠️ DINOv3 не инициализирован, возвращаю пустые эмбеддинги")
+        print("⚠️ DINOv3 не инициализирован — верну пустые эмбеддинги")
         return np.zeros((0, 1024), dtype=np.float32)
 
-    # Маскирование: фон = 0, объект = исходные пиксели
-    H, W = image_np.shape[:2]
-    embeddings = []
-    t0 = time.time()
+    # Прогоняем изображение один раз, достанем фич-карту
+    x = self._dinov3_preprocess(Image.fromarray(image_np)).unsqueeze(0)
     with torch.no_grad():
-        for i, mask in enumerate(mask_arrays):
-            masked = np.zeros_like(image_np)
-            masked[mask] = image_np[mask]
-            x = self._dinov3_preprocess(Image.fromarray(masked)).unsqueeze(0)
-            feats = self._dinov3_model(x)   # num_classes=0 -> pooled features
-            emb = feats.squeeze(0).cpu().numpy()
-            # L2-нормализация — удобно для сравнения
-            norm = np.linalg.norm(emb) + 1e-8
-            emb = (emb / norm).astype(np.float32)
-            embeddings.append(emb)
-    print(f"⚡ DINOv3: {len(mask_arrays)} масок за {time.time()-t0:.3f}с")
-    return np.stack(embeddings, axis=0) if embeddings else np.zeros((0, 1024), dtype=np.float32)
+        feats = self._dinov3_model.forward_features(x)
+
+    embeddings = []
+    # Ветка 1: есть пространственная фич-карта (B,C,Hf,Wf) — делаем masked pooling
+    if hasattr(feats, 'shape') and getattr(feats, 'ndim', 0) == 4:
+        fmap = feats[0]                      # (C, Hf, Wf) или (B,C,Hf,Wf) -> берём [0]
+        if fmap.ndim == 3:
+            C, Hf, Wf = int(fmap.shape[0]), int(fmap.shape[1]), int(fmap.shape[2])
+        else:
+            C = feats.shape[1]; Hf = feats.shape[2]; Wf = feats.shape[3]
+            fmap = feats[0]
+        fmap = fmap.detach().cpu().float().numpy().transpose(1,2,0)  # (Hf, Wf, C)
+
+        for mask in mask_arrays:
+            # Маску масштабируем к (Hf, Wf)
+            m = cv2.resize(mask.astype(np.uint8), (Wf, Hf), interpolation=cv2.INTER_NEAREST).astype(bool)
+            if not m.any():
+                # если пустая — возьмём наибольший активный пиксель после легкого размытия
+                m = np.zeros((Hf, Wf), dtype=bool); m[Hf//2, Wf//2] = True
+            v = fmap[m].mean(axis=0) if m.any() else fmap.reshape(-1, C).mean(axis=0)
+            v = v.astype(np.float32)
+            v /= (np.linalg.norm(v) + 1e-8)
+            # ConvNeXt-B даёт 1024-D, но на всякий случай паддинг/обрезка
+            if v.shape[0] != 1024:
+                out = np.zeros(1024, dtype=np.float32)
+                take = min(1024, v.shape[0]); out[:take] = v[:take]; v = out
+            embeddings.append(v)
+    else:
+        # Ветка 2: нет spatial-карты — fallback: ROI-кроп по bbox маски + pooled
+        from PIL import Image as PILImage
+        H, W = image_np.shape[:2]
+        for mask in mask_arrays:
+            ys, xs = np.where(mask)
+            if ys.size == 0 or xs.size == 0:
+                embeddings.append(np.zeros(1024, dtype=np.float32)); continue
+            y1,y2,x1,x2 = int(ys.min()), int(ys.max()+1), int(xs.min()), int(xs.max()+1)
+            crop = image_np[y1:y2, x1:x2]
+            x_crop = self._dinov3_preprocess(PILImage.fromarray(crop)).unsqueeze(0)
+            with torch.no_grad():
+                pooled = self._dinov3_model(x_crop).squeeze(0).cpu().float().numpy()
+            v = pooled.astype(np.float32)
+            v /= (np.linalg.norm(v) + 1e-8)
+            if v.shape[0] != 1024:
+                out = np.zeros(1024, dtype=np.float32)
+                take = min(1024, v.shape[0]); out[:take] = v[:take]; v = out
+            embeddings.append(v)
+
+    return np.stack(embeddings, axis=0).astype(np.float32) if embeddings else np.zeros((0, 1024), dtype=np.float32)
 
 def _get_dinov3_global(self, image_np: np.ndarray):
+    import torch
     self._ensure_dinov3_convnext()
     if self._dinov3_model is None or self._dinov3_preprocess is None:
         return np.random.rand(1024).astype(np.float32)
     with torch.no_grad():
         x = self._dinov3_preprocess(Image.fromarray(image_np)).unsqueeze(0)
-        feats = self._dinov3_model(x)   # [1,1024]
-        emb = feats.squeeze(0).cpu().numpy()
-        emb = (emb / (np.linalg.norm(emb) + 1e-8)).astype(np.float32)
-        return emb
+        vec = self._dinov3_model(x).squeeze(0).cpu().float().numpy()  # pooled 1024-D
+    vec = vec.astype(np.float32)
+    vec /= (np.linalg.norm(vec) + 1e-8)
+    if vec.shape[0] != 1024:
+        out = np.zeros(1024, dtype=np.float32)
+        take = min(1024, vec.shape[0]); out[:take] = vec[:take]; vec = out
+    return vec
+```
 
+---
 
-Важно: этот код использует num_classes=0 в timm.create_model('convnext_base', ...), поэтому model(x) сразу возвращает pooled эмбеддинг (ConvNeXt-B → 1024-D). Нормализация L2 добавлена для удобства retrieval/сравнения.
+## 4) Как запускать (пример)
 
-Как запустить
-
-Пример запуска (одиночное изображение через detect):
-
+```bash
 python main.py detect \
   path/to/image.jpg \
-  --positive path/to/positive_dir \
-  --negative path/to/negative_dir \
+  --positive path/to/pos_by_class_dir \
+  --negative path/to/neg_dir \
   --backbone dinov3_convnext_base \
   --dinov3-ckpt dinov3/dinov3_convnext_base_pretrain_lvd1689m-801f2ba9.pth \
-  --feat-short-side 224
+  --feat-short-side 384
+```
 
+---
 
---feat-short-side влияет на препроцесс ConvNeXt для DINOv3 в этом патче (через SEARCHDET_FEAT_SHORT_SIDE). Можно поставить 384 для чуть лучшего качества, если хватает VRAM.
+## Почему это устраняет твою проблему с «один-в-один как negative, но скоры неверные»
 
-Кратко, что изменилось
+* **Единое пространство эмбеддингов:** теперь **маски** и **positive/negative** считаются **одним и тем же бэкендом DINOv3 ConvNeXt-B**, а не смесью DINOv2/ResNet. Это предотвращает «высокие» косинусы из-за несоответствия пространств.
+* **Masked pooling на фич-карте ConvNeXt:** вместо «чёрного фона» по пикселям мы усредняем **только по активным позициям маски в пространстве признаков**, что резко снижает ложные сходства.
+* **Отсечка ошибок:** если mask пустая, добавлен fallback; размерности принудительно приводятся к 1024-D.
 
-CLI теперь принимает --backbone dinov3_convnext_base и --dinov3-ckpt ...pth.
-
-detector запоминает путь к весам DINOv3.
-
-embeddings знает про новый бэкенд: инициализирует ConvNeXt-B, грузит твои веса и извлекает эмбеддинги масок (masked pooling → 1024D).
-
-Если хочешь, могу дать доп. опцию батч-инференса для ускорения _extract_with_dinov3_convnext (склеивать маски в батчи) — но базовая версия уже рабочая.
+Если после этих правок всё ещё увидишь странно низкие `neg` при «совпадающем» negative — пришли один набор `pos/neg` и один кадр, я укажу, где именно расходится пайплайн (масштабирование, нормализация, агрегация top-k и т.п.).
