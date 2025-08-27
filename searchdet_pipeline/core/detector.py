@@ -23,6 +23,9 @@ from .filtering import MaskFilter
 from .embeddings import EmbeddingExtractor
 from .scoring import ScoreCalculator
 from .step7_result_saving import ResultSaver
+from .embeddings import ResNet101Embedding, DINOv2Embedding, DINOv3Embedding
+from .sam_predictor import SAMPredictor
+from .utils import get_image_size, get_feature_map_size, upsample_feature_map
 
 
 class SearchDetDetector:
@@ -408,3 +411,21 @@ class SearchDetDetector:
             print("   • Проверьте размер feature map (SEARCHDET_FEAT_SHORT_SIDE)")
             print("   • Убедитесь что используется быстрый метод извлечения")
         print()
+class Detector:
+    def __init__(self, sam_encoder: str, sam_checkpoint: str, sam2_checkpoint: str, 
+                 backbone: str = 'dinov2_b', layer: str = 'layer3', 
+                 feat_short_side: int = 512, dinov3_ckpt: str = None):
+        # Загрузка SAM
+        self.sam_predictor = SAMPredictor(sam_encoder, sam_checkpoint, sam2_checkpoint)
+
+        # Загрузка модели эмбеддингов
+        if backbone == 'resnet101':
+            self.embedding_model = ResNet101Embedding(layer=layer)
+        elif backbone.startswith('dinov2'):
+            self.embedding_model = DINOv2Embedding(backbone=backbone)
+        elif backbone == 'dinov3_convnext_base':
+            self.embedding_model = DINOv3Embedding(dinov3_ckpt)
+        else:
+            raise ValueError(f"Неизвестный бэкенд: {backbone}")
+
+        self.backbone = backbone
