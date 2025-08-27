@@ -395,14 +395,11 @@ class MaskFilter:
         return filtered_masks
     
     def _filter_nested_masks_fast(self, masks):
-        """Быстрая версия фильтрации вложенных масок с векторизацией"""
         if len(masks) <= 1:
             return masks
             
-        # Сортируем по площади (большие первыми)
         filtered_masks = sorted(masks, key=lambda m: m['area'], reverse=True)
         
-        # Быстрая проверка через bbox пересечения
         to_remove = set()
         
         for i in range(len(filtered_masks)):
@@ -413,7 +410,6 @@ class MaskFilter:
             bbox_i = mask_i['bbox']
             area_i = mask_i['area']
             
-            # Быстрая проверка bbox пересечений для следующих масок
             for j in range(i + 1, len(filtered_masks)):
                 if j in to_remove:
                     continue
@@ -421,18 +417,14 @@ class MaskFilter:
                 mask_j = filtered_masks[j]
                 bbox_j = mask_j['bbox']
                 area_j = mask_j['area']
-                
-                # Быстрая проверка bbox пересечения
                 x1_i, y1_i, w_i, h_i = bbox_i
                 x1_j, y1_j, w_j, h_j = bbox_j
                 x2_i, y2_i = x1_i + w_i, y1_i + h_i
                 x2_j, y2_j = x1_j + w_j, y1_j + h_j
                 
-                # Проверяем пересечение bbox
                 if not (x1_i < x2_j and x2_i > x1_j and y1_i < y2_j and y2_i > y1_j):
                     continue  # Нет пересечения bbox - пропускаем
                 
-                # Только если bbox пересекаются, проверяем точное пересечение
                 seg_i = mask_i['segmentation']
                 seg_j = mask_j['segmentation']
                 
@@ -454,10 +446,51 @@ class MaskFilter:
         return masks
     
     def _apply_mask_correction_fast(self, masks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Ультра-быстрая коррекция масок - минимальная обработка"""
         if not self.enable_mask_correction:
             return masks
+        
+        import cv2
+        
+        corrected_masks = []
+        
+        for mask_dict in masks:
+            mask = mask_dict['segmentation']
+            mask_uint8 = mask.astype(np.uint8)
             
-        # Для максимальной скорости просто возвращаем маски без коррекции
-        # Коррекция масок занимает слишком много времени даже с scipy
-        return masks
+            kernel_size = self.correction_kernel_size
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        
+            smoothed_mask = mask_uint8
+            
+            if self.erosion_iterations > 0:
+                smoothed_mask = cv2.morphologyEx(smoothed_mask, cv2.MORPH_OPEN, kernel, iterations=self.erosion_iterations)
+            
+            if self.dilation_iterations > 0:
+                smoothed_mask = cv2.morphologyEx(smoothed_mask, cv2.MORPH_CLOSE, kernel, iterations=self.dilation_iterations)
+            
+            blur_kernel_size = 3 
+            smoothed_mask = cv2.GaussianBlur(smoothed_mask.astype(np.float32), (blur_kernel_size, blur_kernel_size), 0.8)
+            smoothed_mask = (smoothed_mask > 0.5).astype(bool)
+            
+            corrected_mask_dict = mask_dict.copy()
+            corrected_mask_dict['segmentation'] = smoothed_mask
+            
+            coords = np.column_stack(np.where(smoothed_mask))
+            if len(coords) > 0:
+                y_min, x_min = coords.min(axis=0)
+                y_max, x_max = coords.max(axis=0)
+                bbox = (x_min, y_min, x_max - x_min, y_max - y_min)
+            else:
+                bbox = (0, 0, 0, 0)
+            
+            corrected_mask_dict['bbox'] = bbox
+            corrected_mask_dict['area'] = np.sum(smoothed_mask)
+            
+            # Обновляем кэш
+            mask_hash = self._get_mask_hash(smoothed_mask)
+            self._bbox_cache[mask_hash] = bbox
+            self._area_cache[mask_hash] = corrected_mask_dict['area']
+            
+            corrected_masks.append(corrected_mask_dict)
+        
+        return corrected_masks
