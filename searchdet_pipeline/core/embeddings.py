@@ -770,3 +770,49 @@ class EmbeddingExtractor:
 
         print(f"   📊 Negative всего: {q_neg.shape[0]}")
         return class_pos, q_neg
+
+
+class DINOv3Embedding(nn.Module):
+    def __init__(self, ckpt_path):
+        super().__init__()
+        self.model = ConvNeXt(arch='base', out_indices=-1)
+        state_dict = torch.load(ckpt_path)['state_dict']
+        self.model.load_state_dict(state_dict)
+        self.model.eval()
+        self.model.to(self.device)
+
+    def preprocess(self, image):
+        transform = T.Compose([
+            T.Resize(256),
+            T.CenterCrop(224),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        return transform(image).unsqueeze(0).to(self.device)
+
+    def get_embedding(self, x):
+        with torch.no_grad():
+            embedding = self.model(x)
+        return embedding
+
+
+class ResNet101Embedding(nn.Module):
+    def __init__(self, layer='layer3'):
+        super().__init__()
+        self.model = ResNet(101, 'DINOv2')
+        self.model.eval()
+        self.model.to(self.device)
+
+    def preprocess(self, image):
+        transform = T.Compose([
+            T.Resize(256),
+            T.CenterCrop(224),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        return transform(image).unsqueeze(0).to(self.device)
+
+    def get_embedding(self, x):
+        with torch.no_grad():
+            embedding = self.model(x)
+        return embedding

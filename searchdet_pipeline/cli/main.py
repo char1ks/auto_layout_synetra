@@ -144,10 +144,11 @@ def _add_detect_arguments(parser: argparse.ArgumentParser):
     parser.add_argument('--adaptive-diff-floor', type=float, help='Минимальная разность для адаптивного режима')
     parser.add_argument('--topk', type=int, help='Количество топ-K примеров для агрегации')
     # Пути к моделям и параметры эмбеддингов
-    parser.add_argument('--backbone', choices=['resnet101','dinov2_s','dinov2_b','dinov2_l','dinov2_g'],
+    parser.add_argument('--backbone', choices=['resnet101','dinov2_s','dinov2_b','dinov2_l','dinov2_g','dinov3_convnext_base'],
                        help='Бэкенд эмбеддингов: DINOv2 base (по умолчанию) или другие варианты')
     parser.add_argument('--layer', help='Слой для извлечения эмбеддингов (например, layer3)', default='layer3')
     parser.add_argument('--feat-short-side', type=int, help='Короткая сторона входа фич (например, 384/512/576)')
+    parser.add_argument('--dinov3-ckpt', help='Путь к весам DINOv3 ConvNeXt-B (.pth)')
     parser.add_argument('--sam-checkpoint', help='Путь к checkpoint SAM-HQ')
     parser.add_argument('--sam-encoder', choices=['vit_b','vit_l','vit_h'], help='Энкодер SAM-HQ/SAM2 (vit_b/vit_l/vit_h)')
     parser.add_argument('--sam2-checkpoint', help='Путь к checkpoint SAM2')
@@ -362,7 +363,13 @@ def _execute_detect(args) -> int:
             detector_params['feat_short_side'] = args.feat_short_side
         if hasattr(args, 'backbone') and args.backbone:
             detector_params['backbone'] = args.backbone
-
+        
+        if hasattr(args, 'dinov3_ckpt') and args.dinov3_ckpt:
+            detector_params['dinov3_ckpt'] = args.dinov3_ckpt
+        
+        if hasattr(args, 'layer') and args.layer:
+            detector_params['layer'] = args.layer
+        
         # Режим дефектов
         if hasattr(args, 'defect') and args.defect:
             detector_params['defect_mode'] = True
