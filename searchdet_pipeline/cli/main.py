@@ -144,16 +144,40 @@ def _add_detect_arguments(parser: argparse.ArgumentParser):
     parser.add_argument('--adaptive-diff-floor', type=float, help='Минимальная разность для адаптивного режима')
     parser.add_argument('--topk', type=int, help='Количество топ-K примеров для агрегации')
     # Пути к моделям и параметры эмбеддингов
-    parser.add_argument('--backbone', choices=['resnet101','dinov2_s','dinov2_b','dinov2_l','dinov2_g','dinov3_convnext_base'],
-                       help='Бэкенд эмбеддингов: DINOv2 base (по умолчанию) или другие варианты')
+    parser.add_argument(
+        "--backbone",
+        choices=[
+            "resnet101",
+            "dinov2_s","dinov2_b","dinov2_l","dinov2_g",
+            "dinov3_vitb16","dinov3_vitl16","dinov3_vith14",
+            "dinov3_convnext_tiny","dinov3_convnext_small","dinov3_convnext_base","dinov3_convnext_large",
+            # короткие алиасы (необязательно)
+            "vitb16","vitl16","vith14",
+            "convnext_tiny","convnext_small","convnext_base","convnext_large",
+        ],
+        default="dinov2_b",
+    )
+    
+    # DINOv3 параметры
+    parser.add_argument("--dinov3-backbone", 
+                       default=None, 
+                       choices=["vitb16", "vitl16", "vith14", 
+                                "convnext_tiny", "convnext_small", 
+                                "convnext_base", "convnext_large"], 
+                       help="Какой бэкенд DINOv3 использовать (ViT или ConvNeXt).")
+
     parser.add_argument('--layer', help='Слой для извлечения эмбеддингов (например, layer3)', default='layer3')
     parser.add_argument('--feat-short-side', type=int, help='Короткая сторона входа фич (например, 384/512/576)')
     parser.add_argument('--dinov3-ckpt', help='Путь к весам DINOv3 ConvNeXt-B (.pth)')
+    parser.add_argument('--pos-as-query-masks', action='store_true', default=True,
+                         help='Строить q_pos из масок positive (по умолчанию: True для DINOv3)')
+    parser.add_argument('--no-pos-as-query-masks', dest='pos_as_query_masks', action='store_false')
     parser.add_argument('--sam-checkpoint', help='Путь к checkpoint SAM-HQ')
     parser.add_argument('--sam-encoder', choices=['vit_b','vit_l','vit_h'], help='Энкодер SAM-HQ/SAM2 (vit_b/vit_l/vit_h)')
     parser.add_argument('--sam2-checkpoint', help='Путь к checkpoint SAM2')
     parser.add_argument('--sam2-config', help='Путь к конфигурации SAM2')
     parser.add_argument('--fastsam-checkpoint', help='Путь к checkpoint FastSAM')
+    parser.add_argument("--vit-pooling", type=str, choices=["cls","mean"], default="cls", help="Pooling for ViT (DINOv3)")
 
     # Параметры консенсуса и NMS
     parser.add_argument('--consensus-k', type=int, help='Минимум positive-попаданий для консенсуса')
@@ -421,6 +445,19 @@ def _execute_detect(args) -> int:
             'hole_area_ratio_threshold': 0.03             # Новый: порог доли дыр внутри силуэта
         })
 
+        # Добавляем DINOv3 параметры в detector_params ДО создания детектора
+        import torch
+        detector_params.update({
+            'dinov3_backbone': getattr(args, 'dinov3_backbone', None),
+            'dinov3_ckpt': getattr(args, 'dinov3_ckpt', None),
+            'vit_pooling': getattr(args, 'vit_pooling', 'cls'),
+            'encoder_device': "cuda" if torch.cuda.is_available() else "cpu",
+            'dino_half_precision': getattr(args, 'dino_half_precision', False),
+            'backbone': getattr(args, 'backbone', 'dinov2_b'),
+            'pos_as_query_masks': getattr(args, 'pos_as_query_masks', True),
+            'min_mask_area': 100
+        })
+        
         print("5️⃣ Создание: detector = SearchDetDetector(**params)")
         # Создаём детектор
         detector = SearchDetDetector(**detector_params)
@@ -569,6 +606,19 @@ def _execute_quick(args) -> int:
             'square_similarity_iou_threshold': 0.94,      # Новый: IoU силуэта с квадратом
             'rectangle_use_silhouette': True,             # Новый: использовать силуэт вместо исходной маски
             'hole_area_ratio_threshold': 0.03             # Новый: порог доли дыр внутри силуэта
+        })
+        
+        # Добавляем DINOv3 параметры в detector_params ДО создания детектора (quick режим)
+        import torch
+        detector_params.update({
+            'dinov3_backbone': getattr(args, 'dinov3_backbone', None),
+            'dinov3_ckpt': getattr(args, 'dinov3_ckpt', None),
+            'vit_pooling': getattr(args, 'vit_pooling', 'cls'),
+            'encoder_device': "cuda" if torch.cuda.is_available() else "cpu",
+            'dino_half_precision': getattr(args, 'dino_half_precision', False),
+            'backbone': getattr(args, 'backbone', 'dinov2_b'),
+            'pos_as_query_masks': getattr(args, 'pos_as_query_masks', True),
+            'min_mask_area': 100
         })
         
         print("6️⃣ Создание: detector = SearchDetDetector(**params)")

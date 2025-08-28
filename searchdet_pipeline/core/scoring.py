@@ -6,7 +6,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Any
 from ..utils.config import ScoringConfig
 
-
+# Простые, устойчивые утилиты (как в рабочем скрипте)
 def _to_matrix(X: np.ndarray, D: int | None = None) -> np.ndarray:
     X = np.asarray(X, dtype=np.float32)
     if X.size == 0:
@@ -19,129 +19,106 @@ def _to_matrix(X: np.ndarray, D: int | None = None) -> np.ndarray:
         raise ValueError(f"Dim mismatch: expected D={D}, got {X.shape}")
     return X
 
-
 def _cosine_matrix(A: np.ndarray, B: np.ndarray) -> np.ndarray:
-    A = np.asarray(A, dtype=np.float32)
-    B = np.asarray(B, dtype=np.float32)
-    if A.ndim == 1:
-        A = A.reshape(1, -1)
-    elif A.ndim > 2:
-        A = A.reshape(A.shape[0], -1)
-    if B.ndim == 1:
-        B = B.reshape(1, -1)
-    elif B.ndim > 2:
-        B = B.reshape(B.shape[0], -1)
-
+    A = _to_matrix(A)
+    B = _to_matrix(B, A.shape[1]) if B.size else _to_matrix(B)
     if A.size == 0 or B.size == 0:
         return np.zeros((A.shape[0], B.shape[0]), dtype=np.float32)
 
-    if A.shape[1] != B.shape[1]:
-        raise ValueError(f"Dim mismatch in _cosine_matrix: A{A.shape} vs B{B.shape}")
-
-    A64 = A.astype(np.float64, copy=False)
-    B64 = B.astype(np.float64, copy=False)
-    A_norm = A64 / (np.linalg.norm(A64, axis=1, keepdims=True) + 1e-12)
-    B_norm = B64 / (np.linalg.norm(B64, axis=1, keepdims=True) + 1e-12)
-
-    sims = A_norm @ B_norm.T
-    sims = np.nan_to_num(sims, nan=0.0, posinf=1.0, neginf=-1.0)
+    # предполагаем, что входы уже L2-нормированы (мы так и делаем в embeddings),
+    # но всё равно нормализуем на всякий случай
+    A = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-8)
+    B = B / (np.linalg.norm(B, axis=1, keepdims=True) + 1e-8)
+    sims = A @ B.T
     sims = np.clip(sims, -1.0, 1.0).astype(np.float32)
-
-    if sims.size and (np.mean(sims >= 0.9995) > 0.9):
-        print("   ⚠️  Предупреждение: почти все косинусы >= 0.9995. "
-              "Проверьте, не совпадают ли векторы и применяется ли бинарная маска в ROI.")
     return sims
 
-
 class ScoreCalculator:
+    """
+    Упрощённый и предсказуемый скорер:
+    - pos_score = 0.7*max_cos + 0.3*mean_topk_cos  (далее перевод в [0,1])
+    - neg_score = max_cos_neg → [0,1]
+    - решение: (pos01 >= min_pos) AND (pos01 - neg01 >= thr) AND (n <= neg_cap)
+    - мультикласс: берём лучший класс по pos01, разделение с аргументом class_separation.
+    Никакой агрессивной квантильной отсечки, совпадает духом с твоим рабочим скриптом.
+    """
 
     def __init__(self, detector, params: Dict[str, Any] | None = None, config: ScoringConfig | None = None):
         self.detector = detector
-        
-        # Приоритет: config > params > defaults
         if config is not None:
             self.config = config
         else:
-            # Создаем конфигурацию из params для обратной совместимости
-            if params is None:
-                params = {}
+            params = params or {}
             self.config = ScoringConfig(
-                min_pos_score=float(params.get('min_pos_score', 0.3)),
+                min_pos_score=float(params.get('min_pos_score', 0.35)),     # мягкий дефолт
                 decision_threshold=float(params.get('decision_threshold', 0.06)),
                 class_separation=float(params.get('class_separation', 0.04)),
-                neg_cap=float(params.get('neg_cap', 0.90)),
+                neg_cap=float(params.get('neg_cap', 0.95)),
                 topk=int(params.get('topk', 5)),
-                pos_trim=float(params.get('pos_trim', 0.2)),
-                neg_quantile=float(params.get('neg_quantile', 0.80)),
                 consensus_k=int(params.get('consensus_k', 0)),
                 consensus_thr=float(params.get('consensus_thr', 0.45)),
                 adaptive_ratio=float(params.get('adaptive_ratio', 0.85)),
                 adaptive_diff_floor=float(params.get('adaptive_diff_floor', 0.04)),
-                adaptive_trigger_pos_range=float(params.get('adaptive_trigger_pos_range', 0.20)),
-                adaptive_trigger_neg_range=float(params.get('adaptive_trigger_neg_range', 0.20)),
-                margin=float(params.get('score_margin', -0.10)),
-                ratio=float(params.get('score_ratio', 1.01)),
+                adaptive_trigger_pos_range=float(params.get('adaptive_trigger_pos_range', 1.0)),  # отключено
+                adaptive_trigger_neg_range=float(params.get('adaptive_trigger_neg_range', 1.0)),  # отключено
+                margin=float(params.get('score_margin', 0.0)),
+                ratio=float(params.get('score_ratio', 1.0)),
                 confidence=float(params.get('score_confidence', 0.60)),
                 allow_unknown=bool(params.get('allow_unknown', True)),
-                verbose=bool(params.get('verbose', True))
+                verbose=bool(params.get('verbose', True)),
             )
+        # если явно не задано, и backbone dinov3 — зафиксируем более адекватные пороги
+        if str(getattr(detector, 'backbone', '')).startswith('dinov3'):
+            if 'min_pos_score' not in (params or {}):
+                self.min_pos_score = 0.70         # порог на p (косинус)
+            if 'decision_threshold' not in (params or {}):
+                self.decision_threshold = 0.15    # p - n разница в косинусе
+            if 'consensus_thr' not in (params or {}):
+                self.consensus_thr = 0.65         # косинусный порог для консенсуса
         
-        # Создаем свойства для обратной совместимости
-        self.min_pos_score = self.config.min_pos_score
-        self.decision_threshold = self.config.decision_threshold
-        self.class_separation = self.config.class_separation
-        self.neg_cap = self.config.neg_cap
-        self.topk = self.config.topk
-        self.consensus_k = self.config.consensus_k
-        self.consensus_thr = self.config.consensus_thr
-        self.adaptive_ratio = self.config.adaptive_ratio
-        self.adaptive_diff_floor = self.config.adaptive_diff_floor
-        self.adaptive_trigger_pos_range = self.config.adaptive_trigger_pos_range
-        self.adaptive_trigger_neg_range = self.config.adaptive_trigger_neg_range
-        self.margin = self.config.margin
-        self.ratio = self.config.ratio
-        self.confidence = self.config.confidence
-        self.allow_unknown = self.config.allow_unknown
-        self.verbose = self.config.verbose
+        # шорткаты
+        for k, v in self.config.__dict__.items():
+            setattr(self, k, v)
 
+    # агрегирование, как раньше — но без квантильных «порогов»
     def _aggregate_positive(self, sims_pos: np.ndarray) -> np.ndarray:
+        """
+        Оставляем косинус в [-1..1]. Никаких (x+1)/2!
+        """
         if sims_pos.size == 0 or sims_pos.shape[1] == 0:
             return np.zeros((sims_pos.shape[0] if sims_pos.ndim > 0 else 0,), dtype=np.float32)
 
-        K = sims_pos.shape[1]
-        k = max(1, min(getattr(self, 'topk', 5), K))
-        topk = np.partition(sims_pos, -k, axis=1)[:, -k:]
-        # лёгкая обрезка краёв (20%), чтобы выбросы не «тянули» наверх
-        t = int(round(k * 0.1))  # 10 % или 0 для полного снятия
-        if t > 0 and (k - 2 * t) > 0:
-            topk = np.sort(topk, axis=1)[:, t:-t]
+        maxv = sims_pos.max(axis=1)
+        k = min(self.topk, sims_pos.shape[1]) if sims_pos.shape[1] > 0 else 1
+        if k > 1:
+            part = np.partition(sims_pos, -k, axis=1)[:, -k:]
+            topk_mean = part.mean(axis=1)
+        else:
+            topk_mean = maxv
 
-        pos_cos = topk.mean(axis=1).astype(np.float32)
-        pos01 = np.clip((pos_cos + 1.0) * 0.5, 0.0, 1.0)
-        return pos01
-
+        # мягкая агрегация (всё ещё в [-1..1])
+        agg = 0.7 * maxv + 0.3 * topk_mean
+        return agg.astype(np.float32)
 
     def _aggregate_negative(self, sims_neg: np.ndarray) -> np.ndarray:
+        """
+        Негатив — тоже в косинусе [-1..1], берём максимум по колонкам (наиболее похожий негатив).
+        """
         if sims_neg.size == 0 or sims_neg.shape[1] == 0:
             return np.zeros((sims_neg.shape[0] if sims_neg.ndim > 0 else 0,), dtype=np.float32)
-        q = getattr(self, 'neg_quantile', 0.95)  # можно выставить self.neg_quantile в конфиге
-        neg_cos = np.quantile(sims_neg, q, axis=1).astype(np.float32)  # «почти худший», но не max
-        neg01 = np.clip((neg_cos + 1.0) * 0.5, 0.0, 1.0)
-        return neg01
-
+        neg_sim = np.max(sims_neg, axis=1)
+        return neg_sim.astype(np.float32)
 
     def _consensus_count(self, sims_pos_cls: np.ndarray) -> np.ndarray:
+        """
+        Считаем количество положительных примеров, у которых косинус >= thr_cos (порог в косинусе!).
+        """
         if sims_pos_cls.size == 0:
             return np.zeros((0,), dtype=np.int32)
-        sims01 = np.clip((sims_pos_cls + 1.0) * 0.5, 0.0, 1.0)
-        return (sims01 >= float(self.consensus_thr)).sum(axis=1).astype(np.int32)
+        return (sims_pos_cls >= float(self.consensus_thr)).sum(axis=1).astype(np.int32)
 
-    def score_multiclass(
-        self,
-        mask_vecs: np.ndarray,
-        class_pos: Dict[str, np.ndarray],
-        q_neg: np.ndarray
-    ) -> List[Dict[str, Any]]:
+    # ======= Мультикласс =======
+    def score_multiclass(self, mask_vecs: np.ndarray, class_pos: Dict[str, np.ndarray], q_neg: np.ndarray) -> List[Dict[str, Any]]:
         mask_vecs = _to_matrix(mask_vecs)
         D = mask_vecs.shape[1] if mask_vecs.size else 0
         class_pos = {cls: _to_matrix(Q, D) for cls, Q in (class_pos or {}).items()}
@@ -151,39 +128,16 @@ class ScoreCalculator:
         if N == 0:
             return []
 
-        # -- ФИЛЬТР НЕГАТИВОВ, ПОДОЗРИТЕЛЬНО ПОХОЖИХ НА ПОЗИТИВЫ --
-        if q_neg.size and len(class_pos):
-            P_list = [Q.mean(axis=0) for Q in class_pos.values() if Q.shape[0] > 0]
-            if len(P_list):
-                P = np.stack(P_list, axis=0).astype(np.float32)
-                P /= (np.linalg.norm(P, axis=1, keepdims=True) + 1e-8)
-                qn = q_neg.astype(np.float32)
-                qn /= (np.linalg.norm(qn, axis=1, keepdims=True) + 1e-8)
-                sim_np = qn @ P.T
-                thr = 0.60  # порог близости негатива к любому классу
-                keep = (np.max(sim_np, axis=1) <= thr)
-                dropped = int(np.sum(~keep))
-                if dropped > 0 and self.verbose:
-                    print(f"   🧹 Убрано {dropped} негативов как слишком похожие на позитивы (thr={thr:.2f})")
-                q_neg = q_neg[keep]
-
-        # --- Расчёт негативных скорингов ---
+        # neg
         if q_neg.shape[0] == 0:
-            sims_neg = np.zeros((N, 0), dtype=np.float32)
             neg_scores = np.zeros(N, dtype=np.float32)
         else:
             sims_neg = _cosine_matrix(mask_vecs, q_neg)
-            # Диагностика «взлётов» NEG
-            if self.verbose and sims_neg.size:
-                top_idx = np.argmax(sims_neg, axis=1)
-                top_val = sims_neg[np.arange(N), top_idx]
-                bad = np.where(top_val > 0.6)[0]
-                for ii in bad[:5]:
-                    print(f"   🧪 Маска {ii}: max NEG cos={top_val[ii]:.3f} на негативе idx={int(top_idx[ii])}")
             neg_scores = self._aggregate_negative(sims_neg)
         if self.neg_cap is not None:
             neg_scores = np.minimum(neg_scores, float(self.neg_cap))
 
+        # pos per class
         class_scores: Dict[str, np.ndarray] = {}
         class_consensus: Dict[str, np.ndarray] = {}
         if self.verbose:
@@ -192,7 +146,6 @@ class ScoreCalculator:
         for cls, Q in (class_pos or {}).items():
             if Q.shape[0] == 0:
                 continue
-            # Считаем косинусы по ВСЕМ позитивным прототипам без усреднения
             sims_pos = _cosine_matrix(mask_vecs, Q)
             pos_scores = self._aggregate_positive(sims_pos)
             class_scores[cls] = pos_scores
@@ -201,105 +154,55 @@ class ScoreCalculator:
                 print(f"   Класс '{cls}': скоры={[f'{s:.3f}' for s in pos_scores]}")
 
         if not class_scores:
-            if self.verbose:
-                print("   ❌ Нет валидных классов с эмбеддингами - возвращаем пустой результат")
             return [
                 {'accepted': False, 'class': None, 'pos_score': 0.0, 'neg_score': float(neg_scores[i]), 'confidence': 0.0}
                 for i in range(N)
             ]
 
         classes = list(class_scores.keys())
-        pos_matrix = np.stack([class_scores[c] for c in classes], axis=1)
+        pos_matrix = np.stack([class_scores[c] for c in classes], axis=1)  # (N, C)
         best_idx = np.argmax(pos_matrix, axis=1)
         best_pos = pos_matrix[np.arange(N), best_idx]
-
-        diff_all = best_pos - neg_scores
-        neg_mask = diff_all < 0
-        m0 = float(np.median(diff_all[neg_mask])) if np.any(neg_mask) else 0.0
-        tau = max(0.35, float(np.std(diff_all)) * 0.5 + 1e-6)
-
-        pos_matrix_sorted = np.sort(pos_matrix, axis=1)[:, ::-1]
-        second_best = pos_matrix_sorted[:, 1] if pos_matrix_sorted.shape[1] > 1 else np.zeros(N, dtype=np.float32)
-
+        second_best = np.partition(pos_matrix, -2, axis=1)[:, -2] if pos_matrix.shape[1] > 1 else np.zeros(N, dtype=np.float32)
         best_cls = [classes[j] for j in best_idx]
 
         if self.verbose:
-            for i in range(N):
-                row = ", ".join([f"{c}={class_scores[c][i]:.3f}" for c in classes])
-                print(f"     Маска {i}: [{row}] -> выбран {best_cls[i]} ({best_pos[i]:.3f})")
-
-        if self.verbose:
             print(f"📊 Скоры мультикласса: pos_avg={np.mean(best_pos):.3f}, neg_avg={np.mean(neg_scores):.3f}")
-            print(f"📊 Диапазоны: pos=[{np.min(best_pos):.3f}, {np.max(best_pos):.3f}], "
-                  f"neg=[{np.min(neg_scores):.3f}, {np.max(neg_scores):.3f}]")
 
-        pos_range = float(np.max(best_pos) - np.min(best_pos)) if best_pos.size else 0.0
-        neg_range = float(np.max(neg_scores) - np.min(neg_scores)) if neg_scores.size else 0.0
-        adaptive_mode = (pos_range < self.adaptive_trigger_pos_range) and (neg_range < self.adaptive_trigger_neg_range)
-
-        if self.verbose:
-            print(f"🎯 Пороги: min_pos={self.min_pos_score:.3f}, "
-                  f"threshold(diff)={self.decision_threshold:.3f}, "
-                  f"class_sep={self.class_separation:.3f}, adaptive_mode={adaptive_mode}")
-
-        class_max = {c: float(np.max(class_scores[c])) for c in classes}
-        class_adaptive_thr = {c: (class_max[c] * self.adaptive_ratio) for c in classes}
-
-        eps = 1e-8
         decisions: List[Dict[str, Any]] = []
-        accepted_count = 0
-
+        acc = 0
+        eps = 1e-8
         for i in range(N):
-            cls_i = best_cls[i]
-            pos_s = float(best_pos[i])
-            neg_s = float(neg_scores[i]) if i < len(neg_scores) else 0.0
-            diff = pos_s - neg_s
-            ratio_ok = (pos_s / (neg_s + eps)) >= float(self.ratio)
+            p = float(best_pos[i])
+            n = float(neg_scores[i])
+            diff = p - n
+            ratio_ok = (p / (n + eps)) >= float(self.ratio)
 
-            cons = int(class_consensus.get(cls_i, np.zeros(N, dtype=np.int32))[i])
-            consensus_ok = cons >= int(self.consensus_k)
-
-            base_ok = (pos_s >= self.min_pos_score) and (pos_s > neg_s)
-
-            class_sep = float(pos_s - float(second_best[i]))
-            class_sep_ok = (class_sep >= self.class_separation) if len(classes) > 1 else True
-
+            base_ok = (p >= self.min_pos_score) and (p > n)
+            class_sep_ok = (p - float(second_best[i])) >= float(self.class_separation) if len(classes) > 1 else True
             diff_ok = (diff >= self.decision_threshold) or ratio_ok
+            consensus_ok = (int(class_consensus.get(best_cls[i], np.zeros(N, dtype=np.int32))[i]) >= int(self.consensus_k))
 
-            accepted_std = base_ok and diff_ok and class_sep_ok and (neg_s <= self.neg_cap) and consensus_ok
-
-            if adaptive_mode:
-                thr = float(class_adaptive_thr.get(cls_i, np.max(best_pos)))
-                accepted_adapt = base_ok and ( (pos_s >= thr) or (diff >= self.adaptive_diff_floor) ) \
-                                 and class_sep_ok and (neg_s <= self.neg_cap) and consensus_ok
-                accepted = accepted_std or accepted_adapt
-            else:
-                accepted = accepted_std
+            ok = base_ok and diff_ok and class_sep_ok and (n <= self.neg_cap) and consensus_ok
 
             if self.verbose:
-                cons_info = f"cons={cons}/{self.consensus_k}"
-                if adaptive_mode:
-                    print(f"   Маска {i}: класс={cls_i}, pos={pos_s:.3f}, neg={neg_s:.3f}, "
-                          f"diff={diff:+.3f}, sep={class_sep:+.3f}, {cons_info}, "
-                          f"adapt_thr={class_adaptive_thr.get(cls_i, 0):.3f}, принято={accepted}")
-                else:
-                    print(f"   Маска {i}: класс={cls_i}, pos={pos_s:.3f}, neg={neg_s:.3f}, "
-                          f"diff={diff:+.3f}, sep={class_sep:+.3f}, {cons_info}, принято={accepted}")
+                print(f"   Маска {i}: класс={best_cls[i]}, pos={p:.3f}, neg={n:.3f}, diff={diff:+.3f}, "
+                      f"sep={(p-second_best[i]):+.3f}, cons={int(consensus_ok)} → принято={ok}")
 
-            calib = 1.0 / (1.0 + np.exp(-((diff - m0) / tau)))
             decisions.append({
-                'accepted': bool(accepted),
-                'class': cls_i if accepted else (None if not self.allow_unknown else cls_i),
-                'pos_score': pos_s,
-                'neg_score': neg_s,
-                'confidence': float(calib),
+                'accepted': bool(ok),
+                'class': best_cls[i] if ok or self.allow_unknown else None,
+                'pos_score': p,
+                'neg_score': n,
+                'confidence': float(np.clip(p, 0.0, 1.0)),
             })
-            accepted_count += int(bool(accepted))
+            acc += int(ok)
 
         if self.verbose:
-            print(f"🎯 Принято {accepted_count} из {N} масок")
+            print(f"🎯 Принято {acc} из {N} масок")
         return decisions
 
+    # ======= Бинарный режим =======
     def score_and_decide(self, mask_vecs: np.ndarray, q_pos: np.ndarray, q_neg: np.ndarray) -> Tuple[List[int], np.ndarray, np.ndarray]:
         mask_vecs = _to_matrix(mask_vecs)
         q_pos = _to_matrix(q_pos, mask_vecs.shape[1])
@@ -315,10 +218,10 @@ class ScoreCalculator:
             neg_scores = np.zeros(mask_vecs.shape[0], dtype=np.float32)
 
         accepted = []
+        eps = 1e-8
         for i, (p, n) in enumerate(zip(pos_scores, neg_scores)):
             diff = p - n
-            ratio_ok = (p / (n + 1e-8)) >= float(self.ratio)
+            ratio_ok = (p / (n + eps)) >= float(self.ratio)
             if (p >= self.min_pos_score) and (diff >= self.decision_threshold or ratio_ok) and (n <= self.neg_cap):
                 accepted.append(i)
-
         return accepted, pos_scores, neg_scores
