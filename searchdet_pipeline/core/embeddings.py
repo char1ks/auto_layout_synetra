@@ -53,6 +53,8 @@ class EmbeddingExtractor:
                 ckpt     = getattr(detector, "dinov3_ckpt", None),
                 device   = getattr(detector, "encoder_device", "cuda"),
                 use_half = bool(getattr(detector, "dino_half_precision", False)),
+                loader   = getattr(detector, "loader", "timm"),
+                repo_dir = getattr(detector, "repo_dir", None),
             )
             print(f"🧩 Using DINOv3 encoder: {self.backbone} @ {self._d3.device}, half={self._d3.use_half}")
 
@@ -125,6 +127,78 @@ class EmbeddingExtractor:
         except Exception as e:
             print(f"⚠️ extract_features_from_masks failed: {e}")
             return np.zeros((0, 1024), dtype=np.float32), []
+    def _extract_with_dinov3_convnext(self, image_np, mask_arrays):
+        """ConvNeXt+DINOv3: эмбеддинги масок через bbox-crop + тот же preprocess, что и для positive."""
+        import time, torch, cv2
+        from PIL import Image
+        t0 = time.time()
+
+        self._ensure_dinov3_convnext()
+        if self._dinov3_model is None:
+            return None
+
+        H0, W0 = image_np.shape[:2]
+        scale = 1.0
+        if max(H0, W0) > self.max_embedding_size:
+            scale = float(self.max_embedding_size) / float(max(H0, W0))
+            newW, newH = int(W0 * scale), int(H0 * scale)
+            image_np = cv2.resize(image_np, (newW, newH), interpolation=cv2.INTER_LINEAR)
+
+        embeddings = []
+        ctx = float(getattr(self.detector, "mask_context", 0.08))  # 8% контекст по умолчанию
+        use_half = bool(getattr(self.detector, "dino_half_precision", False))
+        device = next(self._dinov3_model.parameters()).device
+        model_dtype = next(self._dinov3_model.parameters()).dtype  # float32 или float16
+
+        with torch.no_grad():
+            for i, m in enumerate(mask_arrays):
+                # ресайз маски под scale (если был)
+                if scale != 1.0:
+                    m = cv2.resize(m.astype(np.uint8), (image_np.shape[1], image_np.shape[0]),
+                                interpolation=cv2.INTER_NEAREST).astype(bool)
+
+                ys, xs = np.where(m)
+                if ys.size == 0:
+                    embeddings.append(np.zeros(1024, dtype=np.float32))
+                    continue
+
+                y1, y2 = ys.min(), ys.max()
+                x1, x2 = xs.min(), xs.max()
+
+                # контекст вокруг bbox
+                h, w = image_np.shape[:2]
+                pad_y = int((y2 - y1 + 1) * ctx)
+                pad_x = int((x2 - x1 + 1) * ctx)
+                y1 = max(0, y1 - pad_y); y2 = min(h - 1, y2 + pad_y)
+                x1 = max(0, x1 - pad_x); x2 = min(w - 1, x2 + pad_x)
+
+                crop = image_np[y1:y2+1, x1:x2+1].copy()
+
+                pil = Image.fromarray(crop)
+                x = self._dinov3_preprocess(pil).unsqueeze(0)  # (1,3,224,224)
+                x = x.to(device)
+                # приводим dtype входа к dtype модели (важно для half)
+                if model_dtype == torch.float16:
+                    x = x.half()
+                else:
+                    x = x.float()
+
+                z = self._dinov3_model(x)           # (1, D), num_classes=0 => pre-logits
+                v = z[0].detach().cpu().float().numpy()
+
+                # L2-нормализация и приведение к D=1024 (если вдруг другое D)
+                v = v.astype(np.float32)
+                n = np.linalg.norm(v) + 1e-8
+                v = v / n
+                if v.shape[0] != 1024:
+                    out = np.zeros(1024, dtype=np.float32)
+                    take = min(1024, v.shape[0])
+                    out[:take] = v[:take]
+                    v = out
+                embeddings.append(v)
+
+        print(f"   ⚡ DINOv3 ConvNeXt-B (bbox-crop): {time.time()-t0:.3f}s, N={len(embeddings)}")
+        return np.stack(embeddings, axis=0).astype(np.float32)
 
     # =========================
     # Примеры (positive/negative)

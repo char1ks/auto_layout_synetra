@@ -83,16 +83,28 @@ class DinoV3Encoder:
         half: bool = False,
         vit_pooling: str = "cls",  # 'cls' | 'mean'
         use_half: bool = False,
+        loader: str = "timm",  # "timm" | "hub"
+        repo_dir: Optional[str] = None,
     ):
         if backbone not in ALL_BACKBONES:
             raise ValueError(f"Unknown DINOv3 backbone '{backbone}'")
+        self.backbone = backbone
         self.is_vit = backbone in VIT_BACKBONES
         self.arch = VIT_BACKBONES.get(backbone, CONVN_BACKBONES.get(backbone))
         self.device = torch.device(device if device == "cpu" or torch.cuda.is_available() else "cpu")
         self.half = bool(half or use_half)  # Поддержка обоих параметров
         self.use_half = self.half  # Унификация
         self.vit_pooling = vit_pooling.lower().strip()
+        self.loader = loader
+        self.repo_dir = repo_dir
 
+        if self.loader == "hub":
+            self._build_from_hub(backbone, ckpt)
+        else:
+            self._build_from_timm(backbone, ckpt)
+
+    def _build_from_timm(self, backbone: str, ckpt: Optional[str]):
+        """Создание модели через timm (текущий способ)."""
         gp = "token" if self.is_vit else "avg"
         self.model = timm.create_model(self.arch, pretrained=False, num_classes=0, global_pool=gp)
         self.model.eval().to(self.device)
@@ -106,6 +118,47 @@ class DinoV3Encoder:
 
         if ckpt:
             self._smart_load(ckpt)
+
+    def _build_from_hub(self, backbone: str, ckpt: str):
+        """Создание модели через torch.hub (официальный способ)."""
+        if self.repo_dir is None:
+            raise ValueError("Для loader=hub нужно указать repo_dir (путь к локальному клону DINOv3).")
+
+        # Карта имён hub-функций
+        HUB_NAME = None
+        if   backbone in ("vitb16", "vit_base_patch16_224"):     HUB_NAME = "dinov3_vitb16"
+        elif backbone in ("vitl16", "vit_large_patch16_224"):    HUB_NAME = "dinov3_vitl16"
+        elif backbone in ("vith14", "vit_huge_patch14_224"):     HUB_NAME = "dinov3_vith16plus"  # ближ. вариант
+        elif backbone in ("convnext_tiny",):                     HUB_NAME = "dinov3_convnext_tiny"
+        elif backbone in ("convnext_small",):                    HUB_NAME = "dinov3_convnext_small"
+        elif backbone in ("convnext_base", "dinov3_convnext_base"): HUB_NAME = "dinov3_convnext_base"
+        elif backbone in ("convnext_large",):                    HUB_NAME = "dinov3_convnext_large"
+        else:
+            raise ValueError(f"Неизвестный backbone для hub: {backbone}")
+
+        print(f"🧩 Загрузка через torch.hub: {HUB_NAME}")
+        self.model = torch.hub.load(self.repo_dir, HUB_NAME, source="local", weights=ckpt)
+        self.model.eval().to(self.device)
+        if self.half:
+            self.model.half()
+
+        # Попробуем взять data_config у модели; если нет — дефолты ImageNet
+        try:
+            self.data_cfg = resolve_model_data_config(self.model)
+            self.tf = create_transform(**self.data_cfg, is_training=False)
+        except Exception:
+            from torchvision import transforms
+            self.tf = transforms.Compose([
+                transforms.Resize(224, interpolation=3),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)),
+            ])
+
+        # Определим, ViT это или ConvNeXt, чтобы выбрать pooling по умолчанию
+        name = self.model.__class__.__name__.lower()
+        self.is_vit = ("vit" in name)
+        print(f"   ⚙️ HUB модель: {self.model.__class__.__name__} (is_vit={self.is_vit})")
 
     def _smart_load(self, path: str):
         if not os.path.isfile(path):

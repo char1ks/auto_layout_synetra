@@ -143,6 +143,8 @@ def _add_detect_arguments(parser: argparse.ArgumentParser):
     parser.add_argument('--adaptive-ratio', type=float, help='Коэффициент для адаптивного порога (0-1)')
     parser.add_argument('--adaptive-diff-floor', type=float, help='Минимальная разность для адаптивного режима')
     parser.add_argument('--topk', type=int, help='Количество топ-K примеров для агрегации')
+    parser.add_argument('--pos-agg', choices=['max', 'mean_topk', 'mean'], default='max',
+                       help='Режим агрегации positive-скоров: max (по умолчанию), mean_topk, mean')
     # Пути к моделям и параметры эмбеддингов
     parser.add_argument(
         "--backbone",
@@ -178,6 +180,10 @@ def _add_detect_arguments(parser: argparse.ArgumentParser):
     parser.add_argument('--sam2-config', help='Путь к конфигурации SAM2')
     parser.add_argument('--fastsam-checkpoint', help='Путь к checkpoint FastSAM')
     parser.add_argument("--vit-pooling", type=str, choices=["cls","mean"], default="cls", help="Pooling for ViT (DINOv3)")
+    parser.add_argument("--loader", type=str, default="timm", choices=["timm", "hub"],
+                         help="Model loader: timm or torch.hub")
+    parser.add_argument("--repo-dir", type=str, default=None,
+                         help="Path to local DINOv3 repository for hub loader")
 
     # Параметры консенсуса и NMS
     parser.add_argument('--consensus-k', type=int, help='Минимум positive-попаданий для консенсуса')
@@ -380,6 +386,8 @@ def _execute_detect(args) -> int:
             detector_params['adaptive_diff_floor'] = args.adaptive_diff_floor
         if hasattr(args, 'topk') and getattr(args, 'topk', None) is not None:
             detector_params['topk'] = args.topk
+        if hasattr(args, 'pos_agg') and getattr(args, 'pos_agg', None) is not None:
+            detector_params['pos_agg'] = args.pos_agg
         
         if hasattr(args, 'layer') and args.layer:
             detector_params['layer'] = args.layer
@@ -390,6 +398,12 @@ def _execute_detect(args) -> int:
         
         if hasattr(args, 'dinov3_ckpt') and args.dinov3_ckpt:
             detector_params['dinov3_ckpt'] = args.dinov3_ckpt
+        
+        if hasattr(args, 'loader') and args.loader:
+            detector_params['loader'] = args.loader
+        
+        if hasattr(args, 'repo_dir') and args.repo_dir:
+            detector_params['repo_dir'] = args.repo_dir
         
         if hasattr(args, 'layer') and args.layer:
             detector_params['layer'] = args.layer
