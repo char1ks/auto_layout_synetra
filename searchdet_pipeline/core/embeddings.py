@@ -7,8 +7,11 @@ from PIL import Image
 import cv2
 import torch
 
+from .dinov3_encoder import DinoV3Encoder
+
+
 def _iter_images(root):
-    exts = ("*.jpg","*.jpeg","*.png","*.bmp","*.webp","*.tif","*.tiff")
+    exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp", "*.tif", "*.tiff")
     paths = []
     for e in exts:
         paths.extend(glob.glob(os.path.join(root, e)))
@@ -52,10 +55,11 @@ def extract_features_from_masks(encoder, masked_crops):
         return np.zeros((0, 1), dtype=np.float32)
     return np.stack(feats, axis=0)  # (N,D)
 
+
 class EmbeddingExtractor:
     def __init__(self, detector):
         self.detector = detector
-        # ничего больше здесь не нужно — всё возьмём из detector.dinov3_encoder
+        self.encoder = DinoV3Encoder(device=detector.device)
 
     # ---------- НАДЁЖНОЕ КОДИРОВАНИЕ ROI МАСКИ ЧЕРЕЗ DINOv3 ----------
     def _encode_mask_roi_with_dinov3(self, image_np: np.ndarray, mask_bool: np.ndarray) -> np.ndarray:
@@ -66,14 +70,13 @@ class EmbeddingExtractor:
         4) подаём в DINOv3-энкодер,
         5) возвращаем L2-нормированный вектор (float32).
         """
-        enc = getattr(self.detector, "dinov3_encoder", None)
-        if enc is None:
+        if self.encoder is None:
             # safety: пустой вектор (но лучше всегда иметь энкодер)
             return np.zeros(1024, dtype=np.float32)
 
         ys, xs = np.where(mask_bool)
         if ys.size == 0 or xs.size == 0:
-            return np.zeros(enc.output_dim, dtype=np.float32)  # fallback
+            return np.zeros(self.encoder.model.embed_dim, dtype=np.float32)  # fallback
 
         y1, y2 = int(ys.min()), int(ys.max())
         x1, x2 = int(xs.min()), int(xs.max())
@@ -86,7 +89,7 @@ class EmbeddingExtractor:
         crop[~m] = 0
 
         pil = Image.fromarray(crop)
-        vec = enc.encode(pil)  # уже float32 + L2 norm внутри энкодера
+        vec = self.encoder.encode(pil)  # уже float32 + L2 norm внутри энкодера
         return vec
 
     # ---------- МАСКИ: ВСЕГДА ЧЕРЕЗ DINOv3 ----------
@@ -101,8 +104,7 @@ class EmbeddingExtractor:
             print("   ❌ Нет масок на входе")
             return np.zeros((0, 1024), dtype=np.float32), []
 
-        enc = getattr(self.detector, "dinov3_encoder", None)
-        if enc is None:
+        if self.encoder is None:
             print("   ❌ DINOv3-энкодер не инициализирован в detector")
             return np.zeros((0, 1024), dtype=np.float32), []
 
@@ -146,8 +148,7 @@ class EmbeddingExtractor:
         q_pos: dict[str, np.ndarray] = {}
         q_neg_list: list[np.ndarray] = []
 
-        enc = getattr(self.detector, "dinov3_encoder", None)
-        if enc is None:
+        if self.encoder is None:
             print("   ❌ DINOv3-энкодер не инициализирован в detector")
             # пустые, чтобы скоринг корректно отработал
             return {}, np.zeros((0, 1024), dtype=np.float32)
@@ -177,7 +178,7 @@ class EmbeddingExtractor:
                 if pos_as_query_masks and mask_crops_by_class and cls in mask_crops_by_class:
                     # Используем маски из positive в качестве запросов
                     for im in mask_crops_by_class[cls][:max_per_class]:
-                        vecs.append(enc.encode(im))
+                        vecs.append(self.encoder.encode(im))
                 else:
                     # Берём целые изображения из класса
                     for item in image_paths[:max_per_class]:
@@ -186,7 +187,7 @@ class EmbeddingExtractor:
                                 im = item.convert("RGB")
                             else:
                                 im = Image.open(item).convert("RGB")
-                            vecs.append(enc.encode(im))
+                            vecs.append(self.encoder.encode(im))
                         except Exception as e:
                             print(f"   ⚠️ Ошибка обработки positive-примера {item}: {e}")
                             continue
@@ -202,7 +203,7 @@ class EmbeddingExtractor:
             for p in _iter_images(negative_dir)[:256]:
                 try:
                     im = Image.open(p).convert("RGB")
-                    v = enc.encode(im)
+                    v = self.encoder.encode(im)
                     q_neg_list.append(v / (np.linalg.norm(v) + 1e-8))
                 except Exception:
                     continue

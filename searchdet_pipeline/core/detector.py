@@ -64,24 +64,7 @@ class SearchDetDetector:
             self.searchdet_transform = None
         self.sam_predictor = SAMPredictor(self.searchdet_sam)
         
-        self.dinov3_backbone = getattr(self.args, "dinov3_backbone", None) or getattr(self.args, "backbone", None)
-        self.dinov3_ckpt     = getattr(self.args, "dinov3_ckpt", None)
-        self.dinov3_device   = "cuda" if (getattr(self.args, "device", "cuda") == "cuda" and torch.cuda.is_available()) else "cpu"
-        self.dinov3_half     = bool(getattr(self.args, "half", False))
-        self.vit_pooling     = getattr(self.args, "vit_pooling", "cls").lower()
-        self.pos_agg_mode    = getattr(self.args, "pos_agg_mode", "max").lower()
 
-        self.dinov3_encoder = DinoV3Encoder(
-            backbone=self.dinov3_backbone,
-            ckpt=self.dinov3_ckpt,
-            device=self.dinov3_device,
-            half=self.dinov3_half,
-            vit_pooling=self.vit_pooling,
-        )
-
-        if self.backbone.startswith('dinov3') and self.dinov3_ckpt:
-            print(f"🔧 Предзагрузка DINOv3 ConvNeXt-B: {self.dinov3_ckpt}")
-            self._preload_dinov3()
         
         self.mask_generator = MaskGenerator(self)
         self.mask_filter = MaskFilter(self, self.params)
@@ -90,60 +73,7 @@ class SearchDetDetector:
         self.result_saver = ResultSaver()
         print("✅ SearchDetDetector инициализирован (автономная модульная версия)")
     
-    def _preload_dinov3(self):
-        """Предзагрузка DINOv3 ConvNeXt-B модели при инициализации детектора."""
-        try:
-            import torch
-            import timm
-            import torchvision.transforms as T
-            from torchvision.transforms import InterpolationMode
-            
-            print("🔄 Загрузка DINOv3 ConvNeXt-B модели...")
-            
-            # Создаем модель ConvNeXt-B без классификатора (эмбеддинги)
-            self.dinov3_model = timm.create_model('convnext_base', pretrained=False, num_classes=0)
-            
-            # Загружаем веса DINOv3
-            if self.dinov3_ckpt and os.path.exists(self.dinov3_ckpt):
-                print(f"🔧 Загружаем DINOv3 веса из: {self.dinov3_ckpt}")
-                state_dict = torch.load(self.dinov3_ckpt, map_location='cpu')
-                # Обрабатываем разные форматы checkpoint
-                if 'state_dict' in state_dict:
-                    state_dict = state_dict['state_dict']
-                elif 'model' in state_dict:
-                    state_dict = state_dict['model']
-                self.dinov3_model.load_state_dict(state_dict, strict=False)
-            else:
-                print(f"⚠️ DINOv3 checkpoint не найден: {self.dinov3_ckpt}, используем случайные веса")
-            
-            # Создаем препроцессор (стандартный ImageNet)
-            self.dinov3_preprocess = T.Compose([
-                T.Resize(256, interpolation=InterpolationMode.BICUBIC),
-                T.CenterCrop(224),
-                T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
-            
-            # Переводим в eval режим и на GPU если доступно
-            self.dinov3_model.eval()
-            if torch.cuda.is_available():
-                self.dinov3_model = self.dinov3_model.cuda()
-                print("🚀 DINOv3 модель загружена на GPU")
-            else:
-                print("💻 DINOv3 модель загружена на CPU")
-                
-            # Применяем половинную точность если включено
-            if self.dino_half_precision and torch.cuda.is_available():
-                self.dinov3_model = self.dinov3_model.half()
-                print("⚡ DINOv3 переведена в половинную точность")
-                
-            print("✅ DINOv3 ConvNeXt-B успешно предзагружена")
-            
-        except Exception as e:
-            print(f"❌ Ошибка предзагрузки DINOv3: {e}")
-            # Устанавливаем None чтобы использовать ленивую загрузку
-            self.dinov3_model = None
-            self.dinov3_preprocess = None
+
     
     def find_present_elements(self, image_path, positive_dir, negative_dir=None, output_dir="output"):
         """Основная функция поиска объектов."""
