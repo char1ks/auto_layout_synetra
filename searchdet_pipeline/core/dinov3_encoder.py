@@ -119,6 +119,30 @@ class DinoV3Encoder:
         if ckpt:
             self._smart_load(ckpt)
 
+        # Определяем output_dim после загрузки модели и чекпоинта
+        if hasattr(self.model, 'num_features'):
+            self.output_dim = self.model.num_features
+        elif hasattr(self.model, 'embed_dim'):
+            self.output_dim = self.model.embed_dim
+        else:
+            # Попробуем определить, прогнав пустой тензор
+            try:
+                dummy_input = torch.randn(1, 3, self.data_cfg['input_size'][1], self.data_cfg['input_size'][2]).to(self.device)
+                if self.half:
+                    dummy_input = dummy_input.half()
+                with torch.no_grad():
+                    dummy_output = self.model(dummy_input)
+                    if isinstance(dummy_output, dict) and 'x_norm_clstoken' in dummy_output:
+                        self.output_dim = dummy_output['x_norm_clstoken'].shape[-1]
+                    elif isinstance(dummy_output, torch.Tensor):
+                        self.output_dim = dummy_output.shape[-1]
+                    else:
+                        self.output_dim = 0 # Fallback
+            except Exception:
+                self.output_dim = 0 # Fallback
+
+
+
     def _build_from_hub(self, backbone: str, ckpt: str):
         """Создание модели через torch.hub (официальный способ)."""
         if self.repo_dir is None:
@@ -214,7 +238,7 @@ class DinoV3Encoder:
         return x.to(self.device)
 
     @torch.no_grad()
-    def encode_image(self, img: Image.Image) -> np.ndarray:
+    def encode(self, img: Image.Image) -> np.ndarray:
         x = self._prep(img)
         feats = self.model.forward_features(x)
 

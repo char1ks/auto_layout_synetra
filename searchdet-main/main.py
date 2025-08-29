@@ -88,12 +88,12 @@ def main():
     embed_start = time.time()
     print("🧠 Создание эмбеддингов для примеров...")
     pos_embs = np.stack([
-        get_vector(img, resnet_model, pooling_layer, transform).numpy()
+        get_vector(img, resnet_model, pooling_layer, transform).cpu().numpy()
         for img in positive_imgs
     ], axis=0).astype(np.float32)
 
     neg_embs = np.stack([
-        get_vector(img, resnet_model, pooling_layer, transform).numpy()
+        get_vector(img, resnet_model, pooling_layer, transform).cpu().numpy()
         for img in negative_imgs
     ], axis=0).astype(np.float32)
     embed_time = time.time() - embed_start

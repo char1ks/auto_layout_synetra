@@ -231,6 +231,13 @@ def scrape_images(keyword, save_dir, num_images=5):
 def get_vector(image, model, layer, transform):
     t_img = transform(image).unsqueeze(0)
     
+    # ---> FIX: move tensor to model's device
+    try:
+        device = next(model.parameters()).device
+        t_img = t_img.to(device)
+    except Exception as e:
+        print(f"[get_vector] Could not move tensor to device: {e}")
+
     # Проверяем, является ли модель DINOv2/v3
     model_name = model.__class__.__name__.lower()
     if 'vit' in model_name or hasattr(model, 'forward_features'):
@@ -343,7 +350,7 @@ def get_cached_embeddings(image_paths, model, layer, transform, cache_dir="cache
     for path in image_paths:
         if os.path.exists(path):
             image = Image.open(path).convert('RGB')
-            embedding = get_vector(image, model, layer, transform).numpy()
+            embedding = get_vector(image, model, layer, transform).cpu().numpy()
             embeddings.append(embedding)
             mtimes[path] = os.path.getmtime(path)
     
@@ -392,9 +399,13 @@ def extract_features_from_masks_fast(image, masks, model, layer, transform):
         image_tensor = (image_tensor - mean) / std
         image_tensor = image_tensor.unsqueeze(0)
     
-    # Перевод в GPU если доступно
+    # ---> FIX: move tensor to model's device and match dtype
     device = next(model.parameters()).device
-    image_tensor = image_tensor.to(device, memory_format=torch.channels_last)
+    image_tensor = image_tensor.to(device)
+    
+    # Match model dtype (e.g. half)
+    if next(model.parameters()).dtype == torch.float16:
+        image_tensor = image_tensor.half()
     
     # Диагностика размера входного тензора
     print(f"   🧪 Backbone input tensor: {list(image_tensor.shape)}")  # должен быть [1,3,?,?] где ? ~512
@@ -653,7 +664,7 @@ def extract_features_from_masks_slow(image, masks, model, layer, transform):
         else:
             pil_image = Image.fromarray(mask_image)
             
-        features.append(get_vector(pil_image, model, layer, transform).numpy())
+        features.append(get_vector(pil_image, model, layer, transform).cpu().numpy())
     
     extract_time = time.time() - extract_start
     print(f"   ⏱️ Извлечение эмбеддингов завершено за: {extract_time:.3f} сек ({extract_time/len(masks)*1000:.1f} мс/маска)")

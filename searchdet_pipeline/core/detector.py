@@ -4,6 +4,7 @@
 Автономный SearchDetDetector для модульного пайплайна.
 """
 
+import argparse
 import os
 import sys
 import cv2
@@ -25,6 +26,8 @@ from .scoring import ScoreCalculator
 from .step7_result_saving import ResultSaver
 from .sam_predictor import SAMPredictor
 from .utils import get_image_size, get_feature_map_size, upsample_feature_map
+from .dinov3_encoder import DinoV3Encoder
+import torch
 
 
 class SearchDetDetector:
@@ -32,10 +35,15 @@ class SearchDetDetector:
         if not SEARCHDET_AVAILABLE:
             raise RuntimeError("SearchDet не найден")
         self.params = kwargs
+        self.args = argparse.Namespace(**kwargs)
         self.sam_encoder = self.params.get('sam_encoder', 'vit_l')
         self.sam_model = self.params.get('sam_model', None)
+        self.device = self.params.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
+        self.half = self.params.get('half', False)
+        self.mask_backend = self.params.get('backend', 'sam-hq')
         self.backbone = self.params.get('backbone', 'dinov2_b')
         self.dinov3_ckpt = self.params.get('dinov3_ckpt', None)
+        self.nms_iou = self.params.get('nms_iou', 0.5)
         if not self.backbone.startswith('dinov2'):
             feat_short = str(self.params.get('feat_short_side', 384))
             os.environ['SEARCHDET_FEAT_SHORT_SIDE'] = feat_short
@@ -53,27 +61,24 @@ class SearchDetDetector:
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ])
         else:
-            print(f"🔧 DINOv2: трансформация будет определена в EmbeddingExtractor")  
-        self.searchdet_layer = self.params.get('layer', 'layer3')
-        print(f"🔧 Используется слой для эмбеддингов: {self.searchdet_layer}")
-        self.mask_backend = self.params.get('mask_backend', 'fastsam')
-        self.consensus_k = int(self.params.get('consensus_k', 3))
-        self.consensus_thr = float(self.params.get('consensus_thr', 0.60))
-        self.nms_iou = float(self.params.get('nms_iou', 0.60))
-        # 🚀 Параметры оптимизации эмбеддингов
-        self.max_embedding_size = self.params.get('max_embedding_size', 1024)
-        self.dino_half_precision = self.params.get('dino_half_precision', False)
+            self.searchdet_transform = None
+        self.sam_predictor = SAMPredictor(self.searchdet_sam)
+        
+        self.dinov3_backbone = getattr(self.args, "dinov3_backbone", None) or getattr(self.args, "backbone", None)
+        self.dinov3_ckpt     = getattr(self.args, "dinov3_ckpt", None)
+        self.dinov3_device   = "cuda" if (getattr(self.args, "device", "cuda") == "cuda" and torch.cuda.is_available()) else "cpu"
+        self.dinov3_half     = bool(getattr(self.args, "half", False))
+        self.vit_pooling     = getattr(self.args, "vit_pooling", "cls").lower()
+        self.pos_agg_mode    = getattr(self.args, "pos_agg_mode", "max").lower()
 
-        # 🚀 Параметры генерации масок
-        default_sam_long = min(1800, self.max_embedding_size)
-        self.sam_long_side = int(self.params.get('sam_long_side', default_sam_long))
-        self.fastsam_imgsz = int(self.params.get('fastsam_imgsz', 1024))
-        self.fastsam_conf = float(self.params.get('fastsam_conf', 0.4))
-        self.fastsam_iou = float(self.params.get('fastsam_iou', 0.9))
-        self.fastsam_retina = bool(self.params.get('fastsam_retina', True))
-        self.ban_border_masks = bool(self.params.get('border_ban', True))
-        self.border_width = int(self.params.get('border_width', 2))
-        # 🚀 Предзагрузка DINOv3 при инициализации (если используется)
+        self.dinov3_encoder = DinoV3Encoder(
+            backbone=self.dinov3_backbone,
+            ckpt=self.dinov3_ckpt,
+            device=self.dinov3_device,
+            half=self.dinov3_half,
+            vit_pooling=self.vit_pooling,
+        )
+
         if self.backbone.startswith('dinov3') and self.dinov3_ckpt:
             print(f"🔧 Предзагрузка DINOv3 ConvNeXt-B: {self.dinov3_ckpt}")
             self._preload_dinov3()
@@ -396,39 +401,70 @@ class SearchDetDetector:
         return kept
 
     def _load_example_images(self, dir_path):
-
-        if not dir_path or not Path(dir_path).exists():
-            return []
-        images = []
-        for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp']:
-            for img_path in Path(dir_path).glob(ext):
-                try:
-                    img = Image.open(img_path).convert('RGB')
-                    images.append(img)
-                except Exception as e:
-                    print(f"   ⚠️ Не удалось загрузить {img_path}: {e}")
-        return images
-    
-    
-    def _load_positive_by_class(self, dir_path):
+        """Рекурсивно загружает все изображения из директории."""
         from pathlib import Path
         from PIL import Image
+
+        images = []
+        if not dir_path:
+            return images
+            
+        p_dir = Path(dir_path)
+        if not p_dir.exists() or not p_dir.is_dir() or p_dir.name.startswith('.'):
+            return images
+
+        valid_extensions = {'.jpg', '.jpeg', '.png', '.bmp'}
+        
+        for item in p_dir.iterdir():
+            if item.name.startswith('.'):
+                continue
+            
+            if item.is_dir():
+                images.extend(self._load_example_images(item))  # Рекурсивный вызов
+            elif item.is_file() and item.suffix.lower() in valid_extensions:
+                try:
+                    img = Image.open(item).convert('RGB')
+                    images.append(img)
+                except Exception as e:
+                    print(f"   ⚠️ Не удалось загрузить {item}: {e}")
+        return images
+
+    def _load_positive_by_class(self, dir_path):
+        """Загружает позитивные примеры, распределяя их по классам."""
+        from pathlib import Path
         result = {}
-        if not dir_path or not Path(dir_path).exists():
+        if not dir_path:
             return result
-        subdirs = [p for p in Path(dir_path).iterdir() if p.is_dir()]
-        if not subdirs:
-            result['object'] = self._load_example_images(dir_path)
+            
+        p_dir = Path(dir_path)
+        if not p_dir.exists() or not p_dir.is_dir() or p_dir.name.startswith('.'):
             return result
-        for sd in subdirs:
-            imgs = []
-            for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp']:
-                for img_path in sd.glob(ext):
-                    try:
-                        imgs.append(Image.open(img_path).convert('RGB'))
-                    except Exception as e:
-                        print(f"   ⚠️ Не удалось загрузить {img_path}: {e}")
-            result[sd.name] = imgs
+
+        # Ищем нескрытые поддиректории
+        subdirs = [p for p in p_dir.iterdir() if p.is_dir() and not p.name.startswith('.')]
+        
+        if subdirs:
+            # Режим 1: Поддиректории являются классами
+            print(f"   📂 Режим мульти-класса: подпапки в '{p_dir.name}' считаются классами.")
+            for class_dir in subdirs:
+                class_name = class_dir.name
+                loaded_images = self._load_example_images(class_dir)
+                if loaded_images:
+                    result[class_name] = loaded_images
+                    print(f"     -> Класс '{class_name}': найдено {len(loaded_images)} изображений.")
+                else:
+                    print(f"     -> Класс '{class_name}': 0 изображений.")
+        else:
+            # Режим 2: Нет поддиректорий, вся папка - один класс
+            print(f"   📂 Режим одного класса: все изображения в '{p_dir.name}' будут принадлежать классу '{p_dir.name}'.")
+            class_name = p_dir.name
+            loaded_images = self._load_example_images(p_dir)
+            if loaded_images:
+                result[class_name] = loaded_images
+                print(f"     -> Класс '{class_name}': найдено {len(loaded_images)} изображений.")
+            else:
+                print(f"     -> Класс '{class_name}': 0 изображений.")
+
         return result
     def _print_timing_statistics(self, timing_info):
         print("\n" + "="*60)

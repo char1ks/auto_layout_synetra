@@ -212,6 +212,8 @@ def _add_detect_arguments(parser: argparse.ArgumentParser):
     parser.add_argument('--border-width', type=int, help='Толщина рамки для фильтра границ (px)')
     
     # Дополнительные опции
+    parser.add_argument('--device', default='cuda', help='Устройство для выполнения (например, cuda или cpu)')
+    parser.add_argument('--half', action='store_true', help='Использовать половинную точность (float16)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Подробный вывод')
     parser.add_argument('--quiet', '-q', action='store_true', help='Минимальный вывод')
     parser.add_argument('--defect', action='store_true', help='Включить режим поиска дефектов (beta)')
@@ -246,6 +248,8 @@ def _add_batch_arguments(parser: argparse.ArgumentParser):
     parser.add_argument('--sam2-config', help='Путь к конфигурации SAM2')
     
     # Дополнительные опции
+    parser.add_argument('--device', default='cuda', help='Устройство для выполнения (например, cuda или cpu)')
+    parser.add_argument('--half', action='store_true', help='Использовать половинную точность (float16)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Подробный вывод')
 
 
@@ -256,6 +260,8 @@ def _add_quick_arguments(parser: argparse.ArgumentParser):
     parser.add_argument('--output', '-o', help='Директория для сохранения результатов')
     parser.add_argument('--backend', choices=['sam-hq', 'sam2', 'fastsam'], 
                        default='sam-hq', help='Бэкенд для генерации масок')
+    parser.add_argument('--device', default='cuda', help='Устройство для выполнения (например, cuda или cpu)')
+    parser.add_argument('--half', action='store_true', help='Использовать половинную точность (float16)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Подробный вывод')
 
 
@@ -343,6 +349,8 @@ def _execute_detect(args) -> int:
         # Параметры для детектора
         detector_params = {
             'mask_backend': args.backend or 'fastsam',
+            'device': args.device,
+            'half': args.half,
         }
         
         # Добавляем пути к моделям если указаны
@@ -605,6 +613,8 @@ def _execute_quick(args) -> int:
         # Параметры для детектора
         detector_params = {
             'mask_backend': args.backend or 'fastsam',
+            'device': args.device,
+            'half': args.half,
         }
         
         # Параметры умного фильтра прямоугольников
@@ -777,6 +787,11 @@ def _apply_cli_args_to_config(config, args):
         if 'embeddings' not in config_dict:
             config_dict['embeddings'] = {}
         config_dict['embeddings']['dino_half_precision'] = True
+
+    if hasattr(args, 'device') and args.device:
+        config_dict['device'] = args.device
+    if hasattr(args, 'half') and args.half:
+        config_dict['half'] = args.half
     
     return Config.from_dict(config_dict)
 
