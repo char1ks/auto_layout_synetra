@@ -49,6 +49,27 @@ def _cosine_matrix(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     return sims
 
 
+def _cos(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    # a: (N,D), b: (M,D) -> (N,M)
+    return a @ b.T
+
+def _agg_scores(sims: np.ndarray, mode: str = "mean_topk", topk: int = 2) -> np.ndarray:
+    """
+    sims: (N, K_i) — похожесть масок к K_i примерам одного класса.
+    Возвращает (N,) — агрегированный pos по классу.
+    """
+    if sims.size == 0:
+        return np.full((sims.shape[0],), -1.0, dtype=np.float32)
+    if mode == "max":
+        return sims.max(axis=1)
+    if mode == "mean":
+        return sims.mean(axis=1)
+    # mean_topk
+    k = min(topk, sims.shape[1])
+    part = np.partition(sims, -k, axis=1)[:, -k:]
+    return part.mean(axis=1)
+
+
 # --------------- скорер ---------------
 
 class ScoreCalculator:
@@ -171,146 +192,91 @@ class ScoreCalculator:
 
     def score_multiclass(
         self,
-        mask_vecs: np.ndarray,
-        class_pos: Dict[str, np.ndarray],
-        q_neg: np.ndarray
+        mask_vecs: np.ndarray,                    # (N,D), L2-normed
+        q_pos: dict[str, np.ndarray],             # class -> (K_i,D)
+        q_neg: np.ndarray | None,                 # (K_neg,D) or None/(0,*)
+        *,
+        online_negatives: np.ndarray | None = None,
     ) -> List[Dict[str, Any]]:
-        mask_vecs = _to_matrix(mask_vecs)
-        D = mask_vecs.shape[1] if mask_vecs.size else 0
-        class_pos = {cls: _to_matrix(Q, D) for cls, Q in (class_pos or {}).items()}
-        q_neg = _to_matrix(q_neg, D)
+        """
+        Возвращает decisions: List[dict], где dict = {
+            'accepted': bool, 'cls': str|None, 'pos': float, 'neg': float,
+            'diff': float, 'ratio': float, 'confidence': float
+        }
+        """
+        pos_agg = self.pos_agg
+        topk = self.topk
+        min_pos = self.min_pos_score
+        diff_thr = self.decision_threshold
+        ratio_thr = self.ratio
+        top2_margin = self.class_separation
+        require_two_pos = False # not in config, use default
 
-        N = mask_vecs.shape[0]
-        if N == 0:
-            return []
+        N, D = mask_vecs.shape
+        if not q_pos:
+            return [{'accepted': False, 'cls': None, 'pos': 0.0, 'neg': 0.0,
+                     'diff': 0.0, 'ratio': 0.0, 'confidence': 0.0} for _ in range(N)]
 
-        # --- негативы: сырые косинусы ---
-        if q_neg.shape[0] == 0:
-            sims_neg = np.zeros((N, 0), dtype=np.float32)
-            neg_raw = np.zeros(N, dtype=np.float32)
+        # Собираем pos-скор по всем классам
+        classes = sorted(q_pos.keys())
+        pos_all = []
+        for cls in classes:
+            Q = q_pos[cls]  # (K_i, D)
+            sims = _cos(mask_vecs, Q)            # (N, K_i), уже [-1..1]
+            pos_cls = _agg_scores(sims, pos_agg, topk)
+            if require_two_pos and Q.shape[0] < 2:
+                # штрафуем классы с 1 примером, чтобы не «долбить» max по одному
+                pos_cls -= 0.05
+            pos_all.append(pos_cls)
+        pos_all = np.stack(pos_all, 1)            # (N, C)
+        best_idx = pos_all.argmax(axis=1)         # (N,)
+        best_pos = pos_all[np.arange(N), best_idx]
+        # второй лучший класс (для отрыва/top2-margin)
+        pos_sorted = np.sort(pos_all, axis=1)
+        second_pos = pos_sorted[:, -2] if pos_sorted.shape[1] >= 2 else np.full((N,), -1.0, dtype=np.float32)
+
+        # NEG: реальные + онлайн
+        neg_pool = []
+        if q_neg is not None and q_neg.size:
+            neg_pool.append(q_neg)
+        if online_negatives is not None and online_negatives.size:
+            neg_pool.append(online_negatives)
+        if neg_pool:
+            NEG = np.concatenate(neg_pool, axis=0)     # (K_neg, D)
+            neg_scores = _cos(mask_vecs, NEG).max(axis=1)  # (N,)
         else:
-            sims_neg = _cosine_matrix(mask_vecs, q_neg)
-            neg_raw = self._aggregate_negative(sims_neg)
+            # Если нет негативов — используем второй лучший класс как суррогат neg
+            neg_scores = second_pos.copy()
 
-        # для принятия решений используем clamp до [0, neg_cap]
-        neg_for_decision = np.clip(np.maximum(neg_raw, 0.0), 0.0,
-                                   (self.neg_cap if self.neg_cap is not None else 1.0)).astype(np.float32)
+        # Гейты
+        eps = 1e-3
+        ratios = best_pos / np.maximum(neg_scores, 0.01)   # чтобы не делить на 0
+        diffs = best_pos - np.maximum(neg_scores, 0.0)
+        margins = best_pos - second_pos
 
-        if self.verbose:
-            print("🔍 ЭТАП 3: Сопоставление с positive/negative по классам...")
-            print("   ℹ️ |mask_vec| mean≈", float(np.mean(np.linalg.norm(mask_vecs, axis=1))))
-            print("   ℹ️ |Q_pos| mean≈", float(np.mean([np.mean(np.linalg.norm(Q, axis=1)) for Q in class_pos.values() if len(Q)>0] or [0])))
-
-        # --- по классам: сырые pos косинусы ---
-        class_scores: Dict[str, np.ndarray] = {}
-        class_consensus: Dict[str, np.ndarray] = {}
-
-        for cls, Q in (class_pos or {}).items():
-            if Q.shape[0] == 0:
-                if self.verbose:
-                    print(f"   📊 Класс '{cls}': 0 примеров")
-                continue
-            sims_pos = _cosine_matrix(mask_vecs, Q)      # [-1,1]
-            pos_scores = self._aggregate_positive(sims_pos)
-            class_scores[cls] = pos_scores
-            class_consensus[cls] = self._consensus_count(sims_pos)
-            if self.verbose:
-                s_list = [f"{s:.3f}" for s in pos_scores]
-                print(f"   📊 Класс '{cls}': {Q.shape[0]} примеров → скоры={s_list}")
-
-        if not class_scores:
-            if self.verbose:
-                print("   ❌ Нет валидных классов с эмбеддингами - возвращаем пустой результат")
-            return [
-                {'accepted': False, 'class': None, 'pos_score': 0.0,
-                 'neg_score': float(neg_for_decision[i]), 'confidence': 0.0}
-                for i in range(N)
-            ]
-
-        classes = list(class_scores.keys())
-        pos_matrix = np.stack([class_scores[c] for c in classes], axis=1)  # [N, C]
-        best_idx = np.argmax(pos_matrix, axis=1)
-        best_pos = pos_matrix[np.arange(N), best_idx]                      # сырые косинусы
-        second_best = np.partition(pos_matrix, -2, axis=1)[:, -2] if pos_matrix.shape[1] > 1 \
-                      else best_pos - 0.0  # так sep≈0 при одном классе
-        best_cls = [classes[j] for j in best_idx]
-
-        if self.verbose:
-            for i in range(N):
-                row = ", ".join([f"{c}={class_scores[c][i]:.3f}" for c in classes])
-                print(f"     Маска {i}: [{row}] → выбран {best_cls[i]} ({best_pos[i]:.3f})")
-
-        # сводные метрики
-        pos_min, pos_max = float(np.min(best_pos)), float(np.max(best_pos))
-        neg_avg = float(np.mean(neg_raw)) if neg_raw.size else 0.0
-        if self.verbose:
-            print(f"📊 Скоры мультикласса: pos_avg={np.mean(best_pos):.3f}, neg_avg={neg_avg:.3f}")
-
-        pos_range = pos_max - pos_min
-        neg_range = float(np.max(neg_raw) - np.min(neg_raw)) if neg_raw.size else 0.0
-
-        # Аккуратная анти-коллапс отсечка:
-        # включаем ТОЛЬКО если нет негативов, и все pos одинаково «запредельно» высокие
-        use_quantile_gate = (q_neg.shape[0] == 0) and (pos_max > 0.95) and (pos_range < 0.02)
-
-        if self.verbose:
-            print(f"🎯 Пороги: min_pos={self.min_pos_score:.3f}, diff_thr={self.decision_threshold:.3f}, "
-                  f"class_sep={self.class_separation:.3f}, quantile_gate={use_quantile_gate}")
-
-        q85 = float(np.quantile(best_pos, 0.85)) if use_quantile_gate else None
-        if use_quantile_gate and self.verbose:
-            print(f"   📐 Квантильная отсечка: Q85={q85:.3f}")
-
-        eps = 1e-8
-        out: List[Dict[str, Any]] = []
-        accepted_count = 0
-
+        decisions = []
         for i in range(N):
-            cls_i = best_cls[i]
-            pos_s = float(best_pos[i])                 # косинус [-1,1]
-            neg_raw_i = float(neg_raw[i]) if i < len(neg_raw) else 0.0
-            neg_i = float(neg_for_decision[i]) if i < len(neg_for_decision) else 0.0
+            cls = classes[best_idx[i]]
+            pos = float(np.clip(best_pos[i], -1.0, 1.0))
+            neg = float(np.clip(neg_scores[i], -1.0, 1.0))
+            diff = float(diffs[i])
+            ratio = float(ratios[i])
+            margin2 = float(margins[i])
 
-            # базовые условия
-            base_ok = (pos_s >= self.min_pos_score) and (pos_s > neg_i)
-            class_sep = float(pos_s - float(second_best[i]))
-            class_sep_ok = (class_sep >= self.class_separation) if len(classes) > 1 else True
+            accept = (pos >= min_pos) and (diff >= diff_thr) and (ratio >= ratio_thr) and (margin2 >= top2_margin)
+            conf = max(0.0, min(1.0, 0.5 * (pos - min_pos) + 0.5 * (diff - diff_thr)))
 
-            diff = pos_s - neg_i - self.margin
-            ratio_ok = (pos_s / (neg_i + eps)) >= float(self.ratio) if neg_i > 0 else (pos_s >= self.min_pos_score)
-            diff_ok = (diff >= self.decision_threshold) or ratio_ok
-
-            cons = int(class_consensus.get(cls_i, np.zeros(N, dtype=np.int32))[i])
-            consensus_ok = cons >= int(self.consensus_k)
-
-            # квантильная отсечка (только при спец-условиях выше)
-            quant_ok = True
-            if use_quantile_gate:
-                quant_ok = (pos_s >= q85)
-
-            accepted = bool(base_ok and diff_ok and class_sep_ok and consensus_ok and quant_ok)
-
-            if self.verbose:
-                cons_info = f"cons={cons}/{self.consensus_k}"
-                extra = f", neg_raw={neg_raw_i:.3f}, neg={neg_i:.3f}, diff={diff:+.3f}, sep={class_sep:+.3f}"
-                if use_quantile_gate:
-                    extra += f", q85={q85:.3f}"
-                print(f"   Маска {i}: класс={cls_i}, pos={pos_s:.3f}{extra}, {cons_info} → принято={accepted}")
-
-            out.append({
-                'accepted': accepted,
-                'class': cls_i if (accepted or self.allow_unknown) else None,
-                'pos_score': pos_s,                  # СЫРОЙ КОСИНУС
-                'neg_score': neg_i,                  # уже с clamp [0, neg_cap]
-                'neg_score_raw': neg_raw_i,          # для отладки
-                'confidence': float(np.clip(0.5 * (pos_s + 1.0), 0.0, 1.0)),  # в [0,1] только для UI
+            decisions.append({
+                'accepted': bool(accept),
+                'cls': cls if accept else cls,
+                'pos': pos,
+                'neg': neg,
+                'diff': diff,
+                'ratio': ratio,
+                'confidence': float(conf),
             })
-            if accepted:
-                accepted_count += 1
 
-        if self.verbose:
-            print(f"🎯 Принято {accepted_count} из {N} масок")
-        return out
+        return decisions
 
     # ----- бинарный режим (оставлен для совместимости/APIs)
 

@@ -609,17 +609,48 @@ def extract_features_from_masks_fast(image, masks, model, layer, transform):
 # Удалено, чтобы избежать рекурсии
 
 
-# Function to extract features from masks with OPTIMIZATION
-def extract_features_from_masks(image, masks, model, layer, transform):
+# embeddings.py — В МЕТОДЕ, КОТОРЫЙ ДЕЛАЕТ СТАРОЕ (медленное) ИЗВЛЕЧЕНИЕ ФИЧ
+# например extract_features_from_masks(...) — ДОБАВЬ НОРМАЛИЗАЦИЮ dtype/device
+
+import torch
+
+def extract_features_from_masks(encoder, masked_crops):
     """
-    Главная функция извлечения фич - использует быстрый Masked Pooling метод
+    masked_crops: List[PIL.Image] — вырезки под маски
+    Возвращает: np.ndarray (N,D)
     """
-    # 🚀 Пробуем быстрый метод сначала
-    try:
-        return extract_features_from_masks_fast(image, masks, model, layer, transform)
-    except Exception as e:
-        print(f"   ⚠️ Быстрый метод не сработал ({str(e)}), используем старый")
-        return extract_features_from_masks_slow(image, masks, model, layer, transform)
+    feats = []
+    # Получаем эталонный dtype/device из модели
+    p = next(encoder.model.parameters())
+    dev, dt = p.device, p.dtype
+
+    for im in masked_crops:
+        x = encoder.tf(im).unsqueeze(0)                  # cpu float32
+        x = x.to(device=dev, dtype=dt, non_blocking=True)
+        with torch.no_grad():
+            f = encoder.model.forward_features(x)
+            # тот же способ, что и в encoder.encode
+            if hasattr(encoder.model, "forward_head"):
+                out = encoder.model.forward_head(f, pre_logits=True)
+            else:
+                out = f
+            if out.ndim == 2:
+                v = out[0]
+            elif out.ndim == 3:
+                if encoder.pooling == "mean" and out.shape[1] > 1:
+                    v = out[0, 1:].mean(dim=0)
+                else:
+                    v = out[0, 0]
+            elif out.ndim == 4:
+                v = out.mean(dim=(2, 3))[0]
+            else:
+                v = out.flatten(1)[0]
+            v = torch.nn.functional.normalize(v.float(), dim=0)
+            feats.append(v.cpu().numpy().astype(np.float32))
+
+    if not feats:
+        return np.zeros((0, 1), dtype=np.float32)
+    return np.stack(feats, axis=0)  # (N,D)
 
 
 # Старая функция для fallback

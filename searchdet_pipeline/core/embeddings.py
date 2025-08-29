@@ -1,9 +1,56 @@
 # embeddings.py
 
+import os
+import glob
 import numpy as np
 from PIL import Image
 import cv2
 import torch
+
+def _iter_images(root):
+    exts = ("*.jpg","*.jpeg","*.png","*.bmp","*.webp","*.tif","*.tiff")
+    paths = []
+    for e in exts:
+        paths.extend(glob.glob(os.path.join(root, e)))
+    return sorted(paths)
+
+def extract_features_from_masks(encoder, masked_crops):
+    """
+    masked_crops: List[PIL.Image] — вырезки под маски
+    Возвращает: np.ndarray (N,D)
+    """
+    feats = []
+    # Получаем эталонный dtype/device из модели
+    p = next(encoder.model.parameters())
+    dev, dt = p.device, p.dtype
+
+    for im in masked_crops:
+        x = encoder.tf(im).unsqueeze(0)                  # cpu float32
+        x = x.to(device=dev, dtype=dt, non_blocking=True)
+        with torch.no_grad():
+            f = encoder.model.forward_features(x)
+            # тот же способ, что и в encoder.encode
+            if hasattr(encoder.model, "forward_head"):
+                out = encoder.model.forward_head(f, pre_logits=True)
+            else:
+                out = f
+            if out.ndim == 2:
+                v = out[0]
+            elif out.ndim == 3:
+                if encoder.pooling == "mean" and out.shape[1] > 1:
+                    v = out[0, 1:].mean(dim=0)
+                else:
+                    v = out[0, 0]
+            elif out.ndim == 4:
+                v = out.mean(dim=(2, 3))[0]
+            else:
+                v = out.flatten(1)[0]
+            v = torch.nn.functional.normalize(v.float(), dim=0)
+            feats.append(v.cpu().numpy().astype(np.float32))
+
+    if not feats:
+        return np.zeros((0, 1), dtype=np.float32)
+    return np.stack(feats, axis=0)  # (N,D)
 
 class EmbeddingExtractor:
     def __init__(self, detector):
@@ -83,48 +130,82 @@ class EmbeddingExtractor:
         return X, valid_ids
 
     # ---------- ПРИМЕРЫ: ВСЕГДА ЧЕРЕЗ DINOv3 ----------
-    def build_queries_multiclass(self, pos_by_class, neg_imgs):
+    def build_queries_multiclass(self, pos_input: dict | str,
+                              negative_dir: str | None,
+                              pos_as_query_masks: bool,
+                              mask_crops_by_class: dict[str, list] | None = None,
+                              max_per_class: int = 64) -> tuple[dict[str, np.ndarray], np.ndarray]:
         """
-        Строит словарь: {класс: np.ndarray (Kc, D)} и q_neg: (M, D)
-        Все векторы — L2-нормированные float32.
+        Возвращает:
+          q_pos: dict[class_name] -> (K_i, D) — НОРМИРОВАННЫЕ векторы примеров
+          q_neg: (K_neg, D) или shape (0, D), если нет негативов
+
+        Если negative_dir отсутствует/пуст, будет собран онлайн-негатив из фоновых масок
+        (передай его позже в score_multiclass через параметр `online_negatives`).
         """
+        q_pos: dict[str, np.ndarray] = {}
+        q_neg_list: list[np.ndarray] = []
+
         enc = getattr(self.detector, "dinov3_encoder", None)
         if enc is None:
             print("   ❌ DINOv3-энкодер не инициализирован в detector")
             # пустые, чтобы скоринг корректно отработал
             return {}, np.zeros((0, 1024), dtype=np.float32)
 
-        class_pos = {}
-        total_pos = 0
+        # POS: могут быть как dict {class:[paths]} или путь к папке с подпапками-классами
+        pos_class_iterator = None
+        is_dir_mode = False
+        if isinstance(pos_input, str) and os.path.isdir(pos_input):
+            pos_class_iterator = sorted(os.listdir(pos_input))
+            is_dir_mode = True
+        elif isinstance(pos_input, dict):
+            pos_class_iterator = sorted(pos_input.keys())
+            is_dir_mode = False
 
-        for cls_name, img_list in (pos_by_class or {}).items():
-            cls_vecs = []
-            for i, pil_img in enumerate(img_list or []):
+        if pos_class_iterator:
+            for cls in pos_class_iterator:
+                image_paths = []
+                if is_dir_mode:
+                    cls_dir = os.path.join(pos_input, cls)
+                    if not os.path.isdir(cls_dir):
+                        continue
+                    image_paths = _iter_images(cls_dir)
+                else: # dict
+                    image_paths = pos_input[cls]
+
+                vecs: list[np.ndarray] = []
+                if pos_as_query_masks and mask_crops_by_class and cls in mask_crops_by_class:
+                    # Используем маски из positive в качестве запросов
+                    for im in mask_crops_by_class[cls][:max_per_class]:
+                        vecs.append(enc.encode(im))
+                else:
+                    # Берём целые изображения из класса
+                    for item in image_paths[:max_per_class]:
+                        try:
+                            if isinstance(item, Image.Image):
+                                im = item.convert("RGB")
+                            else:
+                                im = Image.open(item).convert("RGB")
+                            vecs.append(enc.encode(im))
+                        except Exception as e:
+                            print(f"   ⚠️ Ошибка обработки positive-примера {item}: {e}")
+                            continue
+
+                if vecs:
+                    arr = np.stack(vecs, 0)
+                    # Приведение к единичным (на всякий)
+                    arr = arr / (np.linalg.norm(arr, axis=1, keepdims=True) + 1e-8)
+                    q_pos[cls] = arr
+
+        # NEG: реальные негативы
+        if negative_dir and os.path.isdir(negative_dir):
+            for p in _iter_images(negative_dir)[:256]:
                 try:
-                    v = enc.encode(pil_img)  # float32, L2
-                    if v is not None and v.size > 0:
-                        cls_vecs.append(v.astype(np.float32, copy=False))
-                except Exception as e:
-                    print(f"   ⚠️ Класс '{cls_name}', пример {i}: {e}")
-            if cls_vecs:
-                Q = np.stack(cls_vecs, axis=0).astype(np.float32, copy=False)
-            else:
-                Q = np.zeros((0, enc.output_dim), dtype=np.float32)
-            class_pos[cls_name] = Q
-            total_pos += Q.shape[0]
-            print(f"   📊 Класс '{cls_name}': {Q.shape[0]} примеров")
+                    im = Image.open(p).convert("RGB")
+                    v = enc.encode(im)
+                    q_neg_list.append(v / (np.linalg.norm(v) + 1e-8))
+                except Exception:
+                    continue
 
-        # отрицательные опциональны; если их нет — возвращаем (0, D), но не используем их в вычитаниях
-        neg_vecs = []
-        for i, pil_img in enumerate(neg_imgs or []):
-            try:
-                v = enc.encode(pil_img)
-                if v is not None and v.size > 0:
-                    neg_vecs.append(v.astype(np.float32, copy=False))
-            except Exception as e:
-                print(f"   ⚠️ Negative пример {i}: {e}")
-        q_neg = np.stack(neg_vecs, axis=0).astype(np.float32, copy=False) if neg_vecs else \
-                np.zeros((0, enc.output_dim), dtype=np.float32)
-
-        print(f"   📊 Negative всего: {q_neg.shape[0]}")
-        return class_pos, q_neg
+        q_neg = np.stack(q_neg_list, 0) if q_neg_list else np.zeros((0, 1), dtype=np.float32)
+        return q_pos, q_neg

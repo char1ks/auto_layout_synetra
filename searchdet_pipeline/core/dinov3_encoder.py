@@ -231,37 +231,47 @@ class DinoV3Encoder:
         print("   ✅ weights loaded (strict=False)")
 
     @torch.no_grad()
-    def _prep(self, img: Image.Image) -> torch.Tensor:
-        x = self.tf(img).unsqueeze(0)
-        if self.half:
-            x = x.half()
-        return x.to(self.device)
+    def _prep(self, img):
+        x = self.tf(img).unsqueeze(0)  # (1,3,H,W) float32 cpu
+        # Приводим к device/dtype самой модели
+        p = next(self.model.parameters())
+        x = x.to(device=p.device, dtype=p.dtype, non_blocking=True)
+        return x
 
     @torch.no_grad()
-    def encode(self, img: Image.Image) -> np.ndarray:
+    def encode(self, img):
+        """
+        Возвращает L2-нормированный вектор (D,), cosine -> [-1, 1].
+        Берём pre-logits: forward_head(..., pre_logits=True) если есть.
+        """
         x = self._prep(img)
         feats = self.model.forward_features(x)
 
+        # 1) Стандартный путь через forward_head(pre_logits=True)
         vec = None
         if hasattr(self.model, "forward_head"):
             out = self.model.forward_head(feats, pre_logits=True)
+            # Формы: (B,D) | (B,T,D) | (B,C,H,W)
             if out.ndim == 2:
-                vec = out[0]
-            elif out.ndim == 3:
+                vec = out[0]                                    # (D,)
+            elif out.ndim == 3:                                 # ViT токены
                 if self.vit_pooling == "mean" and out.shape[1] > 1:
-                    vec = out[0, 1:].mean(dim=0)
+                    vec = out[0, 1:].mean(dim=0)               # mean по патчам
                 else:
-                    vec = out[0, 0]
+                    vec = out[0, 0]                             # CLS
+            elif out.ndim == 4:
+                vec = out.mean(dim=(2, 3))[0]                   # GAP
+        # 2) Фолбэк для hub-моделей/словари фич
         if vec is None:
             t = feats["x"] if isinstance(feats, dict) and "x" in feats else feats
-            if t.ndim == 3:  # ViT
+            if t.ndim == 3:                                     # (B,T,D)
                 if self.vit_pooling == "mean" and t.shape[1] > 1:
                     vec = t[0, 1:].mean(dim=0)
                 else:
                     vec = t[0, 0]
-            elif t.ndim == 4:  # ConvNeXt
+            elif t.ndim == 4:                                   # (B,C,H,W)
                 vec = t.mean(dim=(2, 3))[0]
-            else:
+            else:                                               # (B,D) / flat
                 vec = t.flatten(1)[0]
 
         vec = F.normalize(vec.float(), dim=0).cpu().numpy().astype(np.float32)

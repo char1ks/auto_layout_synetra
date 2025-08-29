@@ -188,12 +188,54 @@ class SearchDetDetector:
             return {"found_elements": [], "masks": []}
         print(f"   📊 Масок с валидными векторами: {mask_vecs.shape[0]}")
         print("1️⃣3️⃣ Шаг 9: EmbeddingExtractor.build_queries_multiclass() - эмбеддинги примеров по классам")
-        class_pos, q_neg = self.embedding_extractor.build_queries_multiclass(pos_by_class, neg_imgs)
+        class_pos, q_neg = self.embedding_extractor.build_queries_multiclass(pos_by_class, neg_imgs, pos_as_query_masks=False)
         timing_info['embedding_extraction'] = time.time() - t_embeddings
+
+        online_negatives = None
+        # Если нет явных негативных примеров, используем онлайн-негативы
+        if q_neg is None or q_neg.shape[0] == 0:
+            print("   ⚠️ Нет явных негативных примеров, генерируем онлайн-негативы...")
+            
+            # 1. Собрать все позитивные запросы в один тензор
+            pos_queries_tensors = [torch.from_numpy(v) for v in class_pos.values() if v.shape[0] > 0]
+
+            if not pos_queries_tensors:
+                print("   ❌ Нет эмбеддингов для positive-классов, невозможно сгенерировать онлайн-негативы.")
+            else:
+                all_pos_queries = torch.cat(pos_queries_tensors, dim=0)
+
+                if all_pos_queries.shape[0] > 0 and mask_vecs.shape[0] > 0:
+                    # 2. Рассчитать косинусное сходство между масками и всеми позитивными запросами
+                    mask_vecs_torch = torch.from_numpy(mask_vecs)
+                    
+                    # Используем torch для расчета косинусной близости
+                    sim_matrix = torch.nn.functional.cosine_similarity(mask_vecs_torch.unsqueeze(1), all_pos_queries.unsqueeze(0), dim=2)
+
+                    # 3. Найти лучший позитивный скор для каждой маски
+                    best_pos_scores, _ = torch.max(sim_matrix, dim=1)
+                    
+                    # 4. Определить количество для онлайн-негативов (нижние 40%)
+                    num_online_negatives = int(mask_vecs.shape[0] * 0.4)
+                    
+                    if num_online_negatives > 0:
+                        # 5. Найти индексы масок с наименьшими скорами
+                        k = min(num_online_negatives, len(best_pos_scores))
+                        if k > 0:
+                            _, bottom_indices = torch.topk(best_pos_scores, k=k, largest=False)
+                            
+                            # 6. Собрать эмбеддинги для онлайн-негативов
+                            online_negatives = mask_vecs[bottom_indices.numpy()]
+                            print(f"   💡 Создано {online_negatives.shape[0]} онлайн-негативов из масок с наихудшими positive-скорами.")
+
         print("1️⃣4️⃣ Шаг 10: ScoreCalculator.score_multiclass() - скоринг и принятие решений")
         print("🔍 ЭТАП 3: Сопоставление с positive/negative по классам...")
         t_scoring = time.time()
-        decisions = self.score_calculator.score_multiclass(mask_vecs, class_pos, q_neg)
+        decisions = self.score_calculator.score_multiclass(
+            mask_vecs, 
+            class_pos, 
+            q_neg,
+            online_negatives=online_negatives
+        )
         timing_info['scoring_and_decisions'] = time.time() - t_scoring
         t_result = time.time()
         found = []
