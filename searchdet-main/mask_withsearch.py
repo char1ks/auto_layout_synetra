@@ -515,7 +515,29 @@ def extract_features_from_masks_fast(image, masks, model, layer, transform):
     valid_mask_indices = []
     
     for i, mask in enumerate(masks):
-        segmentation = mask['segmentation']
+        try:
+            # Безопасное извлечение segmentation
+            if isinstance(mask, dict) and 'segmentation' in mask:
+                segmentation = mask['segmentation']
+            else:
+                print(f"   ⚠️ Маска {i}: неправильный формат {type(mask)}, пропускаем")
+                continue
+                
+            # Проверяем что segmentation является массивом
+            if not isinstance(segmentation, np.ndarray):
+                if hasattr(segmentation, 'cpu') and hasattr(segmentation, 'numpy'):
+                    segmentation = segmentation.cpu().numpy()
+                else:
+                    print(f"   ⚠️ Маска {i}: segmentation не является массивом ({type(segmentation)}), пропускаем")
+                    continue
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            line_info = [line for line in tb.split('\n') if 'line' in line and '.py' in line]
+            line_detail = line_info[-1] if line_info else 'неизвестная строка'
+            print(f"   ⚠️ Ошибка при обработке маски {i}: {e}")
+            print(f"   📍 Место ошибки: {line_detail}")
+            continue
         
         # Изменяем размер маски под feature map (более мягкий способ)
         mask_resized = cv2.resize(segmentation.astype(np.float32), 
@@ -678,12 +700,35 @@ def extract_features_from_masks_slow(image, masks, model, layer, transform):
     
     features = []
     for i, mask in enumerate(masks):
-        if i % 50 == 0 and i > 0:  # Прогресс каждые 50 масок
-            elapsed = time.time() - extract_start
-            estimated_total = elapsed * len(masks) / i
-            print(f"   📊 Обработано {i}/{len(masks)} масок ({elapsed:.1f}с, осталось ~{estimated_total-elapsed:.1f}с)")
+        try:
+            if i % 50 == 0 and i > 0:  # Прогресс каждые 50 масок
+                elapsed = time.time() - extract_start
+                estimated_total = elapsed * len(masks) / i
+                print(f"   📊 Обработано {i}/{len(masks)} масок ({elapsed:.1f}с, осталось ~{estimated_total-elapsed:.1f}с)")
+            
+            # Безопасное извлечение segmentation
+            if isinstance(mask, dict) and 'segmentation' in mask:
+                segmentation = mask['segmentation']
+            else:
+                print(f"   ⚠️ Маска {i}: неправильный формат {type(mask)}, пропускаем")
+                continue
+                
+            # Проверяем что segmentation является массивом
+            if not isinstance(segmentation, np.ndarray):
+                if hasattr(segmentation, 'cpu') and hasattr(segmentation, 'numpy'):
+                    segmentation = segmentation.cpu().numpy()
+                else:
+                    print(f"   ⚠️ Маска {i}: segmentation не является массивом ({type(segmentation)}), пропускаем")
+                    continue
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            line_info = [line for line in tb.split('\n') if 'line' in line and '.py' in line]
+            line_detail = line_info[-1] if line_info else 'неизвестная строка'
+            print(f"   ⚠️ Ошибка при обработке маски {i}: {e}")
+            print(f"   📍 Место ошибки: {line_detail}")
+            continue
         
-        segmentation = mask['segmentation']
         mask_image = np.zeros_like(image)
         mask_image[segmentation] = image[segmentation]
         

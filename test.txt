@@ -1,13 +1,10 @@
-!python -m searchdet_pipeline.cli.main detect all6.png \
-   --positive examples/positive/ \
-   --negative examples/negative/ \
-   --backend fastsam \
-   --min-area 0.3 --max-area 95 --nested-iou 0.85 \
-   --score-confidence 0.72 --score-margin -0.02 --score-ratio 0.98 \
-   --consensus-k 1 --consensus-thr 0.58 \
-   --nms-iou 0.60 --sam-long-side 1800 \
-   --fastsam-imgsz 1024 --fastsam-conf 0.35 --fastsam-iou 0.9 \
-   --ban-border-masks --border-width 2 \
-   --output output/ --verbose \
-   --backbone dinov3_convnext_base \
-   --dinov3-ckpt /content/auto_layout_synetra/dinov3_convnext_base_pretrain_lvd1689m-801f2ba9.pth
+!python -m searchdet_pipeline.cli.main detect foto00117.jpg.png \
+--positive examples/positive/ \
+--output output/ \
+--dinov3-backbone vit7b16 \
+--vit-pooling cls 
+
+ 
+В КЭШ ЗАГРУЗИЬ МОДЛЬ cp /content/drive/MyDrive/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth ~/.cache/torch/hub/checkpoints/
+УСТАНОВИТЬ DINOV3 
+ЗАПУСТИТЬ КОД

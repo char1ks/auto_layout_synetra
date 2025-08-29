@@ -163,7 +163,7 @@ def _add_detect_arguments(parser: argparse.ArgumentParser):
     # DINOv3 параметры
     parser.add_argument("--dinov3-backbone", 
                        default=None, 
-                       choices=["vitb16", "vitl16", "vith14", 
+                       choices=["vitb16", "vitl16", "vith14", "vit7b16",
                                 "convnext_tiny", "convnext_small", 
                                 "convnext_base", "convnext_large"], 
                        help="Какой бэкенд DINOv3 использовать (ViT или ConvNeXt).")
@@ -397,6 +397,14 @@ def _execute_detect(args) -> int:
         if hasattr(args, 'pos_agg') and getattr(args, 'pos_agg', None) is not None:
             detector_params['pos_agg'] = args.pos_agg
         
+        # DINOv3 параметры
+        if hasattr(args, 'dinov3_backbone') and args.dinov3_backbone:
+            detector_params['dinov3_backbone'] = args.dinov3_backbone
+        if hasattr(args, 'dinov3_ckpt') and args.dinov3_ckpt:
+            detector_params['dinov3_ckpt'] = args.dinov3_ckpt
+        if hasattr(args, 'vit_pooling') and args.vit_pooling:
+            detector_params['vit_pooling'] = args.vit_pooling
+
         if hasattr(args, 'layer') and args.layer:
             detector_params['layer'] = args.layer
         if hasattr(args, 'feat_short_side') and args.feat_short_side is not None:

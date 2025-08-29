@@ -40,7 +40,7 @@ class SearchDetDetector:
         self.sam_model = self.params.get('sam_model', None)
         self.device = self.params.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
         self.half = self.params.get('half', False)
-        self.mask_backend = self.params.get('backend', 'sam-hq')
+        self.mask_backend = self.params.get('mask_backend', self.params.get('backend', 'sam-hq'))
         self.backbone = self.params.get('backbone', 'dinov2_b')
         self.dinov3_ckpt = self.params.get('dinov3_ckpt', None)
         self.nms_iou = self.params.get('nms_iou', 0.5)
@@ -112,9 +112,39 @@ class SearchDetDetector:
             return {"found_elements": [], "masks": []}
         print("1️⃣2️⃣ Шаг 8: EmbeddingExtractor.extract_mask_embeddings() - эмбеддинги масок")
         t_embeddings = time.time()
-        mask_vecs, idx_map = self.embedding_extractor.extract_mask_embeddings(image_np, masks)
-        if mask_vecs.shape[0] == 0:
-            print("   ❌ Не удалось получить эмбеддинги масок.")
+        # Конвертируем numpy в PIL для нового API
+        image_pil = Image.fromarray(image_np.astype(np.uint8))
+        
+        print(f"   🔍 ДИАГНОСТИКА: Начинаем обработку {len(masks)} масок")
+        try:
+            mask_vecs = self.embedding_extractor.extract_mask_embeddings(image_pil, masks)
+            print(f"   🔍 ДИАГНОСТИКА: Получено {mask_vecs.shape[0]} валидных векторов из {len(masks)} масок")
+            
+            if mask_vecs.shape[0] == 0:
+                print("   ❌ Не удалось получить эмбеддинги масок.")
+                print("   📍 ПРИЧИНА: Все маски были отброшены как невалидные (NaN/Inf/нулевая норма)")
+                
+                # Детальная диагностика каждой маски
+                print("   🔍 ДЕТАЛЬНАЯ ДИАГНОСТИКА МАСОК:")
+                for i, mask in enumerate(masks):
+                    try:
+                        print(f"     Маска {i+1}: тип={type(mask)}, размер={getattr(mask, 'shape', 'неизвестно')}")
+                        if hasattr(mask, 'segmentation'):
+                            seg = mask['segmentation']
+                            if isinstance(seg, np.ndarray):
+                                print(f"       segmentation: shape={seg.shape}, dtype={seg.dtype}, sum={seg.sum()}")
+                            else:
+                                print(f"       segmentation: тип={type(seg)} (не numpy array)")
+                    except Exception as e:
+                        print(f"     Маска {i+1}: ошибка анализа - {e}")
+                
+                return {"found_elements": [], "masks": []}
+                
+        except Exception as e:
+            import traceback
+            print(f"   ❌ КРИТИЧЕСКАЯ ОШИБКА в extract_mask_embeddings: {e}")
+            print("   📍 STACK TRACE:")
+            traceback.print_exc()
             return {"found_elements": [], "masks": []}
         print(f"   📊 Масок с валидными векторами: {mask_vecs.shape[0]}")
         print("1️⃣3️⃣ Шаг 9: EmbeddingExtractor.build_queries_multiclass() - эмбеддинги примеров по классам")
@@ -160,7 +190,7 @@ class SearchDetDetector:
         print("1️⃣4️⃣ Шаг 10: ScoreCalculator.score_multiclass() - скоринг и принятие решений")
         print("🔍 ЭТАП 3: Сопоставление с positive/negative по классам...")
         t_scoring = time.time()
-        decisions = self.score_calculator.score_multiclass(
+        decisions, _ = self.score_calculator.score_multiclass(
             mask_vecs, 
             class_pos, 
             q_neg,
@@ -172,6 +202,10 @@ class SearchDetDetector:
         result_masks = []
         candidates = []
         H, W = image_np.shape[:2]
+        
+        # Создаем idx_map для связи индексов решений с оригинальными индексами масок
+        idx_map = list(range(len(masks)))
+        
         print(f"\n🔍 Processing {len(decisions)} decisions...")
         for i, dec in enumerate(decisions):
             print(f"  - Decision {i}: accepted={dec.get('accepted')}, class='{dec.get('class')}', confidence={dec.get('confidence', 0.0):.3f}")

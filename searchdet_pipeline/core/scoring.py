@@ -7,6 +7,33 @@ from typing import Dict, List, Tuple, Any
 from ..utils.config import ScoringConfig
 
 
+def _l2n(x: np.ndarray, axis: int = -1, eps: float = 1e-12) -> np.ndarray:
+    n = np.linalg.norm(x, axis=axis, keepdims=True)
+    return x / np.maximum(n, eps)
+
+def _aggregate(sim_mat: np.ndarray, mode: str = "max", topk: int = 3) -> np.ndarray:
+    """
+    sim_mat: [num_masks, num_queries]
+    Возвращает вектор [num_masks] по выбранной агрегации.
+    """
+    if sim_mat.size == 0:
+        return np.full((sim_mat.shape[0] if sim_mat.ndim else 0,), -1.0, dtype=np.float32)
+
+    if mode == "max":
+        return sim_mat.max(axis=1)
+    elif mode == "mean":
+        return sim_mat.mean(axis=1)
+    elif mode == "mean_topk":
+        k = min(topk, sim_mat.shape[1])
+        if k <= 0:
+            return np.full((sim_mat.shape[0],), -1.0, dtype=np.float32)
+        part = np.partition(sim_mat, -k, axis=1)[:, -k:]
+        return part.mean(axis=1)
+    else:
+        # безопасный фоллбэк
+        return sim_mat.max(axis=1)
+
+
 # --------------- утилиты ---------------
 
 def _to_matrix(X: np.ndarray, D: int | None = None) -> np.ndarray:
@@ -49,28 +76,53 @@ def _cosine_matrix(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     return sims
 
 
-def _cos(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    # a: (N,D), b: (M,D) -> (N,M)
-    return a @ b.T
+def _l2n(x: torch.Tensor) -> np.ndarray:
+    return x.detach().cpu().numpy()
 
-def _agg_scores(sims: np.ndarray, mode: str = "mean_topk", topk: int = 2) -> np.ndarray:
+def _cos(A: np.ndarray, B: np.ndarray):
     """
-    sims: (N, K_i) — похожесть масок к K_i примерам одного класса.
-    Возвращает (N,) — агрегированный pos по классу.
+    Косинусная близость между батчами A (M,D) и B (N,D) → (M,N) в [-1,1] без NaN.
+    Если один из векторов нулевой — косинус = -1 (наихудший случай).
     """
-    if sims.size == 0:
-        return np.full((sims.shape[0],), -1.0, dtype=np.float32)
-    if mode == "max":
-        return sims.max(axis=1)
-    if mode == "mean":
-        return sims.mean(axis=1)
-    # mean_topk
-    k = min(topk, sims.shape[1])
-    part = np.partition(sims, -k, axis=1)[:, -k:]
-    return part.mean(axis=1)
+    if A.size == 0 or B.size == 0:
+        return np.full((A.shape[0], B.shape[0]), -1.0, dtype=np.float32)
 
+    A = A.astype(np.float32, copy=False)
+    B = B.astype(np.float32, copy=False)
 
-# --------------- скорер ---------------
+    # нормы
+    a_norm = np.linalg.norm(A, axis=1, keepdims=True)
+    b_norm = np.linalg.norm(B, axis=1, keepdims=True).T  # (1,N)
+
+    # защитим от деления на ноль
+    a_zero = (a_norm < 1e-6)
+    b_zero = (b_norm < 1e-6)
+
+    a_norm_safe = np.where(a_zero, 1.0, a_norm)
+    b_norm_safe = np.where(b_zero, 1.0, b_norm)
+
+    S = (A @ B.T) / (a_norm_safe * b_norm_safe)  # (M,N)
+    S = np.clip(S, -1.0, 1.0)
+    S = np.nan_to_num(S, nan=-1.0, posinf=-1.0, neginf=-1.0)
+
+    # где нули в нормах — ставим -1
+    if a_zero.any():
+        S[a_zero[:, 0], :] = -1.0
+    if b_zero.any():
+        S[:, b_zero[0, :]] = -1.0
+    return S.astype(np.float32, copy=False)
+
+def _agg_scores(scores: np.ndarray, aggregation: str, topk: int = 3) -> np.ndarray:
+    if aggregation == 'mean':
+        return np.mean(scores, axis=1)
+    elif aggregation == 'max':
+        return np.max(scores, axis=1)
+    elif aggregation == 'topk':
+        k = min(topk, scores.shape[1])
+        # take top-k mean
+        return np.mean(np.partition(scores, -k, axis=1)[:, -k:], axis=1)
+    else:
+        raise ValueError(f'Unknown aggregation: {aggregation}')
 
 class ScoreCalculator:
     """
@@ -190,93 +242,75 @@ class ScoreCalculator:
 
     # ----- основной мультикласс-скоринг
 
-    def score_multiclass(
-        self,
-        mask_vecs: np.ndarray,                    # (N,D), L2-normed
-        q_pos: dict[str, np.ndarray],             # class -> (K_i,D)
-        q_neg: np.ndarray | None,                 # (K_neg,D) or None/(0,*)
-        *,
-        online_negatives: np.ndarray | None = None,
-    ) -> List[Dict[str, Any]]:
+    def _aggregate_pos(self, sims_vec: np.ndarray):
+        """Агрегация positive-скоров для ОДНОЙ маски по одному классу."""
+        if sims_vec.size == 0:
+            return -1.0
+        s = np.sort(sims_vec)[::-1]
+        if self.pos_agg == "max":
+            return float(s[0])
+        if self.pos_agg == "mean":
+            return float(s.mean())
+        if self.pos_agg == "mean_topk" and self.topk and self.topk > 0:
+            k = min(self.topk, s.shape[0])
+            return float(s[:k].mean())
+        return float(s[0])
+
+    def score_multiclass(self, mask_vecs: np.ndarray, q_pos: dict, q_neg: np.ndarray, online_negatives=None):
         """
-        Возвращает decisions: List[dict], где dict = {
-            'accepted': bool, 'cls': str|None, 'pos': float, 'neg': float,
-            'diff': float, 'ratio': float, 'confidence': float
-        }
+        mask_vecs: (M,D)
+        q_pos: {class: (K,D)}
+        q_neg: (N,D) — может быть (0,D)
+
+        Возвращает список решений по маскам.
         """
-        pos_agg = self.pos_agg
-        topk = self.topk
-        min_pos = self.min_pos_score
-        diff_thr = self.decision_threshold
-        ratio_thr = self.ratio
-        top2_margin = self.class_separation
-        require_two_pos = False # not in config, use default
-
-        N, D = mask_vecs.shape
-        if not q_pos:
-            return [{'accepted': False, 'cls': None, 'pos': 0.0, 'neg': 0.0,
-                     'diff': 0.0, 'ratio': 0.0, 'confidence': 0.0} for _ in range(N)]
-
-        # Собираем pos-скор по всем классам
-        classes = sorted(q_pos.keys())
-        pos_all = []
-        for cls in classes:
-            Q = q_pos[cls]  # (K_i, D)
-            sims = _cos(mask_vecs, Q)            # (N, K_i), уже [-1..1]
-            pos_cls = _agg_scores(sims, pos_agg, topk)
-            if require_two_pos and Q.shape[0] < 2:
-                # штрафуем классы с 1 примером, чтобы не «долбить» max по одному
-                pos_cls -= 0.05
-            pos_all.append(pos_cls)
-        pos_all = np.stack(pos_all, 1)            # (N, C)
-        best_idx = pos_all.argmax(axis=1)         # (N,)
-        best_pos = pos_all[np.arange(N), best_idx]
-        # второй лучший класс (для отрыва/top2-margin)
-        pos_sorted = np.sort(pos_all, axis=1)
-        second_pos = pos_sorted[:, -2] if pos_sorted.shape[1] >= 2 else np.full((N,), -1.0, dtype=np.float32)
-
-        # NEG: реальные + онлайн
-        neg_pool = []
-        if q_neg is not None and q_neg.size:
-            neg_pool.append(q_neg)
-        if online_negatives is not None and online_negatives.size:
-            neg_pool.append(online_negatives)
-        if neg_pool:
-            NEG = np.concatenate(neg_pool, axis=0)     # (K_neg, D)
-            neg_scores = _cos(mask_vecs, NEG).max(axis=1)  # (N,)
-        else:
-            # Если нет негативов — используем второй лучший класс как суррогат neg
-            neg_scores = second_pos.copy()
-
-        # Гейты
-        eps = 1e-3
-        ratios = best_pos / np.maximum(neg_scores, 0.01)   # чтобы не делить на 0
-        diffs = best_pos - np.maximum(neg_scores, 0.0)
-        margins = best_pos - second_pos
-
+        M = mask_vecs.shape[0]
         decisions = []
-        for i in range(N):
-            cls = classes[best_idx[i]]
-            pos = float(np.clip(best_pos[i], -1.0, 1.0))
-            neg = float(np.clip(neg_scores[i], -1.0, 1.0))
-            diff = float(diffs[i])
-            ratio = float(ratios[i])
-            margin2 = float(margins[i])
+        if M == 0 or not q_pos:
+            return decisions
 
-            accept = (pos >= min_pos) and (diff >= diff_thr) and (ratio >= ratio_thr) and (margin2 >= top2_margin)
-            conf = max(0.0, min(1.0, 0.5 * (pos - min_pos) + 0.5 * (diff - diff_thr)))
+        # предсчёт по negative
+        neg_scores = None
+        if q_neg.size > 0:
+            neg_scores = _cos(mask_vecs, q_neg).max(axis=1)  # (M,)
+        else:
+            # если нет отрицательных — отрицательный «скор» будем считать 0
+            # (или можно -1.0 — выбирай стратегию)
+            neg_scores = np.zeros((M,), dtype=np.float32)
+
+        for i in range(M):
+            mv = mask_vecs[i:i+1]  # (1,D)
+            best_cls = None
+            best_pos = -1.0
+
+            for cls, Q in q_pos.items():
+                sims = _cos(mv, Q)[0]    # (K,)
+                pos = self._aggregate_pos(sims)
+                if pos > best_pos:
+                    best_pos = pos
+                    best_cls = cls
+
+            neg = float(neg_scores[i])
+            diff = best_pos - neg
+            accepted = (best_pos >= self.min_pos_score) and (diff >= self.decision_threshold)
 
             decisions.append({
-                'accepted': bool(accept),
-                'cls': cls if accept else cls,
-                'pos': pos,
-                'neg': neg,
-                'diff': diff,
-                'ratio': ratio,
-                'confidence': float(conf),
+                "mask_index": i,
+                "class": best_cls,
+                "pos": float(best_pos),
+                "neg": float(neg),
+                "diff": float(diff),
+                "accepted": bool(accepted),
+                "confidence": float(best_pos),  # или diff, если предпочитаешь
             })
-
-        return decisions
+        
+        # Добавляем debug информацию
+        debug = {
+            "num_masks": M,
+            "num_classes": len(q_pos),
+            "has_negatives": q_neg.size > 0 if q_neg is not None else False
+        }
+        return decisions, debug
 
     # ----- бинарный режим (оставлен для совместимости/APIs)
 
@@ -307,3 +341,143 @@ class ScoreCalculator:
                 accepted.append(i)
 
         return accepted, pos_scores, neg_for_decision
+
+
+def score_multiclass(
+    mask_vecs: np.ndarray,                # [M, D], L2-норм. если нет — нормируем внутри
+    q_pos: dict[str, np.ndarray],         # {cls: [N_c, D]} (уже L2-норм.)
+    q_neg: np.ndarray | None,             # [K, D] или (0, D)
+    *,
+    pos_agg: str = "max",
+    topk: int = 3,
+    min_pos_score: float = 0.70,
+    decision_threshold: float = 0.10,
+    clamp_neg_to_zero: bool = True,
+    verbose: bool = True,
+):
+    """
+    Считает per-mask скор по каждому классу, выбирает лучший класс и решает принимать/отклонять.
+
+    Возвращает:
+      decisions: list[dict] с полями:
+         {'class': str|None, 'pos': float, 'neg_raw': float, 'neg': float,
+          'diff': float, 'accepted': bool}
+      debug: dict с диагностикой (средние pos/neg и т.п.)
+    """
+    if mask_vecs.ndim == 1:
+        mask_vecs = mask_vecs[None, :]
+    mask_vecs = mask_vecs.astype(np.float32, copy=False)
+    mask_vecs = _l2n(mask_vecs, axis=1)
+    M, D = mask_vecs.shape
+
+    # подготовим негативы
+    if q_neg is None or q_neg.size == 0:
+        # онлайн-негативы = позитивы других классов
+        neg_pool = []
+        for cls, Q in q_pos.items():
+            if Q is not None and Q.size:
+                neg_pool.append(Q)
+        if neg_pool:
+            q_neg_eff = _l2n(np.concatenate(neg_pool, axis=0), axis=1)
+        else:
+            q_neg_eff = np.zeros((0, D), dtype=np.float32)
+        used_online_negs = True
+    else:
+        q_neg_eff = q_neg.astype(np.float32, copy=False)
+        if q_neg_eff.ndim == 1:
+            q_neg_eff = q_neg_eff[None, :]
+        q_neg_eff = _l2n(q_neg_eff, axis=1)
+        used_online_negs = False
+
+    # считаем pos по классам
+    per_class_pos = {}       # cls -> [M]
+    per_class_best = {}      # cls -> {'scores':[M], 'details':...}
+    all_pos_vals = []
+
+    for cls, Q in q_pos.items():         # ВАЖНО: .items() → (cls, ndarray)
+        Q = np.asarray(Q, dtype=np.float32)
+        if Q.ndim == 1:
+            Q = Q[None, :]
+        if Q.size == 0:
+            if verbose:
+                print(f"   📊 Класс '{cls}': 0 примеров")
+            per_class_pos[cls] = np.full((M,), -1.0, dtype=np.float32)
+            continue
+
+        Q = _l2n(Q, axis=1)
+        # косинусы: [M, N_c] = [M,D] @ [D,N_c]
+        sim = mask_vecs @ Q.T
+        pos_cls = _aggregate(sim, mode=pos_agg, topk=topk)
+        per_class_pos[cls] = pos_cls
+        all_pos_vals.extend(pos_cls.tolist())
+
+        if verbose:
+            # покажем все значения по маскам в стиле логов
+            flat = sim.reshape(-1)
+            cls_list = [f"{v:+.3f}" if v < 0 else f"{v:.3f}" for v in pos_cls]
+            print(f"   📊 Класс '{cls}': {Q.shape[0]} примеров → скоры={cls_list[:8] + (['...'] if len(cls_list)>8 else [])}")
+
+    # если совсем нет валидных классов
+    if not per_class_pos:
+        if verbose:
+            print("   ❌ Нет валидных классов с эмбеддингами - возвращаем пустой результат")
+        return [], {'pos_avg': 0.0, 'neg_avg': 0.0}
+
+    # соберём per-mask лучший класс и pos
+    best_cls = []
+    best_pos = []
+    for m in range(M):
+        cls_scores = {cls: per_class_pos[cls][m] for cls in per_class_pos.keys()}
+        cls = max(cls_scores, key=cls_scores.get)
+        best_cls.append(cls)
+        best_pos.append(cls_scores[cls])
+        if verbose:
+            # печать как в логах
+            vals = ", ".join([f"{c}={cls_scores[c]:.3f}" for c in [cls]])
+            print(f"     Маска {m}: [{vals}] → выбран {cls} ({cls_scores[cls]:.3f})")
+
+    best_pos = np.array(best_pos, dtype=np.float32)
+
+    # считаем «негативный» скор: max по всем нег-запросам
+    if q_neg_eff.size > 0:
+        neg_sim = mask_vecs @ q_neg_eff.T           # [M, K]
+        neg_raw = neg_sim.max(axis=1)               # [M]
+    else:
+        neg_raw = np.zeros((M,), dtype=np.float32)  # если не из чего — нули
+
+    neg = np.maximum(neg_raw, 0.0) if clamp_neg_to_zero else neg_raw
+    diff = best_pos - neg
+
+    pos_avg = float(np.mean(best_pos)) if len(best_pos) else 0.0
+    neg_avg = float(np.mean(neg_raw)) if len(neg_raw) else 0.0
+    if verbose:
+        print(f"📊 Скоры мультикласса: pos_avg={pos_avg:.3f}, neg_avg={neg_avg:.3f}")
+
+    # решение: принять маску?
+    decisions = []
+    for m in range(M):
+        accepted = (best_pos[m] >= min_pos_score) and (diff[m] >= decision_threshold)
+        decisions.append({
+            'class': best_cls[m],
+            'pos': float(best_pos[m]),
+            'neg_raw': float(neg_raw[m]),
+            'neg': float(neg[m]),
+            'diff': float(diff[m]),
+            'accepted': bool(accepted),
+        })
+        if verbose:
+            sep = best_pos[m]  # «class separation» в твоих логах по сути сам pos
+            cons = "1/1"       # консенсус теперь считается вне этой функции
+            print(f"   Маска {m}: класс={best_cls[m]}, pos={best_pos[m]:.3f}, "
+                  f"neg_raw={neg_raw[m]:+.3f}, neg={neg[m]:.3f}, "
+                  f"diff={diff[m]:+.3f}, sep=+{sep:.3f}, cons={cons} → принято={accepted}")
+
+    debug = {
+        'pos_avg': pos_avg,
+        'neg_avg': neg_avg,
+        'used_online_negs': used_online_negs,
+        'best_pos': best_pos,
+        'neg_raw': neg_raw,
+        'diff': diff,
+    }
+    return decisions, debug
